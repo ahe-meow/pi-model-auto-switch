@@ -6,7 +6,13 @@ Pi Model Failover is a global-first Pi extension that moves a settled failed req
 
 ## Install
 
-Install globally through Pi's package manager:
+Install the current public GitHub package through Pi's package manager:
+
+```bash
+pi install git:github.com/ahe-meow/pi-model-auto-switch
+```
+
+The npm registry package `pi-model-failover` has not been published yet, so this command currently does **not** work:
 
 ```bash
 pi install npm:pi-model-failover
