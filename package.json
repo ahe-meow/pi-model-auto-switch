@@ -1,0 +1,47 @@
+{
+  "name": "pi-model-failover",
+  "version": "0.1.0",
+  "description": "Global Pi extension for bounded model failover with an interactive /failover editor",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "model-failover"
+  ],
+  "main": "./src/index.ts",
+  "files": [
+    "src/",
+    "README.md",
+    "DESIGN.md",
+    "package.json"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --loader ./test/typescript-loader.mjs --test test/*.test.ts",
+    "check": "node ./node_modules/typescript/bin/tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "@earendil-works/pi-tui": "^0.84.2",
+    "@types/node": "^22.15.0",
+    "tsx": "^4.23.0",
+    "typescript": "^5.9.3"
+  }
+}
