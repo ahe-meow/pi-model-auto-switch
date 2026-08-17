@@ -13,17 +13,12 @@
   "files": [
     "src/",
     "README.md",
-    "DESIGN.md",
     "package.json"
   ],
   "pi": {
     "extensions": [
       "./src/index.ts"
     ]
-  },
-  "scripts": {
-    "test": "node --loader ./test/typescript-loader.mjs --test test/*.test.ts",
-    "check": "node ./node_modules/typescript/bin/tsc --noEmit"
   },
   "engines": {
     "node": ">=22.19.0"
@@ -36,12 +31,5 @@
     "@earendil-works/pi-coding-agent": {
       "optional": true
     }
-  },
-  "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.2",
-    "@earendil-works/pi-tui": "^0.84.2",
-    "@types/node": "^22.15.0",
-    "tsx": "^4.23.0",
-    "typescript": "^5.9.3"
   }
 }
