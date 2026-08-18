@@ -31,12 +31,12 @@ export interface FailoverTuiView {
 export interface FailoverTuiActions {
 	onClose: () => void;
 	onError: (error: unknown) => void;
-	onAdd: () => Promise<void>;
+	onAdd: (model: ModelRef) => Promise<void>;
 	onRemove: (index: number) => Promise<void>;
 	onMove: (index: number, direction: -1 | 1) => Promise<void>;
 	onSelect: (model: ModelRef) => Promise<void>;
 	onToggleEnabled: () => Promise<void>;
-	onSetTimeout: () => Promise<void>;
+	onSetTimeout: (value: string) => Promise<void>;
 	onSetReasoningEffort: (effort: ReasoningEffort) => Promise<void>;
 	onRestore: () => Promise<void>;
 }
@@ -59,6 +59,9 @@ export class FailoverEditor implements Component {
 	private selectedIndex = 0;
 	private scrollOffset = 0;
 	private reasoningSelectionIndex: number | undefined;
+	private addCandidates: readonly ModelRef[] | undefined;
+	private addSelectionIndex: number | undefined;
+	private timeoutInput: string | undefined;
 	private actionQueue = Promise.resolve();
 	private readonly border: DynamicBorder;
 
@@ -93,6 +96,57 @@ export class FailoverEditor implements Component {
 
 	handleInput(data: string): void {
 		const view = this.getView();
+		if (this.addSelectionIndex !== undefined && this.addCandidates) {
+			if (
+				matchesKey(data, Key.escape) ||
+				data === "q" ||
+				matchesKey(data, Key.ctrl("c"))
+			) {
+				this.addCandidates = undefined;
+				this.addSelectionIndex = undefined;
+				return;
+			}
+			if (matchesKey(data, Key.up)) {
+				this.addSelectionIndex = Math.max(0, this.addSelectionIndex - 1);
+				return;
+			}
+			if (matchesKey(data, Key.down)) {
+				this.addSelectionIndex = Math.min(
+					this.addCandidates.length - 1,
+					this.addSelectionIndex + 1,
+				);
+				return;
+			}
+			if (matchesKey(data, Key.enter)) {
+				const model = this.addCandidates[this.addSelectionIndex];
+				this.addCandidates = undefined;
+				this.addSelectionIndex = undefined;
+				if (model) this.runAction(() => this.actions.onAdd(model));
+			}
+			return;
+		}
+		if (this.timeoutInput !== undefined) {
+			if (
+				matchesKey(data, Key.escape) ||
+				data === "q" ||
+				matchesKey(data, Key.ctrl("c"))
+			) {
+				this.timeoutInput = undefined;
+				return;
+			}
+			if (matchesKey(data, Key.backspace)) {
+				this.timeoutInput = this.timeoutInput.slice(0, -1);
+				return;
+			}
+			if (matchesKey(data, Key.enter)) {
+				const value = this.timeoutInput;
+				this.timeoutInput = undefined;
+				this.runAction(() => this.actions.onSetTimeout(value));
+				return;
+			}
+			if (/^\d+$/.test(data)) this.timeoutInput += data;
+			return;
+		}
 		if (this.reasoningSelectionIndex !== undefined) {
 			if (
 				matchesKey(data, Key.escape) ||
@@ -162,7 +216,14 @@ export class FailoverEditor implements Component {
 			return;
 		}
 		if (data === "a") {
-			this.runAction(this.actions.onAdd);
+			const configured = new Set(view.models.map(modelKey));
+			const candidates = view.available.filter(
+				(model) => !configured.has(modelKey(model)),
+			);
+			if (candidates.length > 0) {
+				this.addCandidates = candidates;
+				this.addSelectionIndex = 0;
+			}
 			return;
 		}
 		if (data === "d") {
@@ -176,7 +237,7 @@ export class FailoverEditor implements Component {
 			return;
 		}
 		if (data === "t") {
-			this.runAction(this.actions.onSetTimeout);
+			this.timeoutInput = "";
 			return;
 		}
 		if (data === "i") {
@@ -217,7 +278,31 @@ export class FailoverEditor implements Component {
 			const choices = REASONING_EFFORTS.map((effort, index) =>
 				index === this.reasoningSelectionIndex ? `[${effort}]` : effort,
 			).join("  ");
-			add(this.theme.fg("accent", `Select reasoning: ${choices}  ↑↓ move  Enter select  Esc cancel`));
+			add(
+				this.theme.fg(
+					"accent",
+					`Select reasoning: ${choices}  ↑↓ move  Enter select  Esc cancel`,
+				),
+			);
+		}
+		if (this.timeoutInput !== undefined) {
+			add(
+				this.theme.fg(
+					"accent",
+					`Enter timeout: ${this.timeoutInput || "_"}  digits  Enter save  Esc cancel`,
+				),
+			);
+		}
+		if (this.addSelectionIndex !== undefined && this.addCandidates) {
+			const model = this.addCandidates[this.addSelectionIndex];
+			if (model) {
+				add(
+					this.theme.fg(
+						"accent",
+						`Add model ${this.addSelectionIndex + 1}/${this.addCandidates.length}: ${modelKey(model)}  ↑↓ move  Enter add  Esc cancel`,
+					),
+				);
+			}
 		}
 		add("");
 		if (view.models.length === 0) {

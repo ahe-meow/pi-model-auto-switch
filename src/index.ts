@@ -748,24 +748,7 @@ export default function modelFailoverExtension(pi: ExtensionAPI): void {
 					onClose: () => done(),
 					onError: (error) =>
 						notify(ctx, `Failover action failed: ${String(error)}`, "error"),
-					onAdd: async () => {
-						const configured = new Set(runtime.config.models.map(modelKey));
-						const candidates = runtime.available.filter(
-							(model) => !configured.has(modelKey(model)),
-						);
-						if (candidates.length === 0) {
-							notify(ctx, "No undiscovered models are available to add", "info");
-							return;
-						}
-						const choice = await ctx.ui.select(
-							"Add failover model",
-							candidates.map(modelKey),
-						);
-						if (!choice) return;
-						const model = candidates.find(
-							(candidate) => modelKey(candidate) === choice,
-						);
-						if (!model) return;
+					onAdd: async (model) => {
 						await persist(ctx, runtime, {
 							...runtime.config,
 							models: [...runtime.config.models, { ...model }],
@@ -810,12 +793,7 @@ export default function modelFailoverExtension(pi: ExtensionAPI): void {
 						await persist(ctx, runtime, { ...runtime.config, enabled });
 						updateStatus(ctx, runtime);
 					},
-					onSetTimeout: async () => {
-						const value = await ctx.ui.input(
-							"No-progress timeout seconds",
-							String(runtime.config.noProgressTimeoutSeconds),
-						);
-						if (value === undefined) return;
+					onSetTimeout: async (value) => {
 						const seconds = Number(value.trim());
 						if (!isValidTimeoutSeconds(seconds)) {
 							notify(

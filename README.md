@@ -46,7 +46,7 @@ The list supports selection, add, remove, and reorder. TUI write actions run ser
 
 Automation is enabled by default. A manual `/model` or `Ctrl+P` selection pauses it until Restore is chosen in `/failover`. Restore selects the configured first model and resumes automation without sending a test request. The configured timeout defaults to 90 seconds; valid values are 15-900 seconds or `0` for off.
 
-The TUI also lets you choose the request reasoning effort with `i`, then `↑`/`↓` and Enter: `off`, `low`, `medium`, `high`, `xhigh`, or `max`; Esc cancels. The setting is persisted and defaults to `medium` for existing configurations that do not have it.
+For timeout, press `t`, type digits, and press Enter; Esc cancels. Add now uses the same inline selector, so all `/failover` interactions stay inside the custom panel.
 
 For official OpenAI and Azure OpenAI models, every provider request is adjusted through Pi's `before_provider_request` hook:
 
