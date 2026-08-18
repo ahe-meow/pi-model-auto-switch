@@ -11,9 +11,10 @@ import type {
 	FailoverConfig,
 	ModelRef,
 	AutomationMode,
+	ReasoningEffort,
 	Transition,
 } from "./types.ts";
-import { modelKey } from "./types.ts";
+import { modelKey, REASONING_EFFORTS } from "./types.ts";
 
 export interface FailoverTuiView {
 	config: FailoverConfig;
@@ -36,7 +37,7 @@ export interface FailoverTuiActions {
 	onSelect: (model: ModelRef) => Promise<void>;
 	onToggleEnabled: () => Promise<void>;
 	onSetTimeout: () => Promise<void>;
-	onSetReasoningEffort: () => Promise<void>;
+	onSetReasoningEffort: (effort: ReasoningEffort) => Promise<void>;
 	onRestore: () => Promise<void>;
 }
 
@@ -57,6 +58,7 @@ const MAX_VISIBLE_MODELS = 20;
 export class FailoverEditor implements Component {
 	private selectedIndex = 0;
 	private scrollOffset = 0;
+	private reasoningSelectionIndex: number | undefined;
 	private actionQueue = Promise.resolve();
 	private readonly border: DynamicBorder;
 
@@ -91,6 +93,38 @@ export class FailoverEditor implements Component {
 
 	handleInput(data: string): void {
 		const view = this.getView();
+		if (this.reasoningSelectionIndex !== undefined) {
+			if (
+				matchesKey(data, Key.escape) ||
+				data === "q" ||
+				matchesKey(data, Key.ctrl("c"))
+			) {
+				this.reasoningSelectionIndex = undefined;
+				return;
+			}
+			if (matchesKey(data, Key.up)) {
+				this.reasoningSelectionIndex = Math.max(
+					0,
+					this.reasoningSelectionIndex - 1,
+				);
+				return;
+			}
+			if (matchesKey(data, Key.down)) {
+				this.reasoningSelectionIndex = Math.min(
+					REASONING_EFFORTS.length - 1,
+					this.reasoningSelectionIndex + 1,
+				);
+				return;
+			}
+			if (matchesKey(data, Key.enter)) {
+				const effort = REASONING_EFFORTS[this.reasoningSelectionIndex];
+				this.reasoningSelectionIndex = undefined;
+				if (effort) {
+					this.runAction(() => this.actions.onSetReasoningEffort(effort));
+				}
+			}
+			return;
+		}
 		if (
 			matchesKey(data, Key.escape) ||
 			data === "q" ||
@@ -146,7 +180,8 @@ export class FailoverEditor implements Component {
 			return;
 		}
 		if (data === "i") {
-			this.runAction(this.actions.onSetReasoningEffort);
+			const currentIndex = REASONING_EFFORTS.indexOf(view.config.reasoningEffort);
+			this.reasoningSelectionIndex = currentIndex >= 0 ? currentIndex : 0;
 			return;
 		}
 		if (data === "r") {
@@ -178,6 +213,12 @@ export class FailoverEditor implements Component {
 				"Enter select  a add  d remove  [ ] reorder  e toggle  t timeout  i reasoning  r restore  q close",
 			),
 		);
+		if (this.reasoningSelectionIndex !== undefined) {
+			const choices = REASONING_EFFORTS.map((effort, index) =>
+				index === this.reasoningSelectionIndex ? `[${effort}]` : effort,
+			).join("  ");
+			add(this.theme.fg("accent", `Select reasoning: ${choices}  ↑↓ move  Enter select  Esc cancel`));
+		}
 		add("");
 		if (view.models.length === 0) {
 			add(this.theme.fg("warning", "No models configured"));

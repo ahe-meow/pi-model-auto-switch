@@ -40,7 +40,6 @@ import type {
 	FailureInput,
 	ModelRef,
 	ProgressAttemptKind,
-	ReasoningEffort,
 	RequestState,
 	Transition,
 } from "./types.ts";
@@ -831,17 +830,12 @@ export default function modelFailoverExtension(pi: ExtensionAPI): void {
 							noProgressTimeoutSeconds: seconds,
 						});
 					},
-					onSetReasoningEffort: async () => {
-						const choice = await ctx.ui.select("Reasoning effort", [
-							...REASONING_EFFORTS,
-						]);
-						if (!choice) return;
-						const reasoningEffort = choice as ReasoningEffort;
-						if (!REASONING_EFFORTS.includes(reasoningEffort)) return;
+					onSetReasoningEffort: async (reasoningEffort) => {
 						await persist(ctx, runtime, {
 							...runtime.config,
 							reasoningEffort,
 						});
+						notify(ctx, `Reasoning effort set to ${reasoningEffort}`, "info");
 					},
 					onRestore: async () => {
 						const target = runtime.config.models[0];
