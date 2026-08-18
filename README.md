@@ -46,6 +46,17 @@ The list supports selection, add, remove, and reorder. TUI write actions run ser
 
 Automation is enabled by default. A manual `/model` or `Ctrl+P` selection pauses it until Restore is chosen in `/failover`. Restore selects the configured first model and resumes automation without sending a test request. The configured timeout defaults to 90 seconds; valid values are 15-900 seconds or `0` for off.
 
+The TUI also lets you choose the request reasoning effort with `i`: `off`, `low`, `medium`, `high`, `xhigh`, or `max`. The setting is persisted and defaults to `medium` for existing configurations that do not have it.
+
+For official OpenAI and Azure OpenAI models, every provider request is adjusted through Pi's `before_provider_request` hook:
+
+- Responses requests receive `reasoning.effort` (`off` maps to OpenAI's `none`).
+- Chat Completions requests receive `reasoning_effort`.
+- `prompt_cache_key` is a stable SHA-256 digest of the Pi Session ID, so the plaintext Session ID is not sent as the cache key.
+- `prompt_cache_retention: "24h"` requests extended prompt-cache retention.
+
+OpenAI model support is model-dependent. `xhigh` and `max` can be rejected by models that do not support them, and 24-hour retention is a best-effort maximum rather than a guaranteed cache hit. Non-OpenAI providers are left unchanged. See the [official API implementation notes](https://github.com/ahe-meow/pi-model-auto-switch/blob/main/docs/research/openai-pi-request-parameters.md) for the source references and Pi hook details.
+
 ## Failure policy
 
 Pi owns recognized transient retries and their count/backoff. This extension waits for `agent_settled` before making a failover decision.

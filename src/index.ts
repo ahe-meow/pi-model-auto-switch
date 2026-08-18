@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import type {
 	AgentEndEvent,
@@ -39,14 +40,93 @@ import type {
 	FailureInput,
 	ModelRef,
 	ProgressAttemptKind,
+	ReasoningEffort,
 	RequestState,
 	Transition,
 } from "./types.ts";
-import { modelKey } from "./types.ts";
+import { modelKey, REASONING_EFFORTS } from "./types.ts";
 
 export const FAILOVER_CONFIG_PATH = join(getAgentDir(), "model-failover.json");
 const COOLDOWN_MS = 30 * 60 * 1000;
 const CONTINUATION_TYPE = "model-failover-continuation";
+const OPENAI_REQUEST_APIS = new Set([
+	"openai-responses",
+	"openai-completions",
+	"azure-openai-responses",
+]);
+const SESSION_AFFINITY_HEADERS = new Set([
+	"session_id",
+	"x-client-request-id",
+	"x-session-affinity",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isOfficialOpenAIModel(model: ExtensionContext["model"]): boolean {
+	return Boolean(
+		model &&
+			((model.provider === "openai" && OPENAI_REQUEST_APIS.has(model.api)) ||
+				(model.provider === "azure-openai-responses" &&
+					model.api === "azure-openai-responses")),
+	);
+}
+
+function promptCacheKey(ctx: ExtensionContext): string | undefined {
+	const sessionId = ctx.sessionManager.getSessionId();
+	if (!sessionId) return undefined;
+	return createHash("sha256")
+		.update("pi-model-failover/prompt-cache-key/v1:")
+		.update(sessionId)
+		.digest("hex");
+}
+
+function reasoningEffortForModel(
+	model: NonNullable<ExtensionContext["model"]>,
+	requested: (typeof REASONING_EFFORTS)[number],
+): string | undefined {
+	if (!model.reasoning) return undefined;
+	const mapped = model.thinkingLevelMap?.[requested];
+	if (mapped === null) return undefined;
+	return mapped ?? (requested === "off" ? "none" : requested);
+}
+
+function applyOpenAIRequestParameters(
+	payload: unknown,
+	ctx: ExtensionContext,
+	runtime: RuntimeState,
+): void {
+	if (!isOfficialOpenAIModel(ctx.model) || !isRecord(payload)) return;
+	const key = promptCacheKey(ctx);
+	if (key) payload.prompt_cache_key = key;
+	payload.prompt_cache_retention = "24h";
+
+	const effort = reasoningEffortForModel(
+		ctx.model,
+		runtime.config.reasoningEffort,
+	);
+	if (effort === undefined) return;
+	if (ctx.model.api === "openai-completions") {
+		payload.reasoning_effort = effort;
+		return;
+	}
+	const reasoning = isRecord(payload.reasoning) ? { ...payload.reasoning } : {};
+	reasoning.effort = effort;
+	payload.reasoning = reasoning;
+}
+
+function replaceOpenAISessionHeaders(
+	headers: Record<string, string | null>,
+	ctx: ExtensionContext,
+): void {
+	if (!isOfficialOpenAIModel(ctx.model)) return;
+	const key = promptCacheKey(ctx);
+	if (!key) return;
+	for (const name of Object.keys(headers)) {
+		if (SESSION_AFFINITY_HEADERS.has(name.toLowerCase())) headers[name] = key;
+	}
+}
 
 interface RuntimeState {
 	config: FailoverConfig;
@@ -541,6 +621,14 @@ function viewFor(runtime: RuntimeState): FailoverTuiView {
 export default function modelFailoverExtension(pi: ExtensionAPI): void {
 	const runtime = initialRuntime();
 
+	pi.on("before_provider_request", (event, ctx) => {
+		applyOpenAIRequestParameters(event.payload, ctx, runtime);
+	});
+
+	pi.on("before_provider_headers", (event, ctx) => {
+		replaceOpenAISessionHeaders(event.headers, ctx);
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		await refreshCatalog(ctx, runtime);
 		await selectHealthyModelAtStartup(pi, ctx, runtime);
@@ -741,6 +829,18 @@ export default function modelFailoverExtension(pi: ExtensionAPI): void {
 						await persist(ctx, runtime, {
 							...runtime.config,
 							noProgressTimeoutSeconds: seconds,
+						});
+					},
+					onSetReasoningEffort: async () => {
+						const choice = await ctx.ui.select("Reasoning effort", [
+							...REASONING_EFFORTS,
+						]);
+						if (!choice) return;
+						const reasoningEffort = choice as ReasoningEffort;
+						if (!REASONING_EFFORTS.includes(reasoningEffort)) return;
+						await persist(ctx, runtime, {
+							...runtime.config,
+							reasoningEffort,
 						});
 					},
 					onRestore: async () => {

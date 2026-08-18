@@ -1,3 +1,14 @@
+export const REASONING_EFFORTS = [
+	"off",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+] as const;
+
+export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
+
 export interface ModelRef {
 	provider: string;
 	id: string;
@@ -16,6 +27,7 @@ export interface FailoverConfig {
 	enabled: boolean;
 	paused: boolean;
 	models: ModelRef[];
+	reasoningEffort: ReasoningEffort;
 	noProgressTimeoutSeconds: number;
 	manualRecovery: Record<string, string>;
 }

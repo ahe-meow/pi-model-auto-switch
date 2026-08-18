@@ -36,6 +36,7 @@ export interface FailoverTuiActions {
 	onSelect: (model: ModelRef) => Promise<void>;
 	onToggleEnabled: () => Promise<void>;
 	onSetTimeout: () => Promise<void>;
+	onSetReasoningEffort: () => Promise<void>;
 	onRestore: () => Promise<void>;
 }
 
@@ -144,6 +145,10 @@ export class FailoverEditor implements Component {
 			this.runAction(this.actions.onSetTimeout);
 			return;
 		}
+		if (data === "i") {
+			this.runAction(this.actions.onSetReasoningEffort);
+			return;
+		}
 		if (data === "r") {
 			this.runAction(this.actions.onRestore);
 			return;
@@ -164,13 +169,13 @@ export class FailoverEditor implements Component {
 		if (border[0]) add(border[0]);
 		add(this.theme.fg("accent", "Pi Model Failover"));
 		add(
-			`Automation: ${view.mode}  Timeout: ${view.config.noProgressTimeoutSeconds === 0 ? "off" : `${view.config.noProgressTimeoutSeconds}s`}`,
+			`Automation: ${view.mode}  Timeout: ${view.config.noProgressTimeoutSeconds === 0 ? "off" : `${view.config.noProgressTimeoutSeconds}s`}  Reasoning: ${view.config.reasoningEffort}`,
 		);
 		add(`Current: ${view.current ? modelKey(view.current) : "none"}`);
 		add(
 			this.theme.fg(
 				"dim",
-				"Enter select  a add  d remove  [ ] reorder  e toggle  t timeout  r restore  q close",
+				"Enter select  a add  d remove  [ ] reorder  e toggle  t timeout  i reasoning  r restore  q close",
 			),
 		);
 		add("");

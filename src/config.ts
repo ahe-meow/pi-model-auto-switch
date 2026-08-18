@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { FailoverConfig, ModelRef } from "./types.ts";
+import type { FailoverConfig, ModelRef, ReasoningEffort } from "./types.ts";
+import { REASONING_EFFORTS } from "./types.ts";
 
 export const CONFIG_VERSION = 2 as const;
 export const DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS = 90;
+export const DEFAULT_REASONING_EFFORT: ReasoningEffort = "medium";
 
 export function createDefaultConfig(models: ModelRef[] = []): FailoverConfig {
 	return {
@@ -12,6 +14,7 @@ export function createDefaultConfig(models: ModelRef[] = []): FailoverConfig {
 		enabled: true,
 		paused: false,
 		models: models.map(copyModelRef),
+		reasoningEffort: DEFAULT_REASONING_EFFORT,
 		noProgressTimeoutSeconds: DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS,
 		manualRecovery: {},
 	};
@@ -66,6 +69,13 @@ function readManualRecovery(
 	return result;
 }
 
+function readReasoningEffort(value: unknown): ReasoningEffort | undefined {
+	return typeof value === "string" &&
+		(REASONING_EFFORTS as readonly string[]).includes(value)
+		? (value as ReasoningEffort)
+		: undefined;
+}
+
 export function isValidTimeoutSeconds(value: unknown): value is number {
 	return (
 		typeof value === "number" &&
@@ -98,9 +108,14 @@ export function validateConfig(value: unknown): FailoverConfig | undefined {
 	}
 	const models = readModels(migrated.models);
 	const manualRecovery = readManualRecovery(migrated.manualRecovery);
+	const reasoningEffort =
+		migrated.reasoningEffort === undefined
+			? DEFAULT_REASONING_EFFORT
+			: readReasoningEffort(migrated.reasoningEffort);
 	if (
 		!models ||
 		manualRecovery === undefined ||
+		!reasoningEffort ||
 		!isValidTimeoutSeconds(migrated.noProgressTimeoutSeconds)
 	) {
 		return undefined;
@@ -111,6 +126,7 @@ export function validateConfig(value: unknown): FailoverConfig | undefined {
 		enabled: migrated.enabled,
 		paused: migrated.paused,
 		models,
+		reasoningEffort,
 		noProgressTimeoutSeconds: migrated.noProgressTimeoutSeconds,
 		manualRecovery,
 	};
