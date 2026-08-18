@@ -111,13 +111,13 @@ export class FailoverEditor implements Component {
 			this.clampSelection();
 			return;
 		}
-		if (data === "[") {
+		if (matchesKey(data, Key.leftbracket)) {
 			const index = this.selectedIndex;
 			this.runAction(() => this.actions.onMove(index, -1));
 			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
 			return;
 		}
-		if (data === "]") {
+		if (matchesKey(data, Key.rightbracket)) {
 			const index = this.selectedIndex;
 			this.runAction(() => this.actions.onMove(index, 1));
 			this.selectedIndex = Math.min(
