@@ -13,6 +13,12 @@ const PERSISTENT_ERROR =
 	/\b(balance|quota|usage|billing|credit|insufficient (?:funds|quota|balance)|payment required|spending limit)\b/i;
 const NETWORK_ERROR =
 	/\b(network|fetch failed|econnreset|econnrefused|enotfound|etimedout|timeout|timed out|socket|connection|dns)\b/i;
+const API_ERROR_STATUS = /\b(?:HTTP|API)\s+error\s*\((\d{3})\)/i;
+
+function statusFromMessage(message: string): number | undefined {
+	const match = message.match(API_ERROR_STATUS);
+	return match ? Number(match[1]) : undefined;
+}
 
 export function canArmProgressTimer(
 	mode: AutomationMode,
@@ -45,16 +51,17 @@ export function classifyFailure(input: FailureInput): FailureClassification {
 	}
 
 	const message = (input.message ?? "").replace(/[_-]+/g, " ");
-	if (input.status === 401 || input.status === 403) {
-		return { kind: "persistent", reason: `HTTP ${input.status}` };
+	const status = input.status ?? statusFromMessage(message);
+	if (status === 401 || status === 403) {
+		return { kind: "persistent", reason: `HTTP ${status}` };
 	}
-	if (input.status === 404) return { kind: "persistent", reason: "HTTP 404" };
+	if (status === 404) return { kind: "persistent", reason: "HTTP 404" };
 	if (PERSISTENT_ERROR.test(message)) {
 		return { kind: "persistent", reason: "balance/quota/usage failure" };
 	}
-	if (input.status === 429) return { kind: "cooldown", reason: "HTTP 429" };
-	if (input.status !== undefined && input.status >= 500 && input.status <= 599) {
-		return { kind: "cooldown", reason: `HTTP ${input.status}` };
+	if (status === 429) return { kind: "cooldown", reason: "HTTP 429" };
+	if (status !== undefined && status >= 500 && status <= 599) {
+		return { kind: "cooldown", reason: `HTTP ${status}` };
 	}
 	if (NETWORK_ERROR.test(message))
 		return { kind: "cooldown", reason: "network failure" };
