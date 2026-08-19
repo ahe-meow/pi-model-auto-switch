@@ -48,14 +48,14 @@ Automation is enabled by default. A manual `/model` or `Ctrl+P` selection pauses
 
 For timeout, press `t`, type digits, and press Enter; Esc cancels. Add now uses the same inline selector, so all `/failover` interactions stay inside the custom panel.
 
-For official OpenAI and Azure OpenAI models, every provider request is adjusted through Pi's `before_provider_request` hook:
+For models using Pi's OpenAI Responses, Chat Completions, or Azure OpenAI Responses APIs—including custom compatible providers—every provider request is adjusted through Pi's `before_provider_request` hook:
 
 - Responses requests receive `reasoning.effort` (`off` maps to OpenAI's `none`).
 - Chat Completions requests receive `reasoning_effort`.
 - `prompt_cache_key` is a stable SHA-256 digest of the Pi Session ID, so the plaintext Session ID is not sent as the cache key.
 - `prompt_cache_retention: "24h"` requests extended prompt-cache retention.
 
-OpenAI model support is model-dependent. `xhigh` and `max` can be rejected by models that do not support them, and 24-hour retention is a best-effort maximum rather than a guaranteed cache hit. Non-OpenAI providers are left unchanged. See the [official API implementation notes](https://github.com/ahe-meow/pi-model-auto-switch/blob/main/docs/research/openai-pi-request-parameters.md) for the source references and Pi hook details.
+OpenAI model support is model-dependent. `xhigh` and `max` can be rejected by models that do not support them, and 24-hour retention is a best-effort maximum rather than a guaranteed cache hit. Other API types are left unchanged; custom gateways receive the fields but may reject, strip, or ignore them. See the [official API implementation notes](https://github.com/ahe-meow/pi-model-auto-switch/blob/main/docs/research/openai-pi-request-parameters.md) for the source references and Pi hook details.
 
 ## Failure policy
 

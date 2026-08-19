@@ -24,7 +24,7 @@ Prompt caching uses these top-level request fields on supported Responses and Ch
 
 `prompt_cache_key` influences cache routing when repeated requests share the same prefix. OpenAI recommends stable values such as session IDs, but the key does not replace exact prefix matching. OpenAI also documents a roughly 15 requests/minute traffic guideline per key; higher traffic can miss cache.
 
-`prompt_cache_retention: "24h"` requests extended retention for supported models. It is a maximum/best-effort retention policy, not a guarantee that every request gets a cache hit. Support is model- and organization-dependent; unsupported models or providers can reject the field. The implementation must therefore scope this to official OpenAI/Azure OpenAI request models rather than blindly adding it to every OpenAI-compatible gateway.
+`prompt_cache_retention: "24h"` requests extended retention for supported models. It is a maximum/best-effort retention policy, not a guarantee that every request gets a cache hit. Support is model- and organization-dependent; unsupported models or providers can reject the field. The implementation sends it only for Pi request serializers with known OpenAI field shapes (`openai-responses`, `openai-completions`, and `azure-openai-responses`), including custom gateways explicitly configured with those API types.
 
 ## Pi 0.84.2 request seam
 
@@ -46,10 +46,10 @@ Pi's existing provider serialization is:
 
 1. Add a persisted `reasoningEffort` setting with six user values: `off`, `low`, `medium`, `high`, `xhigh`, `max`; default `medium` for new installs and normalize old configs to that default.
 2. Add a small `/failover` TUI control to cycle the setting.
-3. On every official OpenAI/Azure OpenAI request, map `off` to `none` and inject the API-specific reasoning field.
+3. On every request serialized as OpenAI Responses, Chat Completions, or Azure OpenAI Responses—including custom compatible providers—map `off` to `none` and inject the API-specific reasoning field.
 4. Derive a deterministic `sha256("pi-model-failover/prompt-cache-key/v1:" + sessionId)` hex digest. This is 64 ASCII characters, contains no plaintext Session ID, and is stable for the session.
 5. Inject `prompt_cache_key` and `prompt_cache_retention: "24h"` into the request payload and replace any OpenAI session-affinity header values with the same digest.
-6. Leave non-OpenAI providers untouched. Real cache hits remain provider/model/prefix dependent and require live credentials to verify.
+6. Leave other API types untouched. Real cache hits remain provider/model/prefix dependent and require live credentials to verify; custom gateways can reject, strip, or ignore the fields.
 
 ## Limitations
 

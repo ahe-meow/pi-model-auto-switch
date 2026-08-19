@@ -43,7 +43,7 @@ import type {
 	RequestState,
 	Transition,
 } from "./types.ts";
-import { modelKey, REASONING_EFFORTS } from "./types.ts";
+import { modelKey, type REASONING_EFFORTS } from "./types.ts";
 
 export const FAILOVER_CONFIG_PATH = join(getAgentDir(), "model-failover.json");
 const COOLDOWN_MS = 30 * 60 * 1000;
@@ -63,13 +63,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isOfficialOpenAIModel(model: ExtensionContext["model"]): boolean {
-	return Boolean(
-		model &&
-			((model.provider === "openai" && OPENAI_REQUEST_APIS.has(model.api)) ||
-				(model.provider === "azure-openai-responses" &&
-					model.api === "azure-openai-responses")),
-	);
+function isOpenAIRequestModel(model: ExtensionContext["model"]): boolean {
+	return Boolean(model && OPENAI_REQUEST_APIS.has(model.api));
 }
 
 function promptCacheKey(ctx: ExtensionContext): string | undefined {
@@ -96,7 +91,7 @@ function applyOpenAIRequestParameters(
 	ctx: ExtensionContext,
 	runtime: RuntimeState,
 ): void {
-	if (!isOfficialOpenAIModel(ctx.model) || !isRecord(payload)) return;
+	if (!isOpenAIRequestModel(ctx.model) || !isRecord(payload)) return;
 	const key = promptCacheKey(ctx);
 	if (key) payload.prompt_cache_key = key;
 	payload.prompt_cache_retention = "24h";
@@ -119,7 +114,7 @@ function replaceOpenAISessionHeaders(
 	headers: Record<string, string | null>,
 	ctx: ExtensionContext,
 ): void {
-	if (!isOfficialOpenAIModel(ctx.model)) return;
+	if (!isOpenAIRequestModel(ctx.model)) return;
 	const key = promptCacheKey(ctx);
 	if (!key) return;
 	for (const name of Object.keys(headers)) {
