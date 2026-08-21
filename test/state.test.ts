@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-	canArmProgressTimer,
 	classifyFailure,
 	createRequestState,
 	markAttempt,
@@ -87,29 +86,6 @@ test("error behavior modes choose retries before switching", () => {
 	assert.equal(shouldRetryCurrentModel("cooldown", "switch"), false);
 	assert.equal(shouldRetryCurrentModel("persistent", "retry"), true);
 	assert.equal(shouldRetryCurrentModel("cancelled", "retry"), false);
-});
-
-test("progress timers run only for active initial and extension continuation attempts", () => {
-	assert.equal(
-		canArmProgressTimer("enabled", "requesting", "initial", true),
-		true,
-	);
-	assert.equal(
-		canArmProgressTimer("enabled", "requesting", "extension-continuation", true),
-		true,
-	);
-	assert.equal(
-		canArmProgressTimer("enabled", "requesting", "native-retry", true),
-		false,
-	);
-	assert.equal(
-		canArmProgressTimer("paused", "requesting", "initial", true),
-		false,
-	);
-	assert.equal(
-		canArmProgressTimer("enabled", "settled", "initial", true),
-		false,
-	);
 });
 
 test("each request starts with a fresh attempted set and continuation allowance", () => {

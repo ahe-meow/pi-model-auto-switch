@@ -465,7 +465,15 @@ export class FailoverEditor implements Component {
 	): void {
 		if (this.paramsMode) {
 			const target = model.chain[this.paramsTargetIndex];
-			if (target) this.handleParamsInput(data, model, target);
+			if (!target) {
+				// The chain shrank underneath params mode; fall back instead of
+				// swallowing every key with no way out.
+				this.paramsMode = false;
+				this.settingsMode = this.paramsReturnToSettings;
+				this.paramsReturnToSettings = false;
+				return;
+			}
+			this.handleParamsInput(data, model, target);
 			return;
 		}
 		if (this.settingsInput) {

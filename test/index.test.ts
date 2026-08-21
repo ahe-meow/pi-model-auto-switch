@@ -69,6 +69,85 @@ async function createHarness(): Promise<Harness> {
 	return { register, providers, commands, handlers };
 }
 
+/** Drive the real /failover TUI with one key sequence, then wait for the queued action. */
+/** Snapshot both managed files so "work finished" means both stopped changing. */
+async function stateSnapshot(): Promise<string> {
+	const read = async (path: string) => {
+		try {
+			return await readFile(path, "utf8");
+		} catch {
+			return "";
+		}
+	};
+	return `${await read(configPath)}\u0000${await read(modelsPath)}`;
+}
+
+async function driveFailoverTui(
+	keys: readonly string[],
+): Promise<{ notifications: string[]; config: () => Promise<RawConfig> }> {
+	const { commands, handlers } = await createHarness();
+	const sessionStart = handlers.get("session_start");
+	assert.ok(sessionStart);
+	const notifications: string[] = [];
+	const readConfig = async (): Promise<RawConfig> =>
+		JSON.parse(await readFile(configPath, "utf8")) as RawConfig;
+	const ctx = {
+		mode: "tui",
+		modelRegistry: makeRegistry(),
+		ui: {
+			notify: (message: string) => notifications.push(message),
+			setStatus: () => undefined,
+			custom: async (
+				create: (
+					tui: { requestRender(): void },
+					theme: unknown,
+					keybindings: unknown,
+					done: () => void,
+				) => { handleInput(data: string): void },
+			) => {
+				const editor = create(
+					{ requestRender: () => undefined },
+					{ fg: (_color: string, text: string) => text },
+					{},
+					() => undefined,
+				);
+				for (const key of keys) editor.handleInput(key);
+				// Wait for queued persistence to finish: leaking writes into the next
+				// test would overwrite its fixture.
+				let previous = await stateSnapshot();
+				let changed = false;
+				let stable = 0;
+				for (let attempt = 0; attempt < 200; attempt++) {
+					await new Promise((resolve) => setTimeout(resolve, 10));
+					const current = await stateSnapshot();
+					if (current !== previous) {
+						previous = current;
+						changed = true;
+						stable = 0;
+						continue;
+					}
+					if ((changed || notifications.length > 0) && ++stable >= 3) return;
+				}
+			},
+		},
+	};
+	await sessionStart({ reason: "startup" }, ctx);
+	await commands[0]!.handler("", ctx);
+	return { notifications, config: readConfig };
+}
+
+interface RawConfig {
+	version: number;
+	models: Array<{
+		id: string;
+		name: string;
+		enabled: boolean;
+		chain: ModelRef[];
+		cooldownMinutes: number;
+		targetOverrides: Record<string, unknown>;
+	}>;
+}
+
 test("migrates a v5 config into a v6 generated model and registers the provider", async () => {
 	const legacy: ModelRef[] = [{ provider: "openai", id: "gpt-5" }];
 	await writeFile(
@@ -180,49 +259,12 @@ test("adding a named model persists a disabled draft before targets are selected
 	);
 	await rm(modelsPath, { force: true });
 
-	const { commands, handlers } = await createHarness();
-	const sessionStart = handlers.get("session_start");
-	assert.ok(sessionStart);
-	const notifications: string[] = [];
-	const ctx = {
-		mode: "tui",
-		modelRegistry: makeRegistry(),
-		ui: {
-			notify: (message: string) => notifications.push(message),
-			setStatus: () => undefined,
-			custom: async (
-				create: (
-					tui: { requestRender(): void },
-					theme: unknown,
-					keybindings: unknown,
-					done: () => void,
-				) => { handleInput(data: string): void },
-			) => {
-				const editor = create(
-					{ requestRender: () => undefined },
-					{ fg: (_color: string, text: string) => text },
-					{},
-					() => undefined,
-				);
-				editor.handleInput("a");
-				for (const character of "Named model") editor.handleInput(character);
-				editor.handleInput("\r");
-				for (let attempt = 0; attempt < 50; attempt++) {
-					const raw = JSON.parse(await readFile(configPath, "utf8")) as {
-						models: unknown[];
-					};
-					if (raw.models.length > 0 || notifications.length > 0) return;
-					await new Promise((resolve) => setTimeout(resolve, 10));
-				}
-			},
-		},
-	};
-	await sessionStart({ reason: "startup" }, ctx);
-	await commands[0]!.handler("", ctx);
-
-	const raw = JSON.parse(await readFile(configPath, "utf8")) as {
-		models: Array<{ name: string; enabled: boolean; chain: ModelRef[] }>;
-	};
+	const { notifications, config } = await driveFailoverTui([
+		"a",
+		..."Named model",
+		"\r",
+	]);
+	const raw = await config();
 	assert.deepEqual(
 		notifications.filter((message) => message.includes("Failover error")),
 		[],
@@ -252,52 +294,12 @@ test("removing the last target disables the model instead of failing validation"
 	);
 	await rm(modelsPath, { force: true });
 
-	const { commands, handlers } = await createHarness();
-	const sessionStart = handlers.get("session_start");
-	assert.ok(sessionStart);
-	const notifications: string[] = [];
-	const ctx = {
-		mode: "tui",
-		modelRegistry: makeRegistry(),
-		ui: {
-			notify: (message: string) => notifications.push(message),
-			setStatus: () => undefined,
-			custom: async (
-				create: (
-					tui: { requestRender(): void },
-					theme: unknown,
-					keybindings: unknown,
-					done: () => void,
-				) => { handleInput(data: string): void },
-			) => {
-				const editor = create(
-					{ requestRender: () => undefined },
-					{ fg: (_color: string, text: string) => text },
-					{},
-					() => undefined,
-				);
-				editor.handleInput("\r"); // open model detail
-				editor.handleInput("d"); // remove the selected target
-				for (let attempt = 0; attempt < 50; attempt++) {
-					const raw = JSON.parse(await readFile(configPath, "utf8")) as {
-						models: Array<{ enabled: boolean; chain: unknown[] }>;
-					};
-					if (raw.models[0]?.chain.length === 0 || notifications.length > 0) return;
-					await new Promise((resolve) => setTimeout(resolve, 10));
-				}
-			},
-		},
-	};
-	await sessionStart({ reason: "startup" }, ctx);
-	await commands[0]!.handler("", ctx);
+	const { notifications, config } = await driveFailoverTui([
+		"\r", // open the model detail
+		"d", // remove the selected target
+	]);
 
-	const raw = JSON.parse(await readFile(configPath, "utf8")) as {
-		models: Array<{
-			enabled: boolean;
-			chain: ModelRef[];
-			targetOverrides: Record<string, unknown>;
-		}>;
-	};
+	const raw = await config();
 	assert.deepEqual(
 		notifications.filter((message) => message.includes("Failover error")),
 		[],
@@ -305,6 +307,77 @@ test("removing the last target disables the model instead of failing validation"
 	assert.equal(raw.models[0]!.enabled, false);
 	assert.deepEqual(raw.models[0]!.chain, []);
 	assert.deepEqual(raw.models[0]!.targetOverrides, {});
+});
+
+test("a model name starting with a digit still persists a valid generated id", async () => {
+	await writeFile(
+		configPath,
+		JSON.stringify({ version: 6, models: [] }),
+		"utf8",
+	);
+	await rm(modelsPath, { force: true });
+
+	const { notifications, config } = await driveFailoverTui([
+		"a",
+		..."2nd chain",
+		"\r",
+	]);
+	const raw = await config();
+	assert.deepEqual(
+		notifications.filter((message) => message.includes("Failover error")),
+		[],
+	);
+	assert.equal(raw.models.length, 1);
+	assert.match(raw.models[0]!.id, /^[a-z][a-z0-9_-]*$/);
+	assert.equal(raw.models[0]!.name, "2nd chain");
+});
+
+test("enabling a model without targets warns instead of throwing", async () => {
+	const draft = createGeneratedModel([]);
+	draft.id = "draft";
+	draft.name = "Draft";
+	draft.enabled = false;
+	await writeFile(
+		configPath,
+		JSON.stringify({ version: 6, models: [draft] }),
+		"utf8",
+	);
+	await rm(modelsPath, { force: true });
+
+	const { notifications, config } = await driveFailoverTui(["e"]);
+	const raw = await config();
+	assert.equal(raw.models[0]!.enabled, false);
+	assert.deepEqual(
+		notifications.filter((message) => message.includes("Failover error")),
+		[],
+	);
+	assert.ok(notifications.some((message) => /target/i.test(message)));
+});
+
+test("clearing a numeric setting is rejected instead of silently saving 0", async () => {
+	const entry = createGeneratedModel([{ provider: "openai", id: "gpt-5" }]);
+	entry.id = "default";
+	entry.enabled = true;
+	entry.cooldownMinutes = 30;
+	await writeFile(
+		configPath,
+		JSON.stringify({ version: 6, models: [entry] }),
+		"utf8",
+	);
+	await rm(modelsPath, { force: true });
+
+	const { notifications, config } = await driveFailoverTui([
+		"\r", // open the model detail
+		"t", // settings menu
+		"\x1b[B", // move to Cooldown
+		"\r", // start editing
+		"\x7f",
+		"\x7f", // clear "30"
+		"\r", // commit an empty value
+	]);
+	const raw = await config();
+	assert.equal(raw.models[0]!.cooldownMinutes, 30);
+	assert.ok(notifications.some((message) => /cooldown/i.test(message)));
 });
 
 test("registers the /failover command", async () => {

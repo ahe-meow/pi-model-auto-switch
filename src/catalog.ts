@@ -6,12 +6,6 @@ export interface RegistryModel {
 	id: string;
 }
 
-export interface ModelRegistryReader {
-	refresh?: () => Promise<unknown>;
-	getAll(): readonly RegistryModel[];
-	getAvailable(): readonly RegistryModel[];
-}
-
 function asRef(model: RegistryModel): ModelRef | undefined {
 	if (typeof model.provider !== "string" || model.provider.length === 0)
 		return undefined;
@@ -31,32 +25,4 @@ export function uniqueModels(models: readonly RegistryModel[]): ModelRef[] {
 		result.push(ref);
 	}
 	return result;
-}
-
-export type DiscoveryResult =
-	| { kind: "success"; available: ModelRef[] }
-	| { kind: "failure"; available: ModelRef[]; error: unknown };
-
-/** Refresh and observe the models Pi currently considers authenticated. */
-export async function discoverModels(
-	registry: ModelRegistryReader,
-): Promise<DiscoveryResult> {
-	try {
-		await registry.refresh?.();
-		return { kind: "success", available: uniqueModels(registry.getAvailable()) };
-	} catch (error) {
-		try {
-			return {
-				kind: "failure",
-				available: uniqueModels(registry.getAvailable()),
-				error,
-			};
-		} catch {
-			return { kind: "failure", available: [], error };
-		}
-	}
-}
-
-export function seedModelList(current: ModelRef | undefined): ModelRef[] {
-	return current ? [{ ...current }] : [];
 }

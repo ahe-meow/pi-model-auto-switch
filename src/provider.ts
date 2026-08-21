@@ -70,7 +70,6 @@ export interface RequestOptions {
 	transformHeaders?: (
 		headers: Record<string, string | null>,
 	) => Record<string, string | null> | Promise<Record<string, string | null>>;
-	onProgress?: () => void;
 	[key: string]: unknown;
 }
 
@@ -307,10 +306,7 @@ async function executeTarget(
 		const work = delegate.stream
 			? (async () => {
 					const stream = delegate.stream!(model, context, attemptOptions);
-					for await (const _event of stream) {
-						options.onProgress?.();
-						resetTimer();
-					}
+					for await (const _event of stream) resetTimer();
 					return (await stream.result()) as AssistantMessageLike;
 				})()
 			: delegate.complete(model, context, attemptOptions);
@@ -320,8 +316,11 @@ async function executeTarget(
 		return { result, timedOut: false };
 	} catch (error) {
 		if (timedOut) return { result: errorMessage(error), timedOut: true };
-		if (outerAborted) return { result: errorMessage(error), timedOut: false };
-		throw error;
+		// Auth, transport, and delegate throws become classifiable failures so the
+		// chain can advance; only a real cancellation stops it.
+		const failed = errorMessage(error);
+		if (outerAborted) failed.stopReason = "aborted";
+		return { result: failed, timedOut: false };
 	} finally {
 		if (timer !== undefined) clearTimeout(timer);
 		if (outerSignal) outerSignal.removeEventListener("abort", onAbort);

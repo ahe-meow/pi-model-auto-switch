@@ -200,6 +200,26 @@ test("success buffers a single done event and forwards the target message", asyn
 	assert.equal(calls.length, 1);
 });
 
+test("a thrown delegate error fails over to the next target", async () => {
+	const a = { provider: "a", id: "m1" };
+	const b = { provider: "b", id: "m2" };
+	const generated = createGeneratedModel([a, b]);
+	generated.id = "primary";
+	generated.maxRetries = 0;
+	const { delegate, calls } = scriptedDelegate(
+		new Map([
+			["a/m1", targetModel(a)],
+			["b/m2", targetModel(b)],
+		]),
+		[{ error: new Error('No API key found for "a"') }, { result: okMessage(b) }],
+	);
+	const state = makeState([generated], delegate);
+	const { result } = await consume(runFailoverRequest(generated, {}, {}, state));
+	assert.equal(result.provider, "b");
+	assert.equal(result.model, "m2");
+	assert.equal(calls.length, 2);
+});
+
 test("a cooldown failure routes to the next target and records the cooldown", async () => {
 	const a = { provider: "a", id: "m1" };
 	const b = { provider: "b", id: "m2" };

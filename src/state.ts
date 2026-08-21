@@ -1,10 +1,8 @@
 import type {
-	AutomationMode,
 	FailureClassification,
 	FailureInput,
 	FailureKind,
 	ModelRef,
-	ProgressAttemptKind,
 	RequestState,
 } from "./types.ts";
 import { modelKey } from "./types.ts";
@@ -18,27 +16,6 @@ const API_ERROR_STATUS = /\b(?:HTTP|API)\s+error\s*\((\d{3})\)/i;
 function statusFromMessage(message: string): number | undefined {
 	const match = message.match(API_ERROR_STATUS);
 	return match ? Number(match[1]) : undefined;
-}
-
-export function canArmProgressTimer(
-	mode: AutomationMode,
-	phase:
-		| "ready"
-		| "requesting"
-		| "settled"
-		| "switching"
-		| "succeeded"
-		| "cancelled"
-		| "exhausted",
-	attemptKind: ProgressAttemptKind,
-	hasRequest: boolean,
-): boolean {
-	return (
-		hasRequest &&
-		mode === "enabled" &&
-		phase === "requesting" &&
-		attemptKind !== "native-retry"
-	);
 }
 
 export function classifyFailure(input: FailureInput): FailureClassification {

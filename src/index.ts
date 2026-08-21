@@ -16,6 +16,7 @@ import {
 	createGeneratedModel,
 	loadGeneratedConfig,
 	saveGeneratedConfig,
+	validateGeneratedConfig,
 } from "./generated-config.ts";
 import {
 	FAILOVER_PROVIDER_ID,
@@ -217,6 +218,10 @@ async function persist(
 		);
 		return false;
 	}
+	if (!validateGeneratedConfig(config)) {
+		notify(ctx, "Failover change rejected: it would be invalid", "warning");
+		return false;
+	}
 	const saved = await saveGeneratedConfig(
 		FAILOVER_CONFIG_PATH,
 		config,
@@ -250,23 +255,31 @@ function updateModel(
 	);
 }
 
+/** Generated ids must match /^[a-z][a-z0-9_-]{0,63}$/ to pass config validation. */
+const MAX_GENERATED_ID_LENGTH = 64;
+const MAX_GENERATED_NAME_LENGTH = 120;
+
 function slugify(name: string): string {
-	const base =
-		name
-			.toLowerCase()
-			.replace(/[^a-z0-9_-]+/g, "-")
-			.replace(/^-+|-+$/g, "")
-			.slice(0, 63) || "model";
-	return base;
+	const cleaned = name
+		.toLowerCase()
+		.replace(/[^a-z0-9_-]+/g, "-")
+		.replace(/^-+|-+$/g, "");
+	if (!cleaned) return "model";
+	return (/^[a-z]/.test(cleaned) ? cleaned : `m${cleaned}`).slice(
+		0,
+		MAX_GENERATED_ID_LENGTH,
+	);
 }
 
 function uniqueModelId(config: GeneratedFailoverConfig, name: string): string {
 	const base = slugify(name);
 	const ids = new Set(config.models.map((model) => model.id));
-	let candidate = base;
-	let index = 2;
-	while (ids.has(candidate)) candidate = `${base}-${index++}`;
-	return candidate.slice(0, 63);
+	if (!ids.has(base)) return base;
+	for (let index = 2; ; index++) {
+		const suffix = `-${index}`;
+		const candidate = `${base.slice(0, MAX_GENERATED_ID_LENGTH - suffix.length)}${suffix}`;
+		if (!ids.has(candidate)) return candidate;
+	}
 }
 
 function setTargetReasoning(
@@ -479,6 +492,12 @@ function viewFor(runtime: RuntimeState): FailoverTuiView {
 	};
 }
 
+/** Empty or non-numeric input must never silently resolve to 0. */
+function parseNumericSetting(value: string): number | undefined {
+	const text = value.trim();
+	return /^\d+$/.test(text) ? Number(text) : undefined;
+}
+
 function createFailoverActions(
 	ctx: ExtensionContext,
 	runtime: RuntimeState,
@@ -502,14 +521,15 @@ function createFailoverActions(
 		onClose: close,
 		onError: (error) => notify(ctx, `Failover error: ${String(error)}`, "error"),
 		onAddModel: async (name) => {
-			const id = uniqueModelId(runtime.config, name);
+			const label = name.slice(0, MAX_GENERATED_NAME_LENGTH);
+			const id = uniqueModelId(runtime.config, label);
 			await mutate((config) =>
 				createGeneratedConfig([
 					...config.models,
 					{
 						...createGeneratedModel([]),
 						id,
-						name,
+						name: label,
 						enabled: false,
 					},
 				]),
@@ -521,10 +541,23 @@ function createFailoverActions(
 				createGeneratedConfig(config.models.filter((model) => model.id !== id)),
 			);
 		},
-		onToggleModel: async (id) =>
-			update(id, (model) => ({ ...model, enabled: !model.enabled })),
+		onToggleModel: async (id) => {
+			const current = runtime.config.models.find((entry) => entry.id === id);
+			if (current && !current.enabled && current.chain.length === 0) {
+				notify(
+					ctx,
+					`Add at least one target before enabling "${current.name}"`,
+					"warning",
+				);
+				return;
+			}
+			await update(id, (model) => ({ ...model, enabled: !model.enabled }));
+		},
 		onRenameModel: async (id, name) =>
-			update(id, (model) => ({ ...model, name })),
+			update(id, (model) => ({
+				...model,
+				name: name.slice(0, MAX_GENERATED_NAME_LENGTH),
+			})),
 		onAddTarget: async (id, target) =>
 			update(id, (model) => {
 				if (model.chain.some((entry) => modelKey(entry) === modelKey(target)))
@@ -566,8 +599,8 @@ function createFailoverActions(
 		onSetReasoning: async (id, effort) =>
 			update(id, (model) => ({ ...model, reasoningEffort: effort })),
 		onSetCooldown: async (id, value) => {
-			const minutes = Number(value.trim());
-			if (!isValidCooldownMinutes(minutes)) {
+			const minutes = parseNumericSetting(value);
+			if (minutes === undefined || !isValidCooldownMinutes(minutes)) {
 				notify(
 					ctx,
 					"Cooldown must be an integer from 0 to 1440 minutes",
@@ -580,16 +613,16 @@ function createFailoverActions(
 		onSetErrorHandling: async (id, mode: ErrorHandlingMode) =>
 			update(id, (model) => ({ ...model, errorHandlingMode: mode })),
 		onSetMaxRetries: async (id, value) => {
-			const maxRetries = Number(value.trim());
-			if (!isValidMaxRetries(maxRetries)) {
+			const maxRetries = parseNumericSetting(value);
+			if (maxRetries === undefined || !isValidMaxRetries(maxRetries)) {
 				notify(ctx, "Max retries must be an integer from 0 to 10", "warning");
 				return;
 			}
 			await update(id, (model) => ({ ...model, maxRetries }));
 		},
 		onSetTimeout: async (id, value) => {
-			const seconds = Number(value.trim());
-			if (!isValidTimeoutSeconds(seconds)) {
+			const seconds = parseNumericSetting(value);
+			if (seconds === undefined || !isValidTimeoutSeconds(seconds)) {
 				notify(
 					ctx,
 					"Timeout must be 0 or an integer from 15 to 900 seconds",

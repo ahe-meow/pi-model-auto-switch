@@ -3,7 +3,6 @@ import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ConfigSourceRevision } from "./config.ts";
 import {
-	ERROR_HANDLING_MODES,
 	REASONING_EFFORTS,
 	modelKey,
 	type GeneratedFailoverConfig,

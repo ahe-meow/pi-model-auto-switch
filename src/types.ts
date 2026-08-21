@@ -91,12 +91,6 @@ export interface FailoverConfig {
 	modelReasoningEfforts: Record<string, ReasoningEffort>;
 }
 
-export type AutomationMode = "enabled" | "paused" | "disabled";
-export type ProgressAttemptKind =
-	| "initial"
-	| "native-retry"
-	| "extension-continuation";
-
 export type FailureKind =
 	| "persistent"
 	| "cooldown"
@@ -126,11 +120,4 @@ export interface RequestState {
 	sameModelRetries: number;
 	activeModel?: ModelRef;
 	completed: boolean;
-}
-
-export interface Transition {
-	source?: ModelRef;
-	target?: ModelRef;
-	reason: string;
-	at: number;
 }
