@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createDefaultConfig } from "../src/config.ts";
+import { createGeneratedModel } from "../src/generated-config.ts";
 import type { ModelRef } from "../src/types.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown | Promise<unknown>;
@@ -235,6 +236,75 @@ test("adding a named model persists a disabled draft before targets are selected
 		},
 		{ name: "Named model", enabled: false, chain: [] },
 	);
+});
+
+test("removing the last target disables the model instead of failing validation", async () => {
+	const generated = createGeneratedModel([{ provider: "openai", id: "gpt-5" }]);
+	generated.id = "default";
+	generated.enabled = true;
+	generated.targetOverrides = {
+		"openai/gpt-5": { reasoningEffort: "high" },
+	};
+	await writeFile(
+		configPath,
+		JSON.stringify({ version: 6, models: [generated] }),
+		"utf8",
+	);
+	await rm(modelsPath, { force: true });
+
+	const { commands, handlers } = await createHarness();
+	const sessionStart = handlers.get("session_start");
+	assert.ok(sessionStart);
+	const notifications: string[] = [];
+	const ctx = {
+		mode: "tui",
+		modelRegistry: makeRegistry(),
+		ui: {
+			notify: (message: string) => notifications.push(message),
+			setStatus: () => undefined,
+			custom: async (
+				create: (
+					tui: { requestRender(): void },
+					theme: unknown,
+					keybindings: unknown,
+					done: () => void,
+				) => { handleInput(data: string): void },
+			) => {
+				const editor = create(
+					{ requestRender: () => undefined },
+					{ fg: (_color: string, text: string) => text },
+					{},
+					() => undefined,
+				);
+				editor.handleInput("\r"); // open model detail
+				editor.handleInput("d"); // remove the selected target
+				for (let attempt = 0; attempt < 50; attempt++) {
+					const raw = JSON.parse(await readFile(configPath, "utf8")) as {
+						models: Array<{ enabled: boolean; chain: unknown[] }>;
+					};
+					if (raw.models[0]?.chain.length === 0 || notifications.length > 0) return;
+					await new Promise((resolve) => setTimeout(resolve, 10));
+				}
+			},
+		},
+	};
+	await sessionStart({ reason: "startup" }, ctx);
+	await commands[0]!.handler("", ctx);
+
+	const raw = JSON.parse(await readFile(configPath, "utf8")) as {
+		models: Array<{
+			enabled: boolean;
+			chain: ModelRef[];
+			targetOverrides: Record<string, unknown>;
+		}>;
+	};
+	assert.deepEqual(
+		notifications.filter((message) => message.includes("Failover error")),
+		[],
+	);
+	assert.equal(raw.models[0]!.enabled, false);
+	assert.deepEqual(raw.models[0]!.chain, []);
+	assert.deepEqual(raw.models[0]!.targetOverrides, {});
 });
 
 test("registers the /failover command", async () => {

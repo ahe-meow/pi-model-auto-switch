@@ -316,6 +316,25 @@ function clearRuntimeRecovery(runtime: RuntimeState, id: string): void {
 	}
 }
 
+/** Clear runtime state scoped to one removed target, not the whole model. */
+function clearTargetRuntimeState(
+	runtime: RuntimeState,
+	id: string,
+	target: ModelRef,
+): void {
+	const prefix = `${id}:${modelKey(target)}`;
+	for (const key of [...runtime.providerState.cooldowns.keys()]) {
+		if (key === prefix) runtime.providerState.cooldowns.delete(key);
+	}
+	for (const key of [...runtime.providerState.manualRecovery.keys()]) {
+		if (key === prefix) runtime.providerState.manualRecovery.delete(key);
+	}
+	for (const key of [...runtime.providerState.unsupportedCacheFields.keys()]) {
+		if (key.startsWith(`${prefix}:`))
+			runtime.providerState.unsupportedCacheFields.delete(key);
+	}
+}
+
 function createDelegate(runtime: RuntimeState): Delegate {
 	return {
 		resolveModel: (target) => {
@@ -512,11 +531,26 @@ function createFailoverActions(
 					return model;
 				return { ...model, chain: [...model.chain, target] };
 			}),
-		onRemoveTarget: async (id, target) =>
-			update(id, (model) => ({
-				...model,
-				chain: model.chain.filter((entry) => modelKey(entry) !== modelKey(target)),
-			})),
+		onRemoveTarget: async (id, target) => {
+			clearTargetRuntimeState(runtime, id, target);
+			await update(id, (model) => {
+				const targetKey = modelKey(target);
+				const chain = model.chain.filter((entry) => modelKey(entry) !== targetKey);
+				const targetOverrides = { ...model.targetOverrides };
+				delete targetOverrides[targetKey];
+				const manualRecovery = { ...model.manualRecovery };
+				delete manualRecovery[targetKey];
+				return {
+					...model,
+					// An enabled model with an empty chain is invalid; keep it as a
+					// disabled draft so the user can re-add targets before enabling.
+					enabled: chain.length === 0 ? false : model.enabled,
+					chain,
+					targetOverrides,
+					manualRecovery,
+				};
+			});
+		},
 		onMoveTarget: async (id, target, direction) =>
 			update(id, (model) => {
 				const index = model.chain.findIndex(
