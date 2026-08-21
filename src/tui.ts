@@ -8,15 +8,13 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import type {
-	FailoverConfig,
+	ErrorHandlingMode,
+	GeneratedFailoverConfig,
+	GeneratedFailoverModel,
 	ModelParameterName,
 	ModelRef,
-	AutomationMode,
-	ErrorHandlingMode,
 	ReasoningEffort,
-	Transition,
 } from "./types.ts";
-import { resolveReasoningEffort } from "./config.ts";
 import {
 	ERROR_HANDLING_MODES,
 	modelKey,
@@ -25,40 +23,43 @@ import {
 } from "./types.ts";
 
 export interface FailoverTuiView {
-	config: FailoverConfig;
-	models: readonly ModelRef[];
+	config: GeneratedFailoverConfig;
 	available: readonly ModelRef[];
-	current?: ModelRef;
-	mode: AutomationMode;
 	cooldowns: ReadonlyMap<string, number>;
 	manualRecovery: ReadonlyMap<string, string>;
-	latestTransition?: Transition;
-	exhaustionSummary?: string;
 }
 
 export interface FailoverTuiActions {
 	onClose: () => void;
 	onError: (error: unknown) => void;
-	onAdd: (model: ModelRef) => Promise<void>;
-	onRemove: (index: number) => Promise<void>;
-	onMove: (index: number, direction: -1 | 1) => Promise<void>;
-	onSelect: (model: ModelRef) => Promise<void>;
-	onToggleEnabled: () => Promise<void>;
-	onSetCooldownMinutes: (value: string) => Promise<void>;
-	onSetErrorHandlingMode: (mode: ErrorHandlingMode) => Promise<void>;
-	onSetMaxRetries: (value: string) => Promise<void>;
-	onSetTimeout: (value: string) => Promise<void>;
-	onSetReasoningEffort: (effort: ReasoningEffort) => Promise<void>;
-	onSetModelReasoningEffort: (
-		model: ModelRef,
+	onAddModel: (name: string) => Promise<void>;
+	onRemoveModel: (id: string) => Promise<void>;
+	onToggleModel: (id: string) => Promise<void>;
+	onRenameModel: (id: string, name: string) => Promise<void>;
+	onAddTarget: (id: string, target: ModelRef) => Promise<void>;
+	onRemoveTarget: (id: string, target: ModelRef) => Promise<void>;
+	onMoveTarget: (
+		id: string,
+		target: ModelRef,
+		direction: -1 | 1,
+	) => Promise<void>;
+	onSetReasoning: (id: string, effort: ReasoningEffort) => Promise<void>;
+	onSetCooldown: (id: string, minutes: string) => Promise<void>;
+	onSetErrorHandling: (id: string, mode: ErrorHandlingMode) => Promise<void>;
+	onSetMaxRetries: (id: string, value: string) => Promise<void>;
+	onSetTimeout: (id: string, value: string) => Promise<void>;
+	onSetTargetReasoning: (
+		id: string,
+		target: ModelRef,
 		effort: ReasoningEffort | undefined,
 	) => Promise<void>;
-	onSetModelParameter: (
-		model: ModelRef,
+	onSetTargetParameter: (
+		id: string,
+		target: ModelRef,
 		parameter: ModelParameterName,
 		enabled: boolean,
 	) => Promise<void>;
-	onRestore: () => Promise<void>;
+	onRestore: (id: string) => Promise<void>;
 }
 
 function runTuiAction(
@@ -74,26 +75,29 @@ function padRight(text: string, width: number): string {
 }
 
 type SettingKey =
-	| "cooldownMinutes"
+	| "reasoning"
+	| "cooldown"
 	| "errorHandlingMode"
 	| "maxRetries"
 	| "noProgressTimeoutSeconds"
-	| "modelParameters";
+	| "targetParameters";
 
 const SETTING_KEYS: readonly SettingKey[] = [
-	"cooldownMinutes",
+	"reasoning",
+	"cooldown",
 	"errorHandlingMode",
 	"maxRetries",
 	"noProgressTimeoutSeconds",
-	"modelParameters",
+	"targetParameters",
 ];
 
 const SETTING_LABELS: Record<SettingKey, string> = {
-	cooldownMinutes: "Cooldown",
+	reasoning: "Reasoning level",
+	cooldown: "Cooldown",
 	errorHandlingMode: "Error behavior",
 	maxRetries: "Max retries",
 	noProgressTimeoutSeconds: "No-result timeout",
-	modelParameters: "Model parameters",
+	targetParameters: "Target parameters",
 };
 
 const PARAMETER_LABELS: Record<ModelParameterName, string> = {
@@ -110,7 +114,7 @@ const ERROR_HANDLING_LABELS: Record<ErrorHandlingMode, string> = {
 };
 
 const MAX_VISIBLE_MODELS = 20;
-const MODEL_REASONING_CHOICES: readonly (ReasoningEffort | undefined)[] = [
+const TARGET_REASONING_CHOICES: readonly (ReasoningEffort | undefined)[] = [
 	undefined,
 	...REASONING_EFFORTS,
 ];
@@ -118,17 +122,23 @@ const MODEL_REASONING_CHOICES: readonly (ReasoningEffort | undefined)[] = [
 export class FailoverEditor implements Component {
 	private selectedIndex = 0;
 	private scrollOffset = 0;
-	private reasoningSelectionIndex: number | undefined;
-	private addCandidates: readonly ModelRef[] | undefined;
-	private addSelectionIndex: number | undefined;
+	private detailModelId: string | undefined;
+	private detailTargetIndex = 0;
+	private detailScrollOffset = 0;
+	private addTargetCandidates: readonly ModelRef[] | undefined;
+	private addTargetSelectionIndex: number | undefined;
+	private addModelName: string | undefined;
+	private renameModelName: string | undefined;
 	private settingsMode = false;
 	private settingsSelectionIndex = 0;
 	private settingsInput: { key: SettingKey; value: string } | undefined;
 	private behaviorSelectionIndex: number | undefined;
+	private reasoningSelectionIndex: number | undefined;
 	private paramsMode = false;
-	private paramsModelIndex = 0;
+	private paramsReturnToSettings = false;
+	private paramsTargetIndex = 0;
 	private paramsSelectionIndex = 0;
-	private modelReasoningSelectionIndex: number | undefined;
+	private targetReasoningSelectionIndex: number | undefined;
 	private actionQueue = Promise.resolve();
 	private readonly border: DynamicBorder;
 
@@ -140,10 +150,6 @@ export class FailoverEditor implements Component {
 		this.border = new DynamicBorder((text: string) => theme.fg("accent", text));
 	}
 
-	private selectedModel(): ModelRef | undefined {
-		return this.getView().models[this.selectedIndex];
-	}
-
 	private runAction(action: () => Promise<void>): void {
 		const previous = this.actionQueue;
 		this.actionQueue = runTuiAction(
@@ -152,38 +158,46 @@ export class FailoverEditor implements Component {
 		);
 	}
 
+	private selectedModel(): GeneratedFailoverModel | undefined {
+		return this.getView().config.models[this.selectedIndex];
+	}
+
+	private detailModel(): GeneratedFailoverModel | undefined {
+		if (this.detailModelId === undefined) return undefined;
+		return this.getView().config.models.find(
+			(model) => model.id === this.detailModelId,
+		);
+	}
+
+	private detailTarget(): ModelRef | undefined {
+		return this.detailModel()?.chain[this.detailTargetIndex];
+	}
+
 	private clampSelection(): void {
-		const count = this.getView().models.length;
+		const count = this.getView().config.models.length;
 		this.selectedIndex =
 			count === 0 ? 0 : Math.min(this.selectedIndex, count - 1);
 		const maxOffset = Math.max(0, count - MAX_VISIBLE_MODELS);
-		if (this.selectedIndex < this.scrollOffset) {
+		if (this.selectedIndex < this.scrollOffset)
 			this.scrollOffset = this.selectedIndex;
-		} else if (this.selectedIndex >= this.scrollOffset + MAX_VISIBLE_MODELS) {
+		else if (this.selectedIndex >= this.scrollOffset + MAX_VISIBLE_MODELS)
 			this.scrollOffset = this.selectedIndex - MAX_VISIBLE_MODELS + 1;
-		}
 		this.scrollOffset = Math.min(this.scrollOffset, maxOffset);
 	}
 
-	private beginSettingsEdit(view: FailoverTuiView): void {
-		const key = SETTING_KEYS[this.settingsSelectionIndex];
-		if (!key) return;
-		if (key === "modelParameters") {
-			if (view.models.length === 0) return;
-			this.paramsMode = true;
-			this.paramsModelIndex = Math.min(this.selectedIndex, view.models.length - 1);
-			this.paramsSelectionIndex = 0;
-			this.modelReasoningSelectionIndex = undefined;
-			return;
-		}
-		if (key === "errorHandlingMode") {
-			this.behaviorSelectionIndex = Math.max(
-				0,
-				ERROR_HANDLING_MODES.indexOf(view.config.errorHandlingMode),
-			);
-			return;
-		}
-		this.settingsInput = { key, value: String(view.config[key]) };
+	private clampDetailTarget(): void {
+		const count = this.detailModel()?.chain.length ?? 0;
+		this.detailTargetIndex =
+			count === 0 ? 0 : Math.min(this.detailTargetIndex, count - 1);
+		const maxOffset = Math.max(0, count - MAX_VISIBLE_MODELS);
+		if (this.detailTargetIndex < this.detailScrollOffset)
+			this.detailScrollOffset = this.detailTargetIndex;
+		else if (
+			this.detailTargetIndex >=
+			this.detailScrollOffset + MAX_VISIBLE_MODELS
+		)
+			this.detailScrollOffset = this.detailTargetIndex - MAX_VISIBLE_MODELS + 1;
+		this.detailScrollOffset = Math.min(this.detailScrollOffset, maxOffset);
 	}
 
 	private isCancelInput(data: string): boolean {
@@ -194,23 +208,73 @@ export class FailoverEditor implements Component {
 		);
 	}
 
-	private saveNumericSetting(key: SettingKey, value: string): void {
+	private openDetail(): void {
+		const model = this.selectedModel();
+		if (!model) return;
+		this.detailModelId = model.id;
+		this.detailTargetIndex = 0;
+		this.detailScrollOffset = 0;
+	}
+
+	private beginSettingsEdit(model: GeneratedFailoverModel): void {
+		const key = SETTING_KEYS[this.settingsSelectionIndex];
+		if (!key) return;
+		if (key === "targetParameters") {
+			if (model.chain.length === 0) return;
+			this.paramsMode = true;
+			this.paramsReturnToSettings = true;
+			this.paramsTargetIndex = Math.min(
+				this.detailTargetIndex,
+				model.chain.length - 1,
+			);
+			this.paramsSelectionIndex = 0;
+			this.targetReasoningSelectionIndex = undefined;
+			return;
+		}
+		if (key === "errorHandlingMode") {
+			this.behaviorSelectionIndex = Math.max(
+				0,
+				ERROR_HANDLING_MODES.indexOf(model.errorHandlingMode),
+			);
+			return;
+		}
+		if (key === "reasoning") {
+			this.reasoningSelectionIndex = Math.max(
+				0,
+				REASONING_EFFORTS.indexOf(model.reasoningEffort),
+			);
+			return;
+		}
+		const numericValue =
+			key === "cooldown"
+				? model.cooldownMinutes
+				: key === "maxRetries"
+					? model.maxRetries
+					: model.noProgressTimeoutSeconds;
+		this.settingsInput = { key, value: String(numericValue) };
+	}
+
+	private saveNumericSetting(
+		modelId: string,
+		key: SettingKey,
+		value: string,
+	): void {
 		switch (key) {
-			case "cooldownMinutes":
-				this.runAction(() => this.actions.onSetCooldownMinutes(value));
+			case "cooldown":
+				this.runAction(() => this.actions.onSetCooldown(modelId, value));
 				return;
 			case "maxRetries":
-				this.runAction(() => this.actions.onSetMaxRetries(value));
+				this.runAction(() => this.actions.onSetMaxRetries(modelId, value));
 				return;
 			case "noProgressTimeoutSeconds":
-				this.runAction(() => this.actions.onSetTimeout(value));
+				this.runAction(() => this.actions.onSetTimeout(modelId, value));
 				return;
 			default:
 				return;
 		}
 	}
 
-	private handleNumericSettingInput(data: string): void {
+	private handleNumericSettingInput(data: string, modelId: string): void {
 		const edit = this.settingsInput;
 		if (!edit) return;
 		if (this.isCancelInput(data)) {
@@ -223,13 +287,13 @@ export class FailoverEditor implements Component {
 		}
 		if (matchesKey(data, Key.enter)) {
 			this.settingsInput = undefined;
-			this.saveNumericSetting(edit.key, edit.value);
+			this.saveNumericSetting(modelId, edit.key, edit.value);
 			return;
 		}
 		if (/^\d+$/.test(data)) edit.value += data;
 	}
 
-	private handleBehaviorInput(data: string): void {
+	private handleBehaviorInput(data: string, modelId: string): void {
 		const index = this.behaviorSelectionIndex;
 		if (index === undefined) return;
 		if (this.isCancelInput(data)) {
@@ -250,161 +314,11 @@ export class FailoverEditor implements Component {
 		if (!matchesKey(data, Key.enter)) return;
 		const mode = ERROR_HANDLING_MODES[index];
 		this.behaviorSelectionIndex = undefined;
-		if (mode) this.runAction(() => this.actions.onSetErrorHandlingMode(mode));
+		if (mode)
+			this.runAction(() => this.actions.onSetErrorHandling(modelId, mode));
 	}
 
-	private handleSettingsMenuInput(data: string, view: FailoverTuiView): void {
-		if (this.isCancelInput(data)) {
-			this.settingsMode = false;
-			return;
-		}
-		if (matchesKey(data, Key.up)) {
-			this.settingsSelectionIndex = Math.max(0, this.settingsSelectionIndex - 1);
-			return;
-		}
-		if (matchesKey(data, Key.down)) {
-			this.settingsSelectionIndex = Math.min(
-				SETTING_KEYS.length - 1,
-				this.settingsSelectionIndex + 1,
-			);
-			return;
-		}
-		if (matchesKey(data, Key.enter)) this.beginSettingsEdit(view);
-	}
-
-	private modelReasoningChoiceIndex(
-		view: FailoverTuiView,
-		model: ModelRef,
-	): number {
-		const effort = view.config.modelReasoningEfforts[modelKey(model)];
-		if (effort === undefined) return 0;
-		const index = REASONING_EFFORTS.indexOf(effort);
-		return index < 0 ? 0 : index + 1;
-	}
-
-	private handleModelReasoningInput(data: string, view: FailoverTuiView): void {
-		const index = this.modelReasoningSelectionIndex;
-		if (index === undefined) return;
-		if (this.isCancelInput(data)) {
-			this.modelReasoningSelectionIndex = undefined;
-			return;
-		}
-		if (matchesKey(data, Key.up)) {
-			this.modelReasoningSelectionIndex = Math.max(0, index - 1);
-			return;
-		}
-		if (matchesKey(data, Key.down)) {
-			this.modelReasoningSelectionIndex = Math.min(
-				MODEL_REASONING_CHOICES.length - 1,
-				index + 1,
-			);
-			return;
-		}
-		if (!matchesKey(data, Key.enter)) return;
-		const model = view.models[this.paramsModelIndex];
-		if (!model) return;
-		const effort = MODEL_REASONING_CHOICES[index];
-		this.modelReasoningSelectionIndex = undefined;
-		this.runAction(() => this.actions.onSetModelReasoningEffort(model, effort));
-	}
-
-	private handleParamsInput(data: string, view: FailoverTuiView): void {
-		if (this.modelReasoningSelectionIndex !== undefined) {
-			this.handleModelReasoningInput(data, view);
-			return;
-		}
-		if (this.isCancelInput(data)) {
-			this.paramsMode = false;
-			return;
-		}
-		const count = view.models.length;
-		if (count === 0) return;
-		if (matchesKey(data, Key.up)) {
-			this.paramsSelectionIndex = Math.max(0, this.paramsSelectionIndex - 1);
-			return;
-		}
-		if (matchesKey(data, Key.down)) {
-			this.paramsSelectionIndex = Math.min(
-				MODEL_PARAMETER_NAMES.length,
-				this.paramsSelectionIndex + 1,
-			);
-			return;
-		}
-		if (matchesKey(data, Key.left) || data === "[") {
-			this.paramsModelIndex = (this.paramsModelIndex - 1 + count) % count;
-			return;
-		}
-		if (matchesKey(data, Key.right) || data === "]") {
-			this.paramsModelIndex = (this.paramsModelIndex + 1) % count;
-			return;
-		}
-		if (!matchesKey(data, Key.enter) && data !== " ") return;
-		const model = view.models[this.paramsModelIndex];
-		if (!model) return;
-		if (this.paramsSelectionIndex === 0) {
-			this.modelReasoningSelectionIndex = this.modelReasoningChoiceIndex(
-				view,
-				model,
-			);
-			return;
-		}
-		const parameter = MODEL_PARAMETER_NAMES[this.paramsSelectionIndex - 1];
-		if (!parameter) return;
-		const enabled = this.parameterEnabled(view, model, parameter);
-		this.runAction(() =>
-			this.actions.onSetModelParameter(model, parameter, !enabled),
-		);
-	}
-
-	private parameterEnabled(
-		view: FailoverTuiView,
-		model: ModelRef,
-		parameter: ModelParameterName,
-	): boolean {
-		return view.config.modelParameters[modelKey(model)]?.[parameter] ?? true;
-	}
-
-	private handleSettingsInput(data: string, view: FailoverTuiView): void {
-		if (this.paramsMode) {
-			this.handleParamsInput(data, view);
-			return;
-		}
-		if (this.settingsInput) {
-			this.handleNumericSettingInput(data);
-			return;
-		}
-		if (this.behaviorSelectionIndex !== undefined) {
-			this.handleBehaviorInput(data);
-			return;
-		}
-		this.handleSettingsMenuInput(data, view);
-	}
-
-	private handleAddInput(data: string): void {
-		const candidates = this.addCandidates;
-		const index = this.addSelectionIndex;
-		if (!candidates || index === undefined) return;
-		if (this.isCancelInput(data)) {
-			this.addCandidates = undefined;
-			this.addSelectionIndex = undefined;
-			return;
-		}
-		if (matchesKey(data, Key.up)) {
-			this.addSelectionIndex = Math.max(0, index - 1);
-			return;
-		}
-		if (matchesKey(data, Key.down)) {
-			this.addSelectionIndex = Math.min(candidates.length - 1, index + 1);
-			return;
-		}
-		if (!matchesKey(data, Key.enter)) return;
-		const model = candidates[index];
-		this.addCandidates = undefined;
-		this.addSelectionIndex = undefined;
-		if (model) this.runAction(() => this.actions.onAdd(model));
-	}
-
-	private handleReasoningInput(data: string): void {
+	private handleReasoningInput(data: string, modelId: string): void {
 		const index = this.reasoningSelectionIndex;
 		if (index === undefined) return;
 		if (this.isCancelInput(data)) {
@@ -425,52 +339,304 @@ export class FailoverEditor implements Component {
 		if (!matchesKey(data, Key.enter)) return;
 		const effort = REASONING_EFFORTS[index];
 		this.reasoningSelectionIndex = undefined;
-		if (effort) this.runAction(() => this.actions.onSetReasoningEffort(effort));
+		if (effort)
+			this.runAction(() => this.actions.onSetReasoning(modelId, effort));
 	}
 
-	private openAddMenu(view: FailoverTuiView): void {
-		const configured = new Set(view.models.map(modelKey));
-		const candidates = view.available.filter(
-			(model) => !configured.has(modelKey(model)),
+	private handleSettingsMenuInput(
+		data: string,
+		model: GeneratedFailoverModel,
+	): void {
+		if (this.isCancelInput(data)) {
+			this.settingsMode = false;
+			return;
+		}
+		if (matchesKey(data, Key.up)) {
+			this.settingsSelectionIndex = Math.max(0, this.settingsSelectionIndex - 1);
+			return;
+		}
+		if (matchesKey(data, Key.down)) {
+			this.settingsSelectionIndex = Math.min(
+				SETTING_KEYS.length - 1,
+				this.settingsSelectionIndex + 1,
+			);
+			return;
+		}
+		if (matchesKey(data, Key.enter)) this.beginSettingsEdit(model);
+	}
+
+	private targetReasoningChoiceIndex(
+		model: GeneratedFailoverModel,
+		target: ModelRef,
+	): number {
+		const override = model.targetOverrides[modelKey(target)];
+		const effort = override?.reasoningEffort;
+		if (effort === undefined) return 0;
+		const index = REASONING_EFFORTS.indexOf(effort);
+		return index < 0 ? 0 : index + 1;
+	}
+
+	private handleTargetReasoningInput(
+		data: string,
+		model: GeneratedFailoverModel,
+		target: ModelRef,
+	): void {
+		const index = this.targetReasoningSelectionIndex;
+		if (index === undefined) return;
+		if (this.isCancelInput(data)) {
+			this.targetReasoningSelectionIndex = undefined;
+			return;
+		}
+		if (matchesKey(data, Key.up)) {
+			this.targetReasoningSelectionIndex = Math.max(0, index - 1);
+			return;
+		}
+		if (matchesKey(data, Key.down)) {
+			this.targetReasoningSelectionIndex = Math.min(
+				TARGET_REASONING_CHOICES.length - 1,
+				index + 1,
+			);
+			return;
+		}
+		if (!matchesKey(data, Key.enter)) return;
+		const effort = TARGET_REASONING_CHOICES[index];
+		this.targetReasoningSelectionIndex = undefined;
+		this.runAction(() =>
+			this.actions.onSetTargetReasoning(model.id, target, effort),
+		);
+	}
+
+	private parameterEnabled(
+		model: GeneratedFailoverModel,
+		target: ModelRef,
+		parameter: ModelParameterName,
+	): boolean {
+		const override = model.targetOverrides[modelKey(target)]?.modelParameters;
+		const base = model.modelParameters;
+		if (!override) return base[parameter];
+		return override[parameter];
+	}
+
+	private handleParamsInput(
+		data: string,
+		model: GeneratedFailoverModel,
+		target: ModelRef,
+	): void {
+		if (this.targetReasoningSelectionIndex !== undefined) {
+			this.handleTargetReasoningInput(data, model, target);
+			return;
+		}
+		if (this.isCancelInput(data)) {
+			this.paramsMode = false;
+			if (!this.paramsReturnToSettings) this.settingsMode = false;
+			this.paramsReturnToSettings = false;
+			return;
+		}
+		if (matchesKey(data, Key.up)) {
+			this.paramsSelectionIndex = Math.max(0, this.paramsSelectionIndex - 1);
+			return;
+		}
+		if (matchesKey(data, Key.down)) {
+			this.paramsSelectionIndex = Math.min(
+				MODEL_PARAMETER_NAMES.length,
+				this.paramsSelectionIndex + 1,
+			);
+			return;
+		}
+		if (!matchesKey(data, Key.enter) && data !== " ") return;
+		if (this.paramsSelectionIndex === 0) {
+			this.targetReasoningSelectionIndex = this.targetReasoningChoiceIndex(
+				model,
+				target,
+			);
+			return;
+		}
+		const parameter = MODEL_PARAMETER_NAMES[this.paramsSelectionIndex - 1];
+		if (!parameter) return;
+		const enabled = this.parameterEnabled(model, target, parameter);
+		this.runAction(() =>
+			this.actions.onSetTargetParameter(model.id, target, parameter, !enabled),
+		);
+	}
+
+	private handleSettingsInput(
+		data: string,
+		model: GeneratedFailoverModel,
+	): void {
+		if (this.paramsMode) {
+			const target = model.chain[this.paramsTargetIndex];
+			if (target) this.handleParamsInput(data, model, target);
+			return;
+		}
+		if (this.settingsInput) {
+			this.handleNumericSettingInput(data, model.id);
+			return;
+		}
+		if (this.behaviorSelectionIndex !== undefined) {
+			this.handleBehaviorInput(data, model.id);
+			return;
+		}
+		if (this.reasoningSelectionIndex !== undefined) {
+			this.handleReasoningInput(data, model.id);
+			return;
+		}
+		this.handleSettingsMenuInput(data, model);
+	}
+
+	private openAddTarget(model: GeneratedFailoverModel): void {
+		const configured = new Set(model.chain.map(modelKey));
+		const candidates = this.getView().available.filter(
+			(target) => !configured.has(modelKey(target)),
 		);
 		if (candidates.length === 0) return;
-		this.addCandidates = candidates;
-		this.addSelectionIndex = 0;
+		this.addTargetCandidates = candidates;
+		this.addTargetSelectionIndex = 0;
 	}
 
-	private handleMainCommand(data: string, view: FailoverTuiView): void {
+	private handleAddTargetInput(data: string, modelId: string): void {
+		const candidates = this.addTargetCandidates;
+		const index = this.addTargetSelectionIndex;
+		if (!candidates || index === undefined) return;
+		if (this.isCancelInput(data)) {
+			this.addTargetCandidates = undefined;
+			this.addTargetSelectionIndex = undefined;
+			return;
+		}
+		if (matchesKey(data, Key.up)) {
+			this.addTargetSelectionIndex = Math.max(0, index - 1);
+			return;
+		}
+		if (matchesKey(data, Key.down)) {
+			this.addTargetSelectionIndex = Math.min(candidates.length - 1, index + 1);
+			return;
+		}
+		if (!matchesKey(data, Key.enter)) return;
+		const target = candidates[index];
+		this.addTargetCandidates = undefined;
+		this.addTargetSelectionIndex = undefined;
+		if (target) this.runAction(() => this.actions.onAddTarget(modelId, target));
+	}
+
+	private handleTextInput(
+		data: string,
+		get: () => string,
+		set: (value: string) => void,
+		reset: () => void,
+		commit: (value: string) => void,
+	): void {
+		if (this.isCancelInput(data)) {
+			reset();
+			return;
+		}
+		if (matchesKey(data, Key.backspace)) {
+			set(get().slice(0, -1));
+			return;
+		}
+		if (matchesKey(data, Key.enter)) {
+			const value = get().trim();
+			reset();
+			if (value) commit(value);
+			return;
+		}
+		if (data.length === 1 && !matchesKey(data, Key.enter)) set(get() + data);
+	}
+
+	private handleDetailCommand(
+		data: string,
+		model: GeneratedFailoverModel,
+	): void {
 		switch (data) {
 			case "a":
-				this.openAddMenu(view);
+				this.openAddTarget(model);
 				return;
 			case "d": {
-				const index = this.selectedIndex;
-				if (this.selectedModel())
-					this.runAction(() => this.actions.onRemove(index));
+				const target = this.detailTarget();
+				if (target)
+					this.runAction(() => this.actions.onRemoveTarget(model.id, target));
 				return;
 			}
-			case "e":
-				this.runAction(this.actions.onToggleEnabled);
-				return;
 			case "t":
 				this.settingsMode = true;
+				this.paramsMode = false;
+				this.paramsReturnToSettings = false;
 				this.settingsSelectionIndex = 0;
 				return;
-			case "i":
-				this.reasoningSelectionIndex = Math.max(
-					0,
-					REASONING_EFFORTS.indexOf(view.config.reasoningEffort),
-				);
+			case "p": {
+				if (model.chain.length === 0) return;
+				this.settingsMode = true;
+				this.paramsMode = true;
+				this.paramsReturnToSettings = false;
+				this.paramsTargetIndex = this.detailTargetIndex;
+				this.paramsSelectionIndex = 0;
+				this.targetReasoningSelectionIndex = undefined;
 				return;
+			}
 			case "r":
-				this.runAction(this.actions.onRestore);
+				this.runAction(() => this.actions.onRestore(model.id));
 				return;
 			default:
 				return;
 		}
 	}
 
-	private handleMainInput(data: string, view: FailoverTuiView): void {
+	private handleDetailInput(data: string, model: GeneratedFailoverModel): void {
+		if (this.isCancelInput(data)) {
+			this.detailModelId = undefined;
+			return;
+		}
+		if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
+			const direction = matchesKey(data, Key.up) ? -1 : 1;
+			this.detailTargetIndex = Math.min(
+				Math.max(0, model.chain.length - 1),
+				Math.max(0, this.detailTargetIndex + direction),
+			);
+			this.clampDetailTarget();
+			return;
+		}
+		if (matchesKey(data, Key.leftbracket) || matchesKey(data, Key.rightbracket)) {
+			const direction = matchesKey(data, Key.leftbracket) ? -1 : 1;
+			const target = this.detailTarget();
+			if (target)
+				this.runAction(() =>
+					this.actions.onMoveTarget(model.id, target, direction),
+				);
+			this.detailTargetIndex = Math.min(
+				Math.max(0, model.chain.length - 1),
+				Math.max(0, this.detailTargetIndex + direction),
+			);
+			return;
+		}
+		this.handleDetailCommand(data, model);
+	}
+
+	private handleMainCommand(data: string): void {
+		switch (data) {
+			case "a":
+				this.addModelName = "";
+				return;
+			case "d": {
+				const model = this.selectedModel();
+				if (model) this.runAction(() => this.actions.onRemoveModel(model.id));
+				return;
+			}
+			case "e": {
+				const model = this.selectedModel();
+				if (model) this.runAction(() => this.actions.onToggleModel(model.id));
+				return;
+			}
+			case "r": {
+				const model = this.selectedModel();
+				if (model) {
+					this.renameModelName = model.name;
+				}
+				return;
+			}
+			default:
+				return;
+		}
+	}
+
+	private handleMainInput(data: string): void {
 		if (this.isCancelInput(data)) {
 			this.actions.onClose();
 			return;
@@ -478,146 +644,197 @@ export class FailoverEditor implements Component {
 		if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
 			const direction = matchesKey(data, Key.up) ? -1 : 1;
 			this.selectedIndex = Math.min(
-				Math.max(0, view.models.length - 1),
+				Math.max(0, this.getView().config.models.length - 1),
 				Math.max(0, this.selectedIndex + direction),
 			);
 			this.clampSelection();
 			return;
 		}
-		if (matchesKey(data, Key.leftbracket) || matchesKey(data, Key.rightbracket)) {
-			const direction = matchesKey(data, Key.leftbracket) ? -1 : 1;
-			const index = this.selectedIndex;
-			this.runAction(() => this.actions.onMove(index, direction));
-			this.selectedIndex = Math.min(
-				Math.max(0, view.models.length - 1),
-				Math.max(0, this.selectedIndex + direction),
-			);
+		if (matchesKey(data, Key.enter) || matchesKey(data, Key.right)) {
+			this.openDetail();
 			return;
 		}
-		if (matchesKey(data, Key.enter)) {
-			const model = this.selectedModel();
-			if (model) this.runAction(() => this.actions.onSelect(model));
-			return;
-		}
-		this.handleMainCommand(data, view);
+		this.handleMainCommand(data);
 	}
 
 	handleInput(data: string): void {
-		const view = this.getView();
-		if (this.settingsMode) {
-			this.handleSettingsInput(data, view);
-			return;
-		}
-		if (this.addSelectionIndex !== undefined) {
-			this.handleAddInput(data);
-			return;
-		}
-		if (this.reasoningSelectionIndex !== undefined) {
-			this.handleReasoningInput(data);
-			return;
-		}
-		this.handleMainInput(data, view);
-	}
-
-	private settingValue(view: FailoverTuiView, key: SettingKey): string {
-		switch (key) {
-			case "cooldownMinutes":
-				return view.config.cooldownMinutes === 0
-					? "off"
-					: `${view.config.cooldownMinutes}m`;
-			case "errorHandlingMode":
-				return ERROR_HANDLING_LABELS[view.config.errorHandlingMode];
-			case "maxRetries":
-				return String(view.config.maxRetries);
-			case "noProgressTimeoutSeconds":
-				return view.config.noProgressTimeoutSeconds === 0
-					? "off"
-					: `${view.config.noProgressTimeoutSeconds}s`;
-			case "modelParameters": {
-				const model = view.models[this.selectedIndex] ?? view.models[0];
-				return model ? `→ ${modelKey(model)}` : "→ none";
-			}
-			default:
-				return "";
-		}
-	}
-
-	private renderParams(width: number, view: FailoverTuiView): string[] {
-		const lines: string[] = [];
-		const add = (line: string) =>
-			lines.push(truncateToWidth(line, Math.max(1, width), ""));
-		const border = this.border.render(width);
-		if (border[0]) add(border[0]);
-		add(this.theme.fg("accent", "Model Parameters"));
-		const model = view.models[this.paramsModelIndex];
-		if (!model) {
-			add(this.theme.fg("warning", "No model selected"));
-			const lastBorder = border.at(-1);
-			if (lastBorder) add(lastBorder);
-			return lines.map((line) =>
-				padRight(truncateToWidth(line, width, ""), width),
+		if (this.addModelName !== undefined) {
+			this.handleTextInput(
+				data,
+				() => this.addModelName ?? "",
+				(value) => {
+					this.addModelName = value;
+				},
+				() => {
+					this.addModelName = undefined;
+				},
+				(value) => this.runAction(() => this.actions.onAddModel(value)),
 			);
+			return;
 		}
-		add(
+		if (this.renameModelName !== undefined) {
+			this.handleTextInput(
+				data,
+				() => this.renameModelName ?? "",
+				(value) => {
+					this.renameModelName = value;
+				},
+				() => {
+					this.renameModelName = undefined;
+				},
+				(value) => {
+					const model = this.selectedModel();
+					if (model)
+						this.runAction(() => this.actions.onRenameModel(model.id, value));
+				},
+			);
+			return;
+		}
+		if (this.settingsMode) {
+			const model = this.detailModel();
+			if (model) {
+				this.handleSettingsInput(data, model);
+				return;
+			}
+			this.settingsMode = false;
+			return;
+		}
+		if (this.addTargetSelectionIndex !== undefined) {
+			const model = this.detailModel();
+			if (model) this.handleAddTargetInput(data, model.id);
+			return;
+		}
+		if (this.detailModelId !== undefined) {
+			const model = this.detailModel();
+			if (model) {
+				this.handleDetailInput(data, model);
+				return;
+			}
+			this.detailModelId = undefined;
+			return;
+		}
+		this.handleMainInput(data);
+	}
+
+	private modelStatus(
+		view: FailoverTuiView,
+		id: string,
+		key: string,
+		now: number,
+	): string {
+		const cooldown = view.cooldowns.get(`${id}:${key}`);
+		if (cooldown && cooldown > now)
+			return ` cooldown ${Math.ceil((cooldown - now) / 60000)}m`;
+		const recovery = view.manualRecovery.get(`${id}:${key}`);
+		return recovery ? ` manual recovery: ${recovery}` : "";
+	}
+
+	private renderModelList(view: FailoverTuiView): string[] {
+		if (view.config.models.length === 0)
+			return [this.theme.fg("warning", "No failover models configured")];
+		const lines: string[] = [];
+		const start = this.scrollOffset;
+		const end = Math.min(start + MAX_VISIBLE_MODELS, view.config.models.length);
+		lines.push(
 			this.theme.fg(
 				"dim",
-				`Model: ${modelKey(model)}  (${this.paramsModelIndex + 1}/${view.models.length})`,
+				`Models: ${view.config.models.length}  Showing ${start + 1}-${end}`,
 			),
 		);
-		add(this.theme.fg("dim", "← → switch model  Enter select/toggle  Esc back"));
-		add("");
-		const selectedReasoning = this.paramsSelectionIndex === 0;
-		const configuredReasoning =
-			view.config.modelReasoningEfforts[modelKey(model)];
-		add(
-			this.theme.fg(
-				selectedReasoning ? "accent" : "text",
-				`${selectedReasoning ? ">" : " "} Reasoning level: ${configuredReasoning ?? "inherit"}`,
-			),
-		);
-		for (const [index, parameter] of MODEL_PARAMETER_NAMES.entries()) {
-			const selected = index + 1 === this.paramsSelectionIndex;
-			const enabled = this.parameterEnabled(view, model, parameter);
-			add(
+		for (let index = start; index < end; index++) {
+			const model = view.config.models[index];
+			if (!model) continue;
+			const selected = index === this.selectedIndex;
+			const chain = model.chain.map(modelKey).join(" \u2192 ") || "empty";
+			lines.push(
 				this.theme.fg(
 					selected ? "accent" : "text",
-					`${selected ? ">" : " "} ${PARAMETER_LABELS[parameter]}: ${enabled ? "on" : "off"}`,
+					`${selected ? ">" : " "} ${index + 1}. ${model.id} "${model.name}"${model.enabled ? "" : " [disabled]"}  ${chain}`,
 				),
 			);
 		}
-		if (this.modelReasoningSelectionIndex !== undefined) {
-			const choices = MODEL_REASONING_CHOICES.map((effort, index) => {
-				const label = effort ?? "inherit";
-				return index === this.modelReasoningSelectionIndex ? `[${label}]` : label;
-			}).join("  ");
-			add(
+		if (end < view.config.models.length)
+			lines.push(
 				this.theme.fg(
-					"accent",
-					`Reasoning level: ${choices}  ↑↓ move  Enter save  Esc cancel`,
+					"dim",
+					`... ${view.config.models.length - end} more; use arrows to scroll`,
 				),
 			);
-		}
-		const lastBorder = border.at(-1);
-		if (lastBorder) add(lastBorder);
-		return lines.map((line) => padRight(truncateToWidth(line, width, ""), width));
+		return lines;
 	}
 
-	private renderSettings(width: number, view: FailoverTuiView): string[] {
+	private renderChain(
+		view: FailoverTuiView,
+		model: GeneratedFailoverModel,
+	): string[] {
+		if (model.chain.length === 0)
+			return [this.theme.fg("warning", "No targets configured")];
+		const lines: string[] = [];
+		const start = this.detailScrollOffset;
+		const end = Math.min(start + MAX_VISIBLE_MODELS, model.chain.length);
+		const now = Date.now();
+		for (let index = start; index < end; index++) {
+			const target = model.chain[index];
+			if (!target) continue;
+			const key = modelKey(target);
+			const selected = index === this.detailTargetIndex;
+			lines.push(
+				this.theme.fg(
+					selected ? "accent" : "text",
+					`${selected ? ">" : " "} ${index + 1}. ${key}${this.modelStatus(view, model.id, key, now)}`,
+				),
+			);
+		}
+		return lines;
+	}
+
+	private renderDetail(
+		view: FailoverTuiView,
+		model: GeneratedFailoverModel,
+	): string[] {
+		const lines: string[] = [
+			this.theme.fg("accent", `Failover Model: ${model.id}`),
+			`Name: ${model.name}  Enabled: ${model.enabled ? "yes" : "no"}`,
+			`Reasoning: ${model.reasoningEffort}  Cooldown: ${model.cooldownMinutes === 0 ? "off" : `${model.cooldownMinutes}m`}  Error: ${ERROR_HANDLING_LABELS[model.errorHandlingMode]}  Retries: ${model.maxRetries}  Timeout: ${model.noProgressTimeoutSeconds === 0 ? "off" : `${model.noProgressTimeoutSeconds}s`}`,
+			this.theme.fg(
+				"dim",
+				"a add target  d remove  [ ] reorder  p target params  t settings  r restore  Esc back",
+			),
+			"",
+			...this.renderChain(view, model),
+		];
+		if (this.addTargetSelectionIndex !== undefined && this.addTargetCandidates) {
+			const target = this.addTargetCandidates[this.addTargetSelectionIndex];
+			if (target)
+				lines.push(
+					this.theme.fg(
+						"accent",
+						`Add target ${this.addTargetSelectionIndex + 1}/${this.addTargetCandidates.length}: ${modelKey(target)}  \u2191\u2193 move  Enter add  Esc cancel`,
+					),
+				);
+		}
+		return lines;
+	}
+
+	private renderSettings(
+		model: GeneratedFailoverModel,
+		width: number,
+	): string[] {
+		if (this.paramsMode) return this.renderParams(model, width);
 		const lines: string[] = [];
 		const add = (line: string) =>
 			lines.push(truncateToWidth(line, Math.max(1, width), ""));
 		const border = this.border.render(width);
 		if (border[0]) add(border[0]);
-		add(this.theme.fg("accent", "Failover Settings"));
-		add(this.theme.fg("dim", "↑↓ select  Enter edit  Esc back"));
+		add(this.theme.fg("accent", `Settings: ${model.id}`));
+		add(this.theme.fg("dim", "\u2191\u2193 select  Enter edit  Esc back"));
 		add("");
 		for (const [index, key] of SETTING_KEYS.entries()) {
 			const selected = index === this.settingsSelectionIndex;
-			const value = this.settingValue(view, key);
 			add(
 				this.theme.fg(
 					selected ? "accent" : "text",
-					`${selected ? ">" : " "} ${SETTING_LABELS[key]}: ${value}`,
+					`${selected ? ">" : " "} ${SETTING_LABELS[key]}: ${this.settingValue(model, key)}`,
 				),
 			);
 		}
@@ -628,13 +845,18 @@ export class FailoverEditor implements Component {
 					: ERROR_HANDLING_LABELS[mode],
 			).join("  ");
 			add(this.theme.fg("accent", `Error behavior: ${choices}`));
-			add(this.theme.fg("dim", "↑↓ move  Enter save  Esc cancel"));
+			add(this.theme.fg("dim", "\u2191\u2193 move  Enter save  Esc cancel"));
+		} else if (this.reasoningSelectionIndex !== undefined) {
+			const choices = REASONING_EFFORTS.map((effort, index) =>
+				index === this.reasoningSelectionIndex ? `[${effort}]` : effort,
+			).join("  ");
+			add(this.theme.fg("accent", `Reasoning level: ${choices}`));
+			add(this.theme.fg("dim", "\u2191\u2193 move  Enter save  Esc cancel"));
 		} else if (this.settingsInput) {
-			const label = SETTING_LABELS[this.settingsInput.key];
 			add(
 				this.theme.fg(
 					"accent",
-					`Enter ${label}: ${this.settingsInput.value || "_"}`,
+					`Enter ${SETTING_LABELS[this.settingsInput.key]}: ${this.settingsInput.value || "_"}`,
 				),
 			);
 			add(this.theme.fg("dim", "digits  Enter save  Esc cancel"));
@@ -644,127 +866,135 @@ export class FailoverEditor implements Component {
 		return lines.map((line) => padRight(truncateToWidth(line, width, ""), width));
 	}
 
-	private modelStatus(view: FailoverTuiView, key: string, now: number): string {
-		const cooldown = view.cooldowns.get(key);
-		if (cooldown && cooldown > now)
-			return ` cooldown ${Math.ceil((cooldown - now) / 60000)}m`;
-		const recovery = view.manualRecovery.get(key);
-		return recovery ? ` manual recovery: ${recovery}` : "";
-	}
-
-	private renderModelList(view: FailoverTuiView): string[] {
-		if (view.models.length === 0)
-			return [this.theme.fg("warning", "No models configured")];
+	private renderParams(model: GeneratedFailoverModel, width: number): string[] {
 		const lines: string[] = [];
-		const start = this.scrollOffset;
-		const end = Math.min(start + MAX_VISIBLE_MODELS, view.models.length);
-		lines.push(
+		const add = (line: string) =>
+			lines.push(truncateToWidth(line, Math.max(1, width), ""));
+		const border = this.border.render(width);
+		if (border[0]) add(border[0]);
+		add(this.theme.fg("accent", `Target Parameters: ${model.id}`));
+		const target = model.chain[this.paramsTargetIndex];
+		if (!target) {
+			add(this.theme.fg("warning", "No target selected"));
+			const lastBorder = border.at(-1);
+			if (lastBorder) add(lastBorder);
+			return lines.map((line) =>
+				padRight(truncateToWidth(line, width, ""), width),
+			);
+		}
+		add(this.theme.fg("dim", `Target: ${modelKey(target)}`));
+		add(this.theme.fg("dim", "Enter select/toggle  Esc back"));
+		add("");
+		const override = model.targetOverrides[modelKey(target)];
+		const selectedReasoning = this.paramsSelectionIndex === 0;
+		const configuredReasoning = override?.reasoningEffort;
+		add(
 			this.theme.fg(
-				"dim",
-				`Models: ${view.models.length}  Showing ${start + 1}-${end}`,
+				selectedReasoning ? "accent" : "text",
+				`${selectedReasoning ? ">" : " "} Reasoning level: ${configuredReasoning ?? "inherit"}`,
 			),
 		);
-		const now = Date.now();
-		for (let index = start; index < end; index++) {
-			const model = view.models[index];
-			if (!model) continue;
-			const key = modelKey(model);
-			const selected = index === this.selectedIndex;
-			const current = view.current && modelKey(view.current) === key ? " *" : "";
-			lines.push(
+		for (const [index, parameter] of MODEL_PARAMETER_NAMES.entries()) {
+			const selected = index + 1 === this.paramsSelectionIndex;
+			const enabled = this.parameterEnabled(model, target, parameter);
+			add(
 				this.theme.fg(
 					selected ? "accent" : "text",
-					`${selected ? ">" : " "} ${index + 1}. ${key}${current}${this.modelStatus(view, key, now)}`,
+					`${selected ? ">" : " "} ${PARAMETER_LABELS[parameter]}: ${enabled ? "on" : "off"}`,
 				),
 			);
 		}
-		if (end < view.models.length)
-			lines.push(
-				this.theme.fg(
-					"dim",
-					`... ${view.models.length - end} more; use arrows to scroll`,
-				),
-			);
-		return lines;
-	}
-
-	private renderMainHeader(view: FailoverTuiView): string[] {
-		const selectedModel = view.models[this.selectedIndex];
-		const reasoningEffort = resolveReasoningEffort(view.config, selectedModel);
-		const lines = [
-			this.theme.fg("accent", "Pi Model Failover"),
-			`Automation: ${view.mode}  Timeout: ${view.config.noProgressTimeoutSeconds === 0 ? "off" : `${view.config.noProgressTimeoutSeconds}s`}  Reasoning: ${reasoningEffort}`,
-			`Current: ${view.current ? modelKey(view.current) : "none"}`,
-			this.theme.fg(
-				"dim",
-				"Enter select  a add  d remove  [ ] reorder  e cycle  t settings  i reasoning  r restore  q close",
-			),
-		];
-		if (this.reasoningSelectionIndex !== undefined) {
-			const choices = REASONING_EFFORTS.map((effort, index) =>
-				index === this.reasoningSelectionIndex ? `[${effort}]` : effort,
-			).join("  ");
-			lines.push(
+		if (this.targetReasoningSelectionIndex !== undefined) {
+			const choices = TARGET_REASONING_CHOICES.map((effort, index) => {
+				const label = effort ?? "inherit";
+				return index === this.targetReasoningSelectionIndex ? `[${label}]` : label;
+			}).join("  ");
+			add(
 				this.theme.fg(
 					"accent",
-					`Select reasoning: ${choices}  ↑↓ move  Enter select  Esc cancel`,
+					`Reasoning level: ${choices}  \u2191\u2193 move  Enter save  Esc cancel`,
 				),
 			);
 		}
-		if (this.addSelectionIndex !== undefined && this.addCandidates) {
-			const model = this.addCandidates[this.addSelectionIndex];
-			if (model)
-				lines.push(
-					this.theme.fg(
-						"accent",
-						`Add model ${this.addSelectionIndex + 1}/${this.addCandidates.length}: ${modelKey(model)}  ↑↓ move  Enter add  Esc cancel`,
-					),
-				);
-		}
-		return lines;
+		const lastBorder = border.at(-1);
+		if (lastBorder) add(lastBorder);
+		return lines.map((line) => padRight(truncateToWidth(line, width, ""), width));
 	}
 
-	private renderTransition(view: FailoverTuiView): string[] {
-		const lines: string[] = [];
-		if (view.latestTransition) {
-			const source = view.latestTransition.source
-				? modelKey(view.latestTransition.source)
-				: "none";
-			const target = view.latestTransition.target
-				? modelKey(view.latestTransition.target)
-				: "none";
-			lines.push(
-				this.theme.fg(
-					"dim",
-					`Last: ${source} -> ${target} (${view.latestTransition.reason})`,
-				),
-			);
+	private settingValue(model: GeneratedFailoverModel, key: SettingKey): string {
+		switch (key) {
+			case "reasoning":
+				return model.reasoningEffort;
+			case "cooldown":
+				return model.cooldownMinutes === 0 ? "off" : `${model.cooldownMinutes}m`;
+			case "errorHandlingMode":
+				return ERROR_HANDLING_LABELS[model.errorHandlingMode];
+			case "maxRetries":
+				return String(model.maxRetries);
+			case "noProgressTimeoutSeconds":
+				return model.noProgressTimeoutSeconds === 0
+					? "off"
+					: `${model.noProgressTimeoutSeconds}s`;
+			case "targetParameters":
+				return model.chain.length > 0 ? "\u2192 edit" : "\u2192 none";
+			default:
+				return "";
 		}
-		if (view.exhaustionSummary)
-			lines.push(this.theme.fg("error", `Exhausted: ${view.exhaustionSummary}`));
-		return lines;
 	}
 
 	render(width: number): string[] {
 		const view = this.getView();
 		if (this.settingsMode) {
-			if (this.paramsMode) return this.renderParams(width, view);
-			return this.renderSettings(width, view);
+			const model = this.detailModel();
+			if (model) return this.renderSettings(model, width);
+			this.settingsMode = false;
 		}
-		this.clampSelection();
+
 		const lines: string[] = [];
 		const add = (line: string) =>
 			lines.push(truncateToWidth(line, Math.max(1, width), ""));
 		const border = this.border.render(width);
 		const firstBorder = border[0];
 		if (firstBorder) add(firstBorder);
-		for (const line of this.renderMainHeader(view)) add(line);
-		add("");
-		for (const line of this.renderModelList(view)) add(line);
-		for (const line of this.renderTransition(view)) add(line);
+
+		if (this.addModelName !== undefined) {
+			add(this.theme.fg("accent", "Add failover model"));
+			add(this.theme.fg("accent", `Name: ${this.addModelName || "_"}`));
+			add(this.theme.fg("dim", "type name  Enter create  Esc cancel"));
+		} else if (this.renameModelName !== undefined) {
+			add(this.theme.fg("accent", "Rename failover model"));
+			add(this.theme.fg("accent", `Name: ${this.renameModelName || "_"}`));
+			add(this.theme.fg("dim", "type name  Enter save  Esc cancel"));
+		} else if (this.detailModelId === undefined) {
+			for (const line of this.renderMainHeader()) add(line);
+			add("");
+			for (const line of this.renderModelList(view)) add(line);
+		} else {
+			const model = this.detailModel();
+			if (model) {
+				for (const line of this.renderDetail(view, model)) add(line);
+			} else {
+				this.detailModelId = undefined;
+				for (const line of this.renderMainHeader()) add(line);
+				add("");
+				for (const line of this.renderModelList(view)) add(line);
+			}
+		}
+
 		const lastBorder = border.at(-1);
 		if (lastBorder) add(lastBorder);
 		return lines.map((line) => padRight(truncateToWidth(line, width, ""), width));
+	}
+
+	private renderMainHeader(): string[] {
+		const lines = [
+			this.theme.fg("accent", "Pi Model Failover"),
+			this.theme.fg(
+				"dim",
+				"Enter edit  a add  d remove  e toggle  r rename  q close",
+			),
+		];
+		return lines;
 	}
 
 	invalidate(): void {

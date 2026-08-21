@@ -130,6 +130,7 @@ function readModelParameters(
 		for (const name of MODEL_PARAMETER_NAMES) toggles[name] = entry[name];
 		if (MODEL_PARAMETER_NAMES.some((name) => typeof toggles[name] !== "boolean"))
 			return undefined;
+		// SAFETY: each named field was checked to be boolean immediately above.
 		result[key] = toggles as unknown as ModelParameterToggles;
 	}
 	return result;
@@ -169,8 +170,10 @@ export function isValidTimeoutSeconds(value: unknown): value is number {
 }
 
 /** Add defaults for older persisted shapes without preserving fields outside the contract. */
-export function migrateConfig(value: unknown): unknown {
-	if (!isRecord(value)) return value;
+export function migrateConfig(
+	value: unknown,
+): Record<string, unknown> | undefined {
+	if (!isRecord(value)) return undefined;
 	if (value.version === 1) {
 		value = {
 			...value,
@@ -202,7 +205,7 @@ export function migrateConfig(value: unknown): unknown {
 			modelReasoningEfforts: {},
 		};
 	}
-	return value;
+	return isRecord(value) ? value : undefined;
 }
 
 /** Normalize trusted config input and discard fields outside the persisted contract. */

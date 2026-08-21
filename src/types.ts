@@ -31,12 +31,47 @@ export const MODEL_PARAMETER_NAMES = [
 
 export type ModelParameterName = (typeof MODEL_PARAMETER_NAMES)[number];
 
+/** Defaults for every extension-controlled request parameter. */
+export const DEFAULT_PARAMETER_TOGGLES: ModelParameterToggles = {
+	promptCacheKey: true,
+	promptCacheRetention: true,
+	reasoningEffort: true,
+	sessionAffinity: true,
+};
+
 /** Per-model toggles controlling which request parameters the extension injects. */
 export interface ModelParameterToggles {
 	promptCacheKey: boolean;
 	promptCacheRetention: boolean;
 	reasoningEffort: boolean;
 	sessionAffinity: boolean;
+}
+
+export interface GeneratedTargetOverride {
+	reasoningEffort?: ReasoningEffort;
+	modelParameters?: ModelParameterToggles;
+}
+
+/** One user-named virtual model and its private real-model fallback policy. */
+export interface GeneratedFailoverModel {
+	id: string;
+	name: string;
+	enabled: boolean;
+	chain: ModelRef[];
+	reasoningEffort: ReasoningEffort;
+	cooldownMinutes: number;
+	errorHandlingMode: ErrorHandlingMode;
+	maxRetries: number;
+	noProgressTimeoutSeconds: number;
+	modelParameters: ModelParameterToggles;
+	targetOverrides: Record<string, GeneratedTargetOverride>;
+	manualRecovery: Record<string, string>;
+}
+
+/** Version 6 business configuration for the generated failover provider. */
+export interface GeneratedFailoverConfig {
+	version: 6;
+	models: GeneratedFailoverModel[];
 }
 
 export interface FailoverConfig {
