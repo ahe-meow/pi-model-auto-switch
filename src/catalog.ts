@@ -33,53 +33,30 @@ export function uniqueModels(models: readonly RegistryModel[]): ModelRef[] {
 	return result;
 }
 
-/** Read the models Pi currently considers authenticated. */
+export type DiscoveryResult =
+	| { kind: "success"; available: ModelRef[] }
+	| { kind: "failure"; available: ModelRef[]; error: unknown };
+
+/** Refresh and observe the models Pi currently considers authenticated. */
 export async function discoverModels(
 	registry: ModelRegistryReader,
-): Promise<ModelRef[]> {
-	await registry.refresh?.();
-	return uniqueModels(registry.getAvailable());
+): Promise<DiscoveryResult> {
+	try {
+		await registry.refresh?.();
+		return { kind: "success", available: uniqueModels(registry.getAvailable()) };
+	} catch (error) {
+		try {
+			return {
+				kind: "failure",
+				available: uniqueModels(registry.getAvailable()),
+				error,
+			};
+		} catch {
+			return { kind: "failure", available: [], error };
+		}
+	}
 }
 
-export function seedModelList(
-	current: ModelRef | undefined,
-	catalog: readonly ModelRef[],
-): ModelRef[] {
-	const result: ModelRef[] = [];
-	const seen = new Set<string>();
-	if (current) {
-		result.push({ ...current });
-		seen.add(modelKey(current));
-	}
-	for (const model of catalog) {
-		const key = modelKey(model);
-		if (seen.has(key)) continue;
-		seen.add(key);
-		result.push({ ...model });
-	}
-	return result;
-}
-
-export function filterConfiguredModels(
-	configured: readonly ModelRef[],
-	available: readonly ModelRef[],
-): ModelRef[] {
-	const availableKeys = new Set(available.map(modelKey));
-	return configured
-		.filter((model) => availableKeys.has(modelKey(model)))
-		.map((model) => ({ ...model }));
-}
-
-/** Preserve user order while keeping refreshed discovery available to add in the TUI. */
-export function mergeDiscoveredModels(
-	configured: readonly ModelRef[],
-	discovered: readonly ModelRef[],
-): ModelRef[] {
-	const result = configured.map((model) => ({ ...model }));
-	const seen = new Set(result.map(modelKey));
-	for (const model of discovered) {
-		const key = modelKey(model);
-		if (!seen.has(key)) result.push({ ...model });
-	}
-	return result;
+export function seedModelList(current: ModelRef | undefined): ModelRef[] {
+	return current ? [{ ...current }] : [];
 }

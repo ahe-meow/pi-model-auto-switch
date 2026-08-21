@@ -79,7 +79,7 @@ export function createRequestState(
 		id,
 		attempted: new Set<string>(),
 		reasons: new Map<string, string>(),
-		sameModelContinuationUsed: false,
+		sameModelRetries: 0,
 		activeModel: activeModel ? { ...activeModel } : undefined,
 		completed: false,
 	};
@@ -150,4 +150,14 @@ export function isAutomaticFailure(kind: FailureKind): boolean {
 		kind === "unknown" ||
 		kind === "no-progress"
 	);
+}
+
+export function shouldRetryCurrentModel(
+	kind: FailureKind,
+	mode: "smart" | "switch" | "retry",
+): boolean {
+	if (!isAutomaticFailure(kind)) return false;
+	if (mode === "switch") return false;
+	if (mode === "retry") return true;
+	return kind !== "persistent";
 }
