@@ -12,6 +12,8 @@
   "main": "./src/index.ts",
   "files": [
     "src/",
+    "scripts/",
+    "patches/",
     "README.md",
     "package.json"
   ],
@@ -19,6 +21,9 @@
     "extensions": [
       "./src/index.ts"
     ]
+  },
+  "scripts": {
+    "patch:subagents": "node scripts/apply-pi-subagents-patch.mjs"
   },
   "engines": {
     "node": ">=22.19.0"

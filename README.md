@@ -30,6 +30,16 @@ The package manifest registers `src/index.ts` globally. Pi keeps the extension a
 getAgentDir()/model-failover.json
 ```
 
+The subagent SDK currently needs a local compatibility patch so its child sessions bind extension lifecycle handlers. After updating Pi packages, reapply the version-locked patch and reload Pi:
+
+```bash
+npm run patch:subagents
+```
+
+Then run `/reload` in Pi or restart Pi.
+
+The script refuses unknown `pi-subagents-j0k3r` versions and is idempotent. The patch source is tracked at `patches/pi-subagents-j0k3r-1.5.4.patch`.
+
 Authentication remains owned by Pi. The extension reads Pi's `models.json` and `ModelRegistry`; it never edits `models.json` and never stores API keys or tokens.
 
 ## `/failover`

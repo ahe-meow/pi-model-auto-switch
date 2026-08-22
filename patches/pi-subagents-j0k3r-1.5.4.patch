@@ -1,0 +1,12 @@
+diff --git a/src/runner/sdk-runner.ts b/src/runner/sdk-runner.ts
+--- a/src/runner/sdk-runner.ts
++++ b/src/runner/sdk-runner.ts
+@@ -163,3 +163,8 @@ async function createSession(
+   const created = await createAgentSession(options);
++  // SDK sessions do not bind extension handlers automatically. Without this,
++  // session_start never reaches providers that need the current model registry.
++  if (typeof created.session?.bindExtensions === 'function') {
++    await created.session.bindExtensions({ mode: 'print' });
++  }
+   return { ...created, nested_session_path: resolvedSessionPath, pi_version: versionFromPiSdk(piSdk) };
+ }
