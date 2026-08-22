@@ -29,8 +29,8 @@ import {
 	type TargetCatalogMetadata,
 } from "./models-catalog.ts";
 
-export const FAILOVER_MODEL_API = "openai-responses";
-export const FAILOVER_BASE_URL = "https://failover.invalid/v1";
+const FAILOVER_MODEL_API = "openai-responses";
+const FAILOVER_BASE_URL = "https://failover.invalid/v1";
 
 /** Minimal structural view of a Pi target model (runtime boundary cast). */
 export interface TargetModelLike {
@@ -94,7 +94,7 @@ export interface Delegate {
 }
 
 /** A switch from one failed chain target to the next. */
-export interface FailoverTransition {
+interface FailoverTransition {
 	source?: ModelRef;
 	target: ModelRef;
 	reason: string;
@@ -327,6 +327,299 @@ async function executeTarget(
 	}
 }
 
+interface TargetAttempt {
+	targetModel: TargetModelLike;
+	targetKey: string;
+	capabilityKey: string;
+	toggles: ModelParameterToggles;
+	status: number | undefined;
+	result: AssistantMessageLike;
+	failure: ReturnType<typeof classifyFailure>;
+}
+
+async function executeTargetAttempt(
+	generated: GeneratedFailoverModel,
+	target: ModelRef,
+	context: RequestContext,
+	options: RequestOptions,
+	state: FailoverProviderState,
+	cacheKey: string | undefined,
+	signal: AbortSignal | undefined,
+): Promise<TargetAttempt | undefined> {
+	const targetModel = state.delegate.resolveModel(target);
+	if (!targetModel) return undefined;
+	const targetKey = modelKey(target);
+	const override = generated.targetOverrides[targetKey];
+	const toggles = mergeToggles(
+		generated.modelParameters,
+		override?.modelParameters,
+	);
+	const effort = override?.reasoningEffort ?? generated.reasoningEffort;
+	const capabilityKey = `${generated.id}:${targetKey}:${targetModel.api}`;
+	const unsupported =
+		state.unsupportedCacheFields.get(capabilityKey) ?? EMPTY_UNSUPPORTED;
+	const timeoutMs =
+		generated.noProgressTimeoutSeconds > 0
+			? generated.noProgressTimeoutSeconds * 1000
+			: undefined;
+	let status: number | undefined;
+	const {
+		apiKey: _droppedApiKey,
+		signal: _outerSignal,
+		timeoutMs: _outerTimeoutMs,
+		onPayload: outerOnPayload,
+		onResponse: outerOnResponse,
+		transformHeaders: outerTransformHeaders,
+		...forward
+	} = options;
+	const attemptOptions: RequestOptions = {
+		...forward,
+		reasoning: effort,
+		onPayload: (payload: unknown, model?: unknown) => {
+			const forwarded = outerOnPayload?.(payload, model);
+			const next = forwarded === undefined ? payload : forwarded;
+			applyRequestParameters(next, {
+				api: targetModel.api,
+				toggles,
+				cacheKey,
+				unsupported,
+				reasoningEffort: mappedReasoning(targetModel, effort),
+			});
+			return next;
+		},
+		onResponse: async (
+			response: { status: number; headers: Record<string, string> },
+			model?: unknown,
+		) => {
+			status = response.status;
+			await outerOnResponse?.(response, model);
+		},
+		transformHeaders: async (headers: Record<string, string | null>) => {
+			const next = outerTransformHeaders
+				? await outerTransformHeaders(headers)
+				: headers;
+			replaceSessionAffinityHeaders(next, { toggles, cacheKey });
+			return next;
+		},
+	};
+	void _droppedApiKey;
+	void _outerSignal;
+	void _outerTimeoutMs;
+	const { result, timedOut } = await executeTarget(
+		state.delegate,
+		targetModel,
+		context,
+		attemptOptions,
+		timeoutMs,
+		signal,
+	);
+	return {
+		targetModel,
+		targetKey,
+		capabilityKey,
+		toggles,
+		status,
+		result,
+		failure: classifyFailure({
+			status,
+			message: result.errorMessage,
+			stopReason: result.stopReason,
+			timedOut,
+		}),
+	};
+}
+
+function applyAutomaticFailure(
+	generated: GeneratedFailoverModel,
+	state: FailoverProviderState,
+	request: ReturnType<typeof createRequestState>,
+	target: ModelRef,
+	targetModel: TargetModelLike,
+	capabilityKey: string,
+	toggles: ModelParameterToggles,
+	status: number | undefined,
+	result: AssistantMessageLike,
+	failure: ReturnType<typeof classifyFailure>,
+	sameRetries: number,
+): { retry: boolean; sameRetries: number } {
+	const rejected = negotiateDisabledFields(
+		rejectedCacheFields({ status, message: result.errorMessage }),
+		toggles,
+	);
+	if (rejected.length > 0 && isOpenAIRequestApi(targetModel.api)) {
+		const remembered = state.unsupportedCacheFields.get(capabilityKey);
+		const newly = rejected.filter(
+			(field) => !remembered || !remembered.has(field),
+		);
+		if (newly.length > 0) {
+			const set = remembered ?? new Set<CacheField>();
+			for (const field of newly) set.add(field);
+			state.unsupportedCacheFields.set(capabilityKey, set);
+			return { retry: true, sameRetries };
+		}
+	}
+
+	recordFailure(request, target, failure.reason);
+	const key = genKey(generated.id, target);
+	if (failure.kind === "cooldown")
+		state.cooldowns.set(key, Date.now() + generated.cooldownMinutes * 60_000);
+	if (failure.kind === "persistent")
+		state.manualRecovery.set(key, failure.reason);
+	const retry =
+		shouldRetryCurrentModel(failure.kind, generated.errorHandlingMode) &&
+		sameRetries < generated.maxRetries;
+	return { retry, sameRetries: retry ? sameRetries + 1 : sameRetries };
+}
+
+async function runFailoverLoop(
+	generated: GeneratedFailoverModel,
+	context: RequestContext,
+	options: RequestOptions,
+	state: FailoverProviderState,
+	signal: AbortSignal | undefined,
+	chain: readonly ModelRef[],
+	cacheKey: string | undefined,
+	request: ReturnType<typeof createRequestState>,
+	requestCooldowns: ReadonlyMap<string, number>,
+	emit: (event: StreamEvent) => void,
+	end: (result: unknown) => void,
+): Promise<void> {
+	if (!generated.enabled) {
+		const message = errorMessage(
+			`Failover model "${generated.name}" is disabled.`,
+		);
+		emit({ type: "error", reason: "error", error: message });
+		end(message);
+		return;
+	}
+	if (chain.length === 0) {
+		const message = errorMessage(
+			`Failover model "${generated.name}" has no configured targets.`,
+		);
+		emit({ type: "error", reason: "error", error: message });
+		end(message);
+		return;
+	}
+
+	let current: ModelRef | undefined;
+	let sameRetries = 0;
+	let previousTarget: ModelRef | undefined;
+	let previousReason: string | undefined;
+	for (;;) {
+		if (signal?.aborted) {
+			const message = errorMessage("Request cancelled");
+			message.stopReason = "aborted";
+			emit({ type: "error", reason: "aborted", error: message });
+			end(message);
+			return;
+		}
+
+		if (!current) {
+			const candidates = chain.filter(
+				(target) => !state.manualRecovery.has(genKey(generated.id, target)),
+			);
+			current = nextUnattemptedModel(
+				candidates,
+				request.attempted,
+				requestCooldowns,
+				Date.now(),
+			);
+			if (!current) {
+				const summary = requestSummary(request, chain);
+				const message = errorMessage(
+					`Failover exhausted for "${generated.name}": ${summary || "no eligible targets"}`,
+				);
+				emit({ type: "error", reason: "error", error: message });
+				end(message);
+				return;
+			}
+			markAttempt(request, current);
+			if (previousTarget && modelKey(previousTarget) !== modelKey(current)) {
+				state.onTransition?.({
+					source: previousTarget,
+					target: current,
+					reason: previousReason ?? "failure",
+				});
+			}
+			previousTarget = undefined;
+			previousReason = undefined;
+		}
+
+		const target = current;
+		const attempt = await executeTargetAttempt(
+			generated,
+			target,
+			context,
+			options,
+			state,
+			cacheKey,
+			signal,
+		);
+		if (!attempt) {
+			recordFailure(request, target, "model unavailable");
+			state.manualRecovery.set(genKey(generated.id, target), "model unavailable");
+			previousTarget = target;
+			previousReason = "model unavailable";
+			current = undefined;
+			continue;
+		}
+
+		const {
+			result,
+			failure,
+			targetModel,
+			targetKey,
+			capabilityKey,
+			toggles,
+			status,
+		} = attempt;
+		if (failure.kind === "none") {
+			const withDiagnostics: AssistantMessageLike = {
+				...result,
+				diagnostics: [
+					...(result.diagnostics ?? []),
+					{ failoverModel: generated.id, target: targetKey },
+				],
+			};
+			emit({ type: "done", reason: result.stopReason, message: withDiagnostics });
+			end(withDiagnostics);
+			return;
+		}
+		if (!isAutomaticFailure(failure.kind)) {
+			const message =
+				failure.kind === "cancelled"
+					? { ...result, stopReason: "aborted" as const }
+					: result;
+			emit({
+				type: "error",
+				reason: failure.kind === "cancelled" ? "aborted" : "error",
+				error: message,
+			});
+			end(message);
+			return;
+		}
+
+		const outcome = applyAutomaticFailure(
+			generated,
+			state,
+			request,
+			target,
+			targetModel,
+			capabilityKey,
+			toggles,
+			status,
+			result,
+			failure,
+			sameRetries,
+		);
+		sameRetries = outcome.sameRetries;
+		if (outcome.retry) continue;
+		previousTarget = target;
+		previousReason = failure.reason;
+		current = undefined;
+	}
+}
+
 export function runFailoverRequest(
 	generated: GeneratedFailoverModel,
 	context: RequestContext,
@@ -343,219 +636,21 @@ export function runFailoverRequest(
 			state.cooldowns.get(genKey(generated.id, target)) ?? 0,
 		]),
 	);
-
-	return createBufferedStream(async (emit, end) => {
-		if (!generated.enabled) {
-			const message = errorMessage(
-				`Failover model "${generated.name}" is disabled.`,
-			);
-			emit({ type: "error", reason: "error", error: message });
-			end(message);
-			return;
-		}
-		if (chain.length === 0) {
-			const message = errorMessage(
-				`Failover model "${generated.name}" has no configured targets.`,
-			);
-			emit({ type: "error", reason: "error", error: message });
-			end(message);
-			return;
-		}
-
-		let current: ModelRef | undefined;
-		let sameRetries = 0;
-		let previousTarget: ModelRef | undefined;
-		let previousReason: string | undefined;
-		for (;;) {
-			if (signal?.aborted) {
-				const message = errorMessage("Request cancelled");
-				message.stopReason = "aborted";
-				emit({ type: "error", reason: "aborted", error: message });
-				end(message);
-				return;
-			}
-
-			if (!current) {
-				const now = Date.now();
-				const candidates = chain.filter(
-					(target) => !state.manualRecovery.has(genKey(generated.id, target)),
-				);
-				current = nextUnattemptedModel(
-					candidates,
-					request.attempted,
-					requestCooldowns,
-					now,
-				);
-				if (!current) {
-					const summary = requestSummary(request, chain);
-					const message = errorMessage(
-						`Failover exhausted for "${generated.name}": ${summary || "no eligible targets"}`,
-					);
-					emit({ type: "error", reason: "error", error: message });
-					end(message);
-					return;
-				}
-				markAttempt(request, current);
-				if (previousTarget && modelKey(previousTarget) !== modelKey(current)) {
-					state.onTransition?.({
-						source: previousTarget,
-						target: current,
-						reason: previousReason ?? "failure",
-					});
-				}
-				previousTarget = undefined;
-				previousReason = undefined;
-			}
-
-			const target = current;
-			const targetModel = state.delegate.resolveModel(target);
-			if (!targetModel) {
-				recordFailure(request, target, "model unavailable");
-				state.manualRecovery.set(genKey(generated.id, target), "model unavailable");
-				previousTarget = target;
-				previousReason = "model unavailable";
-				current = undefined;
-				continue;
-			}
-
-			const targetKey = modelKey(target);
-			const override = generated.targetOverrides[targetKey];
-			const toggles = mergeToggles(
-				generated.modelParameters,
-				override?.modelParameters,
-			);
-			const effort = override?.reasoningEffort ?? generated.reasoningEffort;
-			const capabilityKey = `${generated.id}:${targetKey}:${targetModel.api}`;
-			const unsupported =
-				state.unsupportedCacheFields.get(capabilityKey) ?? EMPTY_UNSUPPORTED;
-			const timeoutMs =
-				generated.noProgressTimeoutSeconds > 0
-					? generated.noProgressTimeoutSeconds * 1000
-					: undefined;
-
-			let status: number | undefined;
-			const {
-				apiKey: _droppedApiKey,
-				signal: _outerSignal,
-				timeoutMs: _outerTimeoutMs,
-				onPayload: outerOnPayload,
-				onResponse: outerOnResponse,
-				transformHeaders: outerTransformHeaders,
-				...forward
-			} = options;
-			const attemptOptions: RequestOptions = {
-				...forward,
-				reasoning: effort,
-				onPayload: (payload: unknown, model?: unknown) => {
-					const forwarded = outerOnPayload?.(payload, model);
-					const next = forwarded === undefined ? payload : forwarded;
-					applyRequestParameters(next, {
-						api: targetModel.api,
-						toggles,
-						cacheKey,
-						unsupported,
-						reasoningEffort: mappedReasoning(targetModel, effort),
-					});
-					return next;
-				},
-				onResponse: async (
-					response: { status: number; headers: Record<string, string> },
-					model?: unknown,
-				) => {
-					status = response.status;
-					await outerOnResponse?.(response, model);
-				},
-				transformHeaders: async (headers: Record<string, string | null>) => {
-					const next = outerTransformHeaders
-						? await outerTransformHeaders(headers)
-						: headers;
-					replaceSessionAffinityHeaders(next, { toggles, cacheKey });
-					return next;
-				},
-			};
-			void _droppedApiKey;
-			void _outerSignal;
-			void _outerTimeoutMs;
-
-			const { result, timedOut } = await executeTarget(
-				state.delegate,
-				targetModel,
-				context,
-				attemptOptions,
-				timeoutMs,
-				signal,
-			);
-			const failure = classifyFailure({
-				status,
-				message: result.errorMessage,
-				stopReason: result.stopReason,
-				timedOut,
-			});
-
-			if (failure.kind === "none") {
-				const withDiagnostics: AssistantMessageLike = {
-					...result,
-					diagnostics: [
-						...(result.diagnostics ?? []),
-						{ failoverModel: generated.id, target: targetKey },
-					],
-				};
-				emit({ type: "done", reason: result.stopReason, message: withDiagnostics });
-				end(withDiagnostics);
-				return;
-			}
-
-			if (!isAutomaticFailure(failure.kind)) {
-				const message =
-					failure.kind === "cancelled"
-						? { ...result, stopReason: "aborted" as const }
-						: result;
-				emit({
-					type: "error",
-					reason: failure.kind === "cancelled" ? "aborted" : "error",
-					error: message,
-				});
-				end(message);
-				return;
-			}
-
-			// Cache-field negotiation runs before policy accounting and never consumes it.
-			const rejected = negotiateDisabledFields(
-				rejectedCacheFields({ status, message: result.errorMessage }),
-				toggles,
-			);
-			if (rejected.length > 0 && isOpenAIRequestApi(targetModel.api)) {
-				const remembered = state.unsupportedCacheFields.get(capabilityKey);
-				const newly = rejected.filter(
-					(field) => !remembered || !remembered.has(field),
-				);
-				if (newly.length > 0) {
-					const set = remembered ?? new Set<CacheField>();
-					for (const field of newly) set.add(field);
-					state.unsupportedCacheFields.set(capabilityKey, set);
-					continue;
-				}
-			}
-
-			recordFailure(request, target, failure.reason);
-			const key = genKey(generated.id, target);
-			if (failure.kind === "cooldown")
-				state.cooldowns.set(key, Date.now() + generated.cooldownMinutes * 60_000);
-			if (failure.kind === "persistent")
-				state.manualRecovery.set(key, failure.reason);
-
-			if (
-				shouldRetryCurrentModel(failure.kind, generated.errorHandlingMode) &&
-				sameRetries < generated.maxRetries
-			) {
-				sameRetries++;
-				continue;
-			}
-			previousTarget = target;
-			previousReason = failure.reason;
-			current = undefined;
-		}
-	});
+	return createBufferedStream((emit, end) =>
+		runFailoverLoop(
+			generated,
+			context,
+			options,
+			state,
+			signal,
+			chain,
+			cacheKey,
+			request,
+			requestCooldowns,
+			emit,
+			end,
+		),
+	);
 }
 
 function buildVirtualModel(

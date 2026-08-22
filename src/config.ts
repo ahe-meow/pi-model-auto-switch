@@ -1,6 +1,10 @@
-import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
-import { dirname } from "node:path";
+import type { ConfigSourceRevision, SourceRead } from "./json-file.ts";
+import {
+	isRecord,
+	readJsonSource,
+	readManualRecovery,
+	writeJsonAtomically,
+} from "./json-file.ts";
 import type {
 	ErrorHandlingMode,
 	FailoverConfig,
@@ -25,7 +29,7 @@ export function resolveReasoningEffort(
 	);
 }
 
-export const CONFIG_VERSION = 5 as const;
+const CONFIG_VERSION = 5 as const;
 export const DEFAULT_COOLDOWN_MINUTES = 30;
 export const DEFAULT_ERROR_HANDLING_MODE: ErrorHandlingMode = "smart";
 export const DEFAULT_MAX_RETRIES = 1;
@@ -53,10 +57,6 @@ function copyModelRef(model: ModelRef): ModelRef {
 	return { provider: model.provider, id: model.id };
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function isModelRef(value: unknown): value is ModelRef {
 	if (!isRecord(value)) return false;
 	return (
@@ -79,23 +79,6 @@ function readModels(value: unknown): ModelRef[] | undefined {
 		models.push(normalized);
 	}
 	return models;
-}
-
-function readManualRecovery(
-	value: unknown,
-): Record<string, string> | undefined {
-	if (!isRecord(value)) return undefined;
-	const result: Record<string, string> = {};
-	for (const [key, reason] of Object.entries(value)) {
-		if (
-			key.trim().length === 0 ||
-			typeof reason !== "string" ||
-			reason.trim().length === 0
-		)
-			return undefined;
-		result[key] = reason;
-	}
-	return result;
 }
 
 function readReasoningEffort(value: unknown): ReasoningEffort | undefined {
@@ -260,92 +243,29 @@ export function validateConfig(value: unknown): FailoverConfig | undefined {
 	};
 }
 
-export type ConfigLoadFailure =
+type ConfigLoadFailure =
 	| { reason: "malformed" | "invalid" | "unreadable"; detail: string }
 	| { reason: "future-version"; version: number; detail: string };
 
-export type ConfigSourceRevision =
-	| { kind: "absent" }
-	| {
-			kind: "present";
-			device: string;
-			inode: string;
-			size: string;
-			mtimeNanoseconds: string;
-			digest: string;
-	  };
-
-interface ConfigSource {
-	bytes?: Buffer;
-	revision: ConfigSourceRevision;
-}
-
 export type ConfigLoadResult =
-	| ({ kind: "missing" } & ConfigSource)
+	| ({ kind: "missing" } & SourceRead)
 	| ({
 			kind: "loaded";
 			config: FailoverConfig;
 			migrated: boolean;
-	  } & ConfigSource)
+	  } & SourceRead)
 	| { kind: "blocked"; failure: ConfigLoadFailure };
 
-function errorDetail(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
-
-function digest(bytes: Buffer): string {
-	return createHash("sha256").update(bytes).digest("hex");
-}
-
-async function readSource(path: string): Promise<ConfigSource> {
-	let handle: Awaited<ReturnType<typeof open>>;
-	try {
-		handle = await open(path, "r");
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT")
-			return { revision: { kind: "absent" } };
-		throw error;
-	}
-	try {
-		const bytes = await handle.readFile();
-		const metadata = await handle.stat({ bigint: true });
-		return {
-			bytes,
-			revision: {
-				kind: "present",
-				device: String(metadata.dev),
-				inode: String(metadata.ino),
-				size: String(metadata.size),
-				mtimeNanoseconds: String(metadata.mtimeNs),
-				digest: digest(bytes),
-			},
-		};
-	} finally {
-		await handle.close();
-	}
-}
-
 export async function loadConfig(path: string): Promise<ConfigLoadResult> {
-	let source: ConfigSource;
-	try {
-		source = await readSource(path);
-	} catch (error) {
+	const source = await readJsonSource(path, "Configuration");
+	if (source.kind === "blocked")
 		return {
 			kind: "blocked",
-			failure: { reason: "unreadable", detail: errorDetail(error) },
+			failure: { reason: source.reason, detail: source.detail },
 		};
-	}
-	if (!source.bytes) return { kind: "missing", ...source };
-
-	let raw: unknown;
-	try {
-		raw = JSON.parse(source.bytes.toString("utf8"));
-	} catch {
-		return {
-			kind: "blocked",
-			failure: { reason: "malformed", detail: "Configuration is not valid JSON" },
-		};
-	}
+	if (source.kind === "missing")
+		return { kind: "missing", revision: source.revision };
+	const raw = source.value;
 	if (
 		isRecord(raw) &&
 		Number.isInteger(raw.version) &&
@@ -374,79 +294,11 @@ export async function loadConfig(path: string): Promise<ConfigLoadResult> {
 		kind: "loaded",
 		config,
 		migrated: isRecord(raw) && raw.version !== CONFIG_VERSION,
-		...source,
+		revision: source.revision,
 	};
 }
 
 export type SaveConfigResult = { kind: "saved" } | { kind: "conflict" };
-
-const LOCK_TIMEOUT_MS = 2_000;
-const LOCK_RETRY_MS = 20;
-
-interface LockRecord {
-	pid: number;
-	createdAt: number;
-	owner: string;
-}
-
-function sameRevision(
-	a: ConfigSourceRevision,
-	b: ConfigSourceRevision,
-): boolean {
-	if (a.kind !== b.kind) return false;
-	return (
-		a.kind === "absent" ||
-		(b.kind === "present" &&
-			a.device === b.device &&
-			a.inode === b.inode &&
-			a.size === b.size &&
-			a.mtimeNanoseconds === b.mtimeNanoseconds &&
-			a.digest === b.digest)
-	);
-}
-
-async function releaseOwnedLock(path: string, owner: string): Promise<void> {
-	try {
-		const lock = JSON.parse(await readFile(path, "utf8")) as Partial<LockRecord>;
-		if (lock.owner === owner) await unlink(path);
-	} catch {
-		// Never delete a lock whose ownership cannot be verified.
-	}
-}
-
-async function acquireLock(path: string, record: LockRecord): Promise<void> {
-	const deadline = Date.now() + LOCK_TIMEOUT_MS;
-	for (;;) {
-		try {
-			const handle = await open(path, "wx", 0o600);
-			try {
-				await handle.writeFile(JSON.stringify(record), "utf8");
-				await handle.sync();
-			} catch (error) {
-				try {
-					await handle.close();
-				} catch {
-					// Preserve the original lock creation failure.
-				}
-				try {
-					await unlink(path);
-				} catch {
-					// A partial lock is safer left for manual review than hidden by cleanup.
-				}
-				throw error;
-			}
-			await handle.close();
-			return;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			if (Date.now() >= deadline)
-				throw new Error(
-					`Timed out waiting for config lock: ${path}. Verify no Pi process is writing, then remove the stale lock if necessary.`,
-				);
-			await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS));
-		}
-	}
-}
 
 /** Lock, compare the retained source revision, then atomically replace the target. */
 export async function saveConfig(
@@ -456,48 +308,5 @@ export async function saveConfig(
 ): Promise<SaveConfigResult> {
 	const validated = validateConfig(config);
 	if (!validated) throw new Error("Refusing to write invalid failover config");
-	await mkdir(dirname(path), { recursive: true });
-	const owner = randomUUID();
-	const lockPath = `${path}.lock`;
-	const tempPath = `${path}.${process.pid}.${owner}.tmp`;
-	let tempCreated = false;
-	await acquireLock(lockPath, {
-		pid: process.pid,
-		createdAt: Date.now(),
-		owner,
-	});
-	try {
-		const currentSource = await readSource(path);
-		if (!sameRevision(currentSource.revision, expectedRevision))
-			return { kind: "conflict" };
-		const handle = await open(tempPath, "wx", 0o600);
-		tempCreated = true;
-		try {
-			await handle.writeFile(`${JSON.stringify(validated, null, 2)}\n`, "utf8");
-			await handle.sync();
-		} finally {
-			await handle.close();
-		}
-		await rename(tempPath, path);
-		try {
-			const directory = await open(dirname(path), "r");
-			try {
-				await directory.sync();
-			} finally {
-				await directory.close();
-			}
-		} catch {
-			// Directory fsync is not supported by every filesystem.
-		}
-		return { kind: "saved" };
-	} finally {
-		if (tempCreated) {
-			try {
-				await unlink(tempPath);
-			} catch {
-				// A crash artifact must not replace or remove the target.
-			}
-		}
-		await releaseOwnedLock(lockPath, owner);
-	}
+	return writeJsonAtomically(path, "config", expectedRevision, () => validated);
 }

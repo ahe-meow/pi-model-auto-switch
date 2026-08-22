@@ -5,7 +5,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { uniqueModels } from "./catalog.ts";
-import type { ConfigSourceRevision } from "./config.ts";
+import type { ConfigSourceRevision } from "./json-file.ts";
 import {
 	isValidCooldownMinutes,
 	isValidMaxRetries,
@@ -348,6 +348,35 @@ function clearTargetRuntimeState(
 	}
 }
 
+/** Pi's concrete runtime behind the synchronous ModelRegistry facade. */
+interface RegistryRuntime {
+	completeSimple?: (
+		model: unknown,
+		context: unknown,
+		options: unknown,
+	) => Promise<unknown>;
+	streamSimple?: (model: unknown, context: unknown, options: unknown) => unknown;
+}
+
+function resolveDelegateTarget(
+	runtime: RuntimeState,
+	model: ModelRef,
+): {
+	registry: ModelRegistry;
+	real: ReturnType<ModelRegistry["find"]>;
+	registryRuntime: RegistryRuntime | undefined;
+} {
+	const registry = runtime.registry;
+	if (!registry) throw new Error("Model registry is not available");
+	const real = registry.find(model.provider, model.id);
+	if (!real)
+		throw new Error(`Target unavailable: ${model.provider}/${model.id}`);
+	// SAFETY: the compatibility facade exposes Pi's concrete runtime at runtime.
+	const registryRuntime = (registry as unknown as { runtime?: RegistryRuntime })
+		.runtime;
+	return { registry, real, registryRuntime };
+}
+
 function createDelegate(runtime: RuntimeState): Delegate {
 	return {
 		resolveModel: (target) => {
@@ -364,23 +393,10 @@ function createDelegate(runtime: RuntimeState): Delegate {
 			return targetModel;
 		},
 		complete: async (model, context, options) => {
-			const registry = runtime.registry;
-			if (!registry) throw new Error("Model registry is not available");
-			const real = registry.find(model.provider, model.id);
-			if (!real)
-				throw new Error(`Target unavailable: ${model.provider}/${model.id}`);
-			// SAFETY: the compatibility facade exposes Pi's concrete runtime at runtime.
-			const registryRuntime = (
-				registry as unknown as {
-					runtime?: {
-						completeSimple?: (
-							model: unknown,
-							context: unknown,
-							options: unknown,
-						) => Promise<unknown>;
-					};
-				}
-			).runtime;
+			const { registry, real, registryRuntime } = resolveDelegateTarget(
+				runtime,
+				model,
+			);
 			const message = registryRuntime?.completeSimple
 				? await registryRuntime.completeSimple(real, context, options)
 				: await registry.complete(
@@ -392,23 +408,10 @@ function createDelegate(runtime: RuntimeState): Delegate {
 			return message as unknown as AssistantMessageLike;
 		},
 		stream: (model, context, options) => {
-			const registry = runtime.registry;
-			if (!registry) throw new Error("Model registry is not available");
-			const real = registry.find(model.provider, model.id);
-			if (!real)
-				throw new Error(`Target unavailable: ${model.provider}/${model.id}`);
-			// SAFETY: the compatibility facade exposes Pi's concrete runtime at runtime.
-			const registryRuntime = (
-				registry as unknown as {
-					runtime?: {
-						streamSimple?: (
-							model: unknown,
-							context: unknown,
-							options: unknown,
-						) => unknown;
-					};
-				}
-			).runtime;
+			const { registry, real, registryRuntime } = resolveDelegateTarget(
+				runtime,
+				model,
+			);
 			if (registryRuntime?.streamSimple) {
 				// SAFETY: Pi's runtime stream emits the structural event-stream contract.
 				return registryRuntime.streamSimple(
@@ -433,6 +436,24 @@ function createDelegate(runtime: RuntimeState): Delegate {
 	};
 }
 
+/** Persist a config, then re-apply the authoritative bytes that landed on disk. */
+async function saveAndApply(
+	runtime: RuntimeState,
+	config: GeneratedFailoverConfig,
+	revision: ConfigSourceRevision,
+): Promise<boolean> {
+	const saved = await saveGeneratedConfig(
+		FAILOVER_CONFIG_PATH,
+		config,
+		revision,
+	);
+	if (saved.kind !== "saved") return false;
+	const reloaded = await loadGeneratedConfig(FAILOVER_CONFIG_PATH);
+	if (reloaded.kind === "loaded")
+		applyConfig(runtime, reloaded.config, reloaded.revision);
+	return true;
+}
+
 async function loadAndApplyInitialConfig(
 	pi: ExtensionAPI,
 	runtime: RuntimeState,
@@ -441,36 +462,14 @@ async function loadAndApplyInitialConfig(
 	if (loaded.kind === "loaded") {
 		runtime.configBlocked = undefined;
 		applyConfig(runtime, loaded.config, loaded.revision);
-		if (loaded.migrated) {
-			// Persist the migrated v6 shape so later runs skip re-migration.
-			const saved = await saveGeneratedConfig(
-				FAILOVER_CONFIG_PATH,
-				loaded.config,
-				loaded.revision,
-			);
-			if (saved.kind === "saved") {
-				const reloaded = await loadGeneratedConfig(FAILOVER_CONFIG_PATH);
-				if (reloaded.kind === "loaded") {
-					applyConfig(runtime, reloaded.config, reloaded.revision);
-				}
-			}
-		}
+		// Persist the migrated v6 shape so later runs skip re-migration.
+		if (loaded.migrated)
+			await saveAndApply(runtime, loaded.config, loaded.revision);
 	} else if (loaded.kind === "missing") {
 		runtime.configBlocked = undefined;
 		const config = createGeneratedConfig([]);
-		const saved = await saveGeneratedConfig(
-			FAILOVER_CONFIG_PATH,
-			config,
-			loaded.revision,
-		);
-		if (saved.kind === "saved") {
-			const reloaded = await loadGeneratedConfig(FAILOVER_CONFIG_PATH);
-			if (reloaded.kind === "loaded") {
-				applyConfig(runtime, reloaded.config, reloaded.revision);
-			}
-		} else {
+		if (!(await saveAndApply(runtime, config, loaded.revision)))
 			applyConfig(runtime, config, loaded.revision);
-		}
 	} else {
 		runtime.configBlocked = loaded.detail;
 		const config = createGeneratedConfig([]);

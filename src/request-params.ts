@@ -1,23 +1,21 @@
 import { createHash } from "node:crypto";
+import { isRecord } from "./json-file.ts";
 import type { FailureInput, ModelParameterToggles } from "./types.ts";
 
-export const OPENAI_REQUEST_APIS = new Set([
+const OPENAI_REQUEST_APIS = new Set([
 	"openai-responses",
 	"openai-completions",
 	"azure-openai-responses",
 ]);
 
-export const SESSION_AFFINITY_HEADERS = new Set([
+const SESSION_AFFINITY_HEADERS = new Set([
 	"session_id",
 	"x-client-request-id",
 	"x-session-affinity",
 	"x-session-id",
 ]);
 
-export const CACHE_FIELDS = [
-	"prompt_cache_key",
-	"prompt_cache_retention",
-] as const;
+const CACHE_FIELDS = ["prompt_cache_key", "prompt_cache_retention"] as const;
 export type CacheField = (typeof CACHE_FIELDS)[number];
 
 const VALIDATION_TYPES = new Set([
@@ -42,10 +40,6 @@ const REQUEST_STATUS_PATTERNS = [
 	/\b(?:HTTP\s+)?(\d{3})\s*:/i,
 ];
 
-export function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 export function isOpenAIRequestApi(api: string): boolean {
 	return OPENAI_REQUEST_APIS.has(api);
 }
@@ -61,39 +55,43 @@ export function promptCacheKeyFromSessionId(
 		.digest("hex");
 }
 
+function findJsonRecordEnd(message: string, start: number): number | undefined {
+	let depth = 0;
+	let inString = false;
+	let escaped = false;
+	for (let end = start; end < message.length; end++) {
+		const character = message[end];
+		if (inString) {
+			if (escaped) escaped = false;
+			else if (character === "\\") escaped = true;
+			else if (character === '"') inString = false;
+			continue;
+		}
+		if (character === '"') {
+			inString = true;
+			continue;
+		}
+		if (character === "{") depth++;
+		else if (character === "}" && --depth === 0) return end;
+	}
+	return undefined;
+}
+
 function extractJsonRecords(message: string): Record<string, unknown>[] {
 	const records: Record<string, unknown>[] = [];
 	for (let start = message.indexOf("{"); start >= 0; ) {
-		let depth = 0;
-		let inString = false;
-		let escaped = false;
-		let end = start;
-		for (; end < message.length; end++) {
-			const character = message[end];
-			if (inString) {
-				if (escaped) escaped = false;
-				else if (character === "\\") escaped = true;
-				else if (character === '"') inString = false;
-				continue;
-			}
-			if (character === '"') {
-				inString = true;
-				continue;
-			}
-			if (character === "{") depth++;
-			else if (character === "}" && --depth === 0) break;
-		}
-		if (depth === 0) {
-			try {
-				const parsed: unknown = JSON.parse(message.slice(start, end + 1));
-				if (isRecord(parsed)) records.push(parsed);
-			} catch {
-				// Ignore balanced non-JSON braces and continue with the next object.
-			}
-			start = message.indexOf("{", end + 1);
-		} else {
+		const end = findJsonRecordEnd(message, start);
+		if (end === undefined) {
 			start = message.indexOf("{", start + 1);
+			continue;
 		}
+		try {
+			const parsed: unknown = JSON.parse(message.slice(start, end + 1));
+			if (isRecord(parsed)) records.push(parsed);
+		} catch {
+			// Ignore balanced non-JSON braces and continue with the next object.
+		}
+		start = message.indexOf("{", end + 1);
 	}
 	return records;
 }
@@ -140,10 +138,15 @@ export function requestStatus(input: FailureInput): number | undefined {
 	return undefined;
 }
 
+/** Literal patterns per field: no dynamic RegExp construction at call time. */
+const CACHE_FIELD_PATTERNS = {
+	prompt_cache_key: /(?:^|[^a-z0-9_])prompt_cache_key(?:$|[^a-z0-9_])/i,
+	prompt_cache_retention:
+		/(?:^|[^a-z0-9_])prompt_cache_retention(?:$|[^a-z0-9_])/i,
+} satisfies Record<CacheField, RegExp>;
+
 function knownFieldFromMessage(message: string, field: CacheField): boolean {
-	return new RegExp(`(?:^|[^a-z0-9_])${field}(?:$|[^a-z0-9_])`, "i").test(
-		message,
-	);
+	return CACHE_FIELD_PATTERNS[field].test(message);
 }
 
 /** Identify which cache fields a 400/422 validation response rejected. */

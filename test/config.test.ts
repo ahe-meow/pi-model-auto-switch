@@ -10,8 +10,8 @@ import {
 	migrateConfig,
 	saveConfig,
 	validateConfig,
-	type ConfigSourceRevision,
 } from "../src/config.ts";
+import type { ConfigSourceRevision } from "../src/json-file.ts";
 import { resolveReasoningEffort } from "../src/config.ts";
 import type { ModelRef } from "../src/types.ts";
 

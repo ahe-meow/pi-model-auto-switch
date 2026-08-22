@@ -18,33 +18,44 @@ function statusFromMessage(message: string): number | undefined {
 	return match ? Number(match[1]) : undefined;
 }
 
+function persistentStatusFailure(
+	status: number | undefined,
+): FailureClassification | undefined {
+	if (status === 401 || status === 403)
+		return { kind: "persistent", reason: `HTTP ${status}` };
+	if (status === 404) return { kind: "persistent", reason: "HTTP 404" };
+	return undefined;
+}
+
+function cooldownStatusFailure(
+	status: number | undefined,
+): FailureClassification | undefined {
+	if (status === 429) return { kind: "cooldown", reason: "HTTP 429" };
+	if (status !== undefined && status >= 500 && status <= 599)
+		return { kind: "cooldown", reason: `HTTP ${status}` };
+	return undefined;
+}
+
 export function classifyFailure(input: FailureInput): FailureClassification {
 	if (input.toolError)
 		return { kind: "tool-failure", reason: "tool execution failure" };
 	if (input.timedOut)
 		return { kind: "no-progress", reason: "no-progress timeout" };
-	if (input.stopReason === "aborted") {
+	if (input.stopReason === "aborted")
 		return { kind: "cancelled", reason: "user cancellation" };
-	}
 
 	const message = (input.message ?? "").replace(/[_-]+/g, " ");
 	const status = input.status ?? statusFromMessage(message);
-	if (status === 401 || status === 403) {
-		return { kind: "persistent", reason: `HTTP ${status}` };
-	}
-	if (status === 404) return { kind: "persistent", reason: "HTTP 404" };
-	if (PERSISTENT_ERROR.test(message)) {
+	const persistentStatus = persistentStatusFailure(status);
+	if (persistentStatus) return persistentStatus;
+	if (PERSISTENT_ERROR.test(message))
 		return { kind: "persistent", reason: "balance/quota/usage failure" };
-	}
-	if (status === 429) return { kind: "cooldown", reason: "HTTP 429" };
-	if (status !== undefined && status >= 500 && status <= 599) {
-		return { kind: "cooldown", reason: `HTTP ${status}` };
-	}
+	const cooldownStatus = cooldownStatusFailure(status);
+	if (cooldownStatus) return cooldownStatus;
 	if (NETWORK_ERROR.test(message))
 		return { kind: "cooldown", reason: "network failure" };
-	if (input.stopReason === "error" || message.length > 0) {
+	if (input.stopReason === "error" || message.length > 0)
 		return { kind: "unknown", reason: "unknown provider error" };
-	}
 	return { kind: "none", reason: "" };
 }
 

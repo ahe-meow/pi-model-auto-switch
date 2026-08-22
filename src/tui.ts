@@ -245,13 +245,12 @@ export class FailoverEditor implements Component {
 			);
 			return;
 		}
-		const numericValue =
-			key === "cooldown"
-				? model.cooldownMinutes
-				: key === "maxRetries"
-					? model.maxRetries
-					: model.noProgressTimeoutSeconds;
-		this.settingsInput = { key, value: String(numericValue) };
+		const numericValues = {
+			cooldown: model.cooldownMinutes,
+			maxRetries: model.maxRetries,
+			noProgressTimeoutSeconds: model.noProgressTimeoutSeconds,
+		};
+		this.settingsInput = { key, value: String(numericValues[key]) };
 	}
 
 	private saveNumericSetting(
@@ -824,16 +823,26 @@ export class FailoverEditor implements Component {
 		return lines;
 	}
 
-	private renderSettings(
-		model: GeneratedFailoverModel,
-		width: number,
-	): string[] {
-		if (this.paramsMode) return this.renderParams(model, width);
+	/** Start a bordered panel: collected lines plus a width-clamping writer. */
+	private beginPanel(width: number): {
+		lines: string[];
+		add: (line: string) => void;
+		border: string[];
+	} {
 		const lines: string[] = [];
 		const add = (line: string) =>
 			lines.push(truncateToWidth(line, Math.max(1, width), ""));
 		const border = this.border.render(width);
 		if (border[0]) add(border[0]);
+		return { lines, add, border };
+	}
+
+	private renderSettings(
+		model: GeneratedFailoverModel,
+		width: number,
+	): string[] {
+		if (this.paramsMode) return this.renderParams(model, width);
+		const { lines, add, border } = this.beginPanel(width);
 		add(this.theme.fg("accent", `Settings: ${model.id}`));
 		add(this.theme.fg("dim", "\u2191\u2193 select  Enter edit  Esc back"));
 		add("");
@@ -875,11 +884,7 @@ export class FailoverEditor implements Component {
 	}
 
 	private renderParams(model: GeneratedFailoverModel, width: number): string[] {
-		const lines: string[] = [];
-		const add = (line: string) =>
-			lines.push(truncateToWidth(line, Math.max(1, width), ""));
-		const border = this.border.render(width);
-		if (border[0]) add(border[0]);
+		const { lines, add, border } = this.beginPanel(width);
 		add(this.theme.fg("accent", `Target Parameters: ${model.id}`));
 		const target = model.chain[this.paramsTargetIndex];
 		if (!target) {
@@ -958,12 +963,7 @@ export class FailoverEditor implements Component {
 			this.settingsMode = false;
 		}
 
-		const lines: string[] = [];
-		const add = (line: string) =>
-			lines.push(truncateToWidth(line, Math.max(1, width), ""));
-		const border = this.border.render(width);
-		const firstBorder = border[0];
-		if (firstBorder) add(firstBorder);
+		const { lines, add, border } = this.beginPanel(width);
 
 		if (this.addModelName !== undefined) {
 			add(this.theme.fg("accent", "Add failover model"));
@@ -995,14 +995,13 @@ export class FailoverEditor implements Component {
 	}
 
 	private renderMainHeader(): string[] {
-		const lines = [
+		return [
 			this.theme.fg("accent", "Pi Model Failover"),
 			this.theme.fg(
 				"dim",
 				"Enter edit  a add  d remove  e toggle  r rename  q close",
 			),
 		];
-		return lines;
 	}
 
 	invalidate(): void {

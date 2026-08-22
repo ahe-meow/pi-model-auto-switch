@@ -23,6 +23,16 @@
   "engines": {
     "node": ">=22.19.0"
   },
+  "knip": {
+    "entry": [
+      "test/*.test.ts",
+      "test/typescript-loader.mjs"
+    ],
+    "project": [
+      "src/**/*.ts",
+      "test/**/*.{ts,mjs}"
+    ]
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"

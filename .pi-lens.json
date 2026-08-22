@@ -1,0 +1,26 @@
+{
+	"rules": {
+		"high-complexity": { "threshold": 25 },
+		"high-fan-out": { "threshold": 30 },
+		"json-schema-decoders-take-unknown-by-design": {
+			"disable": [
+				"no-unknown-parameters",
+				"no-runtime-typeof",
+				"no-unsafe-dictionary-unknown",
+				"no-known-value-widening",
+				"no-conditional-empty-object-spread"
+			]
+		},
+		"structural-mirrors-of-the-pi-provider-api": {
+			"disable": ["large-class", "long-parameter-list"]
+		},
+		"deliberate-idioms": {
+			"disable": [
+				"ts-redundant-filter-map",
+				"ts-delete-property",
+				"pass-through-wrappers",
+				"mixed-async-styles"
+			]
+		}
+	}
+}

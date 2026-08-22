@@ -1,15 +1,21 @@
-import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
-import { dirname } from "node:path";
 import {
 	DEFAULT_COOLDOWN_MINUTES,
 	DEFAULT_ERROR_HANDLING_MODE,
 	DEFAULT_MAX_RETRIES,
 	DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS,
 	DEFAULT_REASONING_EFFORT,
+	isValidCooldownMinutes,
+	isValidMaxRetries,
+	isValidTimeoutSeconds,
 	validateConfig,
-	type ConfigSourceRevision,
 } from "./config.ts";
+import type { ConfigSourceRevision } from "./json-file.ts";
+import {
+	isRecord,
+	readJsonSource,
+	readManualRecovery,
+	writeJsonAtomically,
+} from "./json-file.ts";
 import {
 	DEFAULT_PARAMETER_TOGGLES,
 	ERROR_HANDLING_MODES,
@@ -25,7 +31,21 @@ import {
 	type ReasoningEffort,
 } from "./types.ts";
 
-export const GENERATED_CONFIG_VERSION = 6 as const;
+const GENERATED_CONFIG_VERSION = 6 as const;
+const GENERATED_MODEL_KEYS = new Set([
+	"id",
+	"name",
+	"enabled",
+	"chain",
+	"reasoningEffort",
+	"cooldownMinutes",
+	"errorHandlingMode",
+	"maxRetries",
+	"noProgressTimeoutSeconds",
+	"modelParameters",
+	"targetOverrides",
+	"manualRecovery",
+]);
 export const DEFAULT_GENERATED_MODEL_ID = "default";
 export const DEFAULT_GENERATED_MODEL_NAME = "Default Failover";
 
@@ -57,10 +77,6 @@ export function createGeneratedConfig(
 		version: GENERATED_CONFIG_VERSION,
 		models: models.map(copyGeneratedModel),
 	};
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function copyModelRef(model: ModelRef): ModelRef {
@@ -159,23 +175,6 @@ function readToggles(value: unknown): ModelParameterToggles | undefined {
 	return result;
 }
 
-function readManualRecovery(
-	value: unknown,
-): Record<string, string> | undefined {
-	if (!isRecord(value)) return undefined;
-	const result: Record<string, string> = {};
-	for (const [key, reason] of Object.entries(value)) {
-		if (
-			key.trim().length === 0 ||
-			typeof reason !== "string" ||
-			reason.trim() === ""
-		)
-			return undefined;
-		result[key] = reason;
-	}
-	return result;
-}
-
 function readTargetOverrides(
 	value: unknown,
 	chain: readonly ModelRef[],
@@ -214,33 +213,22 @@ function validGeneratedId(value: unknown): value is string {
 	return typeof value === "string" && /^[a-z][a-z0-9_-]{0,63}$/.test(value);
 }
 
-function readGeneratedModel(
-	value: unknown,
-): GeneratedFailoverModel | undefined {
-	if (!isRecord(value)) return undefined;
-	const allowedKeys = new Set([
-		"id",
-		"name",
-		"enabled",
-		"chain",
-		"reasoningEffort",
-		"cooldownMinutes",
-		"errorHandlingMode",
-		"maxRetries",
-		"noProgressTimeoutSeconds",
-		"modelParameters",
-		"targetOverrides",
-		"manualRecovery",
-	]);
-	if (Object.keys(value).some((key) => !allowedKeys.has(key))) return undefined;
-	const chain = readChain(value.chain, value.enabled === false);
-	const reasoningEffort = readReasoningEffort(value.reasoningEffort);
-	const errorHandlingMode = readErrorHandlingMode(value.errorHandlingMode);
-	const modelParameters = readToggles(value.modelParameters);
-	const manualRecovery =
-		value.manualRecovery === undefined
-			? {}
-			: readManualRecovery(value.manualRecovery);
+function validGeneratedModelFields(
+	value: Record<string, unknown>,
+	chain: ModelRef[] | undefined,
+	reasoningEffort: ReasoningEffort | undefined,
+	errorHandlingMode: ErrorHandlingMode | undefined,
+	modelParameters: ModelParameterToggles | undefined,
+	manualRecovery: Record<string, string> | undefined,
+):
+	| {
+			chain: ModelRef[];
+			reasoningEffort: ReasoningEffort;
+			errorHandlingMode: ErrorHandlingMode;
+			modelParameters: ModelParameterToggles;
+			manualRecovery: Record<string, string>;
+	  }
+	| undefined {
 	if (
 		!validGeneratedId(value.id) ||
 		typeof value.name !== "string" ||
@@ -252,33 +240,61 @@ function readGeneratedModel(
 		!errorHandlingMode ||
 		!modelParameters ||
 		manualRecovery === undefined ||
-		!Number.isInteger(value.cooldownMinutes) ||
-		(value.cooldownMinutes as number) < 0 ||
-		(value.cooldownMinutes as number) > 1440 ||
-		!Number.isInteger(value.maxRetries) ||
-		(value.maxRetries as number) < 0 ||
-		(value.maxRetries as number) > 10 ||
-		!Number.isInteger(value.noProgressTimeoutSeconds) ||
-		((value.noProgressTimeoutSeconds as number) !== 0 &&
-			((value.noProgressTimeoutSeconds as number) < 15 ||
-				(value.noProgressTimeoutSeconds as number) > 900))
+		!isValidCooldownMinutes(value.cooldownMinutes) ||
+		!isValidMaxRetries(value.maxRetries) ||
+		!isValidTimeoutSeconds(value.noProgressTimeoutSeconds)
 	)
 		return undefined;
-	const targetOverrides = readTargetOverrides(value.targetOverrides, chain);
-	if (!targetOverrides) return undefined;
 	return {
-		id: value.id,
-		name: value.name,
-		enabled: value.enabled,
 		chain,
 		reasoningEffort,
-		cooldownMinutes: value.cooldownMinutes as number,
 		errorHandlingMode,
+		modelParameters,
+		manualRecovery,
+	};
+}
+
+function readGeneratedModel(
+	value: unknown,
+): GeneratedFailoverModel | undefined {
+	if (!isRecord(value)) return undefined;
+	if (Object.keys(value).some((key) => !GENERATED_MODEL_KEYS.has(key)))
+		return undefined;
+	const chain = readChain(value.chain, value.enabled === false);
+	const reasoningEffort = readReasoningEffort(value.reasoningEffort);
+	const errorHandlingMode = readErrorHandlingMode(value.errorHandlingMode);
+	const modelParameters = readToggles(value.modelParameters);
+	const manualRecovery =
+		value.manualRecovery === undefined
+			? {}
+			: readManualRecovery(value.manualRecovery);
+	const fields = validGeneratedModelFields(
+		value,
+		chain,
+		reasoningEffort,
+		errorHandlingMode,
+		modelParameters,
+		manualRecovery,
+	);
+	if (!fields) return undefined;
+	const targetOverrides = readTargetOverrides(
+		value.targetOverrides,
+		fields.chain,
+	);
+	if (!targetOverrides) return undefined;
+	return {
+		id: value.id as string,
+		name: value.name as string,
+		enabled: value.enabled as boolean,
+		chain: fields.chain,
+		reasoningEffort: fields.reasoningEffort,
+		cooldownMinutes: value.cooldownMinutes as number,
+		errorHandlingMode: fields.errorHandlingMode,
 		maxRetries: value.maxRetries as number,
 		noProgressTimeoutSeconds: value.noProgressTimeoutSeconds as number,
-		modelParameters,
+		modelParameters: fields.modelParameters,
 		targetOverrides,
-		manualRecovery,
+		manualRecovery: fields.manualRecovery,
 	};
 }
 
@@ -343,59 +359,6 @@ export function validateGeneratedConfig(
 	return createGeneratedConfig(models);
 }
 
-interface SourceRead {
-	bytes?: Buffer;
-	revision: ConfigSourceRevision;
-}
-
-function digest(bytes: Buffer): string {
-	return createHash("sha256").update(bytes).digest("hex");
-}
-
-async function readSource(path: string): Promise<SourceRead> {
-	let handle: Awaited<ReturnType<typeof open>>;
-	try {
-		handle = await open(path, "r");
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT")
-			return { revision: { kind: "absent" } };
-		throw error;
-	}
-	try {
-		const bytes = await handle.readFile();
-		const metadata = await handle.stat({ bigint: true });
-		return {
-			bytes,
-			revision: {
-				kind: "present",
-				device: String(metadata.dev),
-				inode: String(metadata.ino),
-				size: String(metadata.size),
-				mtimeNanoseconds: String(metadata.mtimeNs),
-				digest: digest(bytes),
-			},
-		};
-	} finally {
-		await handle.close();
-	}
-}
-
-function sameRevision(
-	a: ConfigSourceRevision,
-	b: ConfigSourceRevision,
-): boolean {
-	if (a.kind !== b.kind) return false;
-	return (
-		a.kind === "absent" ||
-		(b.kind === "present" &&
-			a.device === b.device &&
-			a.inode === b.inode &&
-			a.size === b.size &&
-			a.mtimeNanoseconds === b.mtimeNanoseconds &&
-			a.digest === b.digest)
-	);
-}
-
 export type GeneratedConfigLoadResult =
 	| { kind: "missing"; revision: ConfigSourceRevision }
 	| {
@@ -413,23 +376,9 @@ export type GeneratedConfigLoadResult =
 export async function loadGeneratedConfig(
 	path: string,
 ): Promise<GeneratedConfigLoadResult> {
-	let source: SourceRead;
-	try {
-		source = await readSource(path);
-	} catch (error) {
-		return { kind: "blocked", reason: "unreadable", detail: String(error) };
-	}
-	if (!source.bytes) return { kind: "missing", revision: source.revision };
-	let raw: unknown;
-	try {
-		raw = JSON.parse(source.bytes.toString("utf8"));
-	} catch {
-		return {
-			kind: "blocked",
-			reason: "malformed",
-			detail: "Configuration is not valid JSON",
-		};
-	}
+	const source = await readJsonSource(path, "Configuration");
+	if (source.kind !== "parsed") return source;
+	const raw = source.value;
 	const config = validateGeneratedConfig(raw);
 	if (!config)
 		return {
@@ -449,37 +398,6 @@ export type SaveGeneratedConfigResult =
 	| { kind: "saved" }
 	| { kind: "conflict" };
 
-async function acquireLock(path: string, owner: string): Promise<void> {
-	const deadline = Date.now() + 2_000;
-	for (;;) {
-		try {
-			const handle = await open(path, "wx", 0o600);
-			await handle.writeFile(
-				JSON.stringify({ pid: process.pid, owner, createdAt: Date.now() }),
-			);
-			await handle.sync();
-			await handle.close();
-			return;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			if (Date.now() >= deadline)
-				throw new Error(`Timed out waiting for generated config lock: ${path}`);
-			await new Promise((resolve) => setTimeout(resolve, 20));
-		}
-	}
-}
-
-async function releaseLock(path: string, owner: string): Promise<void> {
-	try {
-		const record = JSON.parse(await readFile(path, "utf8")) as {
-			owner?: unknown;
-		};
-		if (record.owner === owner) await unlink(path);
-	} catch {
-		// Never remove a lock whose owner cannot be verified.
-	}
-}
-
 export async function saveGeneratedConfig(
 	path: string,
 	config: GeneratedFailoverConfig,
@@ -488,34 +406,10 @@ export async function saveGeneratedConfig(
 	const validated = validateGeneratedConfig(config);
 	if (!validated)
 		throw new Error("Refusing to write invalid generated failover config");
-	await mkdir(dirname(path), { recursive: true });
-	const owner = randomUUID();
-	const lockPath = `${path}.lock`;
-	const tempPath = `${path}.${process.pid}.${owner}.tmp`;
-	let tempCreated = false;
-	await acquireLock(lockPath, owner);
-	try {
-		const current = await readSource(path);
-		if (!sameRevision(current.revision, expectedRevision))
-			return { kind: "conflict" };
-		const handle = await open(tempPath, "wx", 0o600);
-		tempCreated = true;
-		try {
-			await handle.writeFile(`${JSON.stringify(validated, null, 2)}\n`, "utf8");
-			await handle.sync();
-		} finally {
-			await handle.close();
-		}
-		await rename(tempPath, path);
-		return { kind: "saved" };
-	} finally {
-		if (tempCreated) {
-			try {
-				await unlink(tempPath);
-			} catch {
-				/* already renamed */
-			}
-		}
-		await releaseLock(lockPath, owner);
-	}
+	return writeJsonAtomically(
+		path,
+		"generated config",
+		expectedRevision,
+		() => validated,
+	);
 }
