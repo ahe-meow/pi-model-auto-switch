@@ -102,6 +102,7 @@ export type FailureKind =
 export interface FailureInput {
 	status?: number;
 	message?: string;
+	providerErrorCategory?: string;
 	stopReason?: string;
 	timedOut?: boolean;
 	toolError?: boolean;

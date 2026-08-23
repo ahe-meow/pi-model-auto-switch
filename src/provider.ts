@@ -54,6 +54,8 @@ export interface AssistantMessageLike {
 	usage?: unknown;
 	stopReason: string;
 	errorMessage?: string;
+	status?: number;
+	providerErrorCategory?: string;
 	diagnostics?: unknown[];
 	timestamp: number;
 }
@@ -205,7 +207,78 @@ function createBufferedStream(
 	};
 }
 
-function errorMessage(error: unknown): AssistantMessageLike {
+const MAX_EXTERNAL_ERROR_CATEGORY_LENGTH = 128;
+const MAX_EXTERNAL_ERROR_MESSAGE_LENGTH = 4096;
+
+interface NormalizedProviderError {
+	message: string;
+	status?: number;
+	providerErrorCategory?: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function boundedString(value: unknown, maxLength: number): string | undefined {
+	if (typeof value !== "string" || value.trim().length === 0) return undefined;
+	return value.length > maxLength ? value.slice(0, maxLength) : value;
+}
+
+function numericStatus(value: unknown): number | undefined {
+	return typeof value === "number" &&
+		Number.isInteger(value) &&
+		value >= 100 &&
+		value <= 599
+		? value
+		: undefined;
+}
+
+function fallbackErrorMessage(error: unknown): string {
+	if (error instanceof Error && typeof error.message === "string")
+		return error.message;
+	try {
+		return String(error);
+	} catch {
+		return "Unknown provider error";
+	}
+}
+
+function normalizeProviderError(error: unknown): NormalizedProviderError {
+	const record = isRecord(error) ? error : undefined;
+	const metadata =
+		record && isRecord(record.error_metadata) ? record.error_metadata : undefined;
+	const details =
+		metadata && isRecord(metadata.details) ? metadata.details : undefined;
+	const providerErrorCategory = boundedString(
+		metadata?.category,
+		MAX_EXTERNAL_ERROR_CATEGORY_LENGTH,
+	);
+	const metadataMessage = boundedString(
+		metadata?.message,
+		MAX_EXTERNAL_ERROR_MESSAGE_LENGTH,
+	);
+	const message =
+		metadataMessage ??
+		boundedString(
+			fallbackErrorMessage(error),
+			MAX_EXTERNAL_ERROR_MESSAGE_LENGTH,
+		) ??
+		"Unknown provider error";
+	return {
+		message,
+		status:
+			numericStatus(metadata?.status) ??
+			numericStatus(record?.status) ??
+			numericStatus(details?.status),
+		...(providerErrorCategory ? { providerErrorCategory } : {}),
+	};
+}
+
+function buildErrorMessage(
+	message: string,
+	metadata?: Pick<NormalizedProviderError, "status" | "providerErrorCategory">,
+): AssistantMessageLike {
 	return {
 		role: "assistant",
 		content: [],
@@ -221,9 +294,18 @@ function errorMessage(error: unknown): AssistantMessageLike {
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason: "error",
-		errorMessage: error instanceof Error ? error.message : String(error),
+		errorMessage: message,
+		...(metadata?.status !== undefined ? { status: metadata.status } : {}),
+		...(metadata?.providerErrorCategory
+			? { providerErrorCategory: metadata.providerErrorCategory }
+			: {}),
 		timestamp: Date.now(),
 	};
+}
+
+function errorMessage(error: unknown): AssistantMessageLike {
+	const normalized = normalizeProviderError(error);
+	return buildErrorMessage(normalized.message, normalized);
 }
 
 function genKey(generatedId: string, target: ModelRef): string {
@@ -284,7 +366,12 @@ async function executeTarget(
 	options: RequestOptions,
 	timeoutMs: number | undefined,
 	outerSignal: AbortSignal | undefined,
-): Promise<{ result: AssistantMessageLike; timedOut: boolean }> {
+): Promise<{
+	result: AssistantMessageLike;
+	timedOut: boolean;
+	status?: number;
+	providerErrorCategory?: string;
+}> {
 	const controller = new AbortController();
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let timeoutReject!: (error: unknown) => void;
@@ -333,12 +420,24 @@ async function executeTarget(
 		const result = await Promise.race([work, timeout, aborted]);
 		return { result, timedOut: false };
 	} catch (error) {
-		if (timedOut) return { result: errorMessage(error), timedOut: true };
+		const normalized = normalizeProviderError(error);
+		if (timedOut)
+			return {
+				result: buildErrorMessage(normalized.message, normalized),
+				timedOut: true,
+				status: normalized.status,
+				providerErrorCategory: normalized.providerErrorCategory,
+			};
 		// Auth, transport, and delegate throws become classifiable failures so the
 		// chain can advance; only a real cancellation stops it.
-		const failed = errorMessage(error);
+		const failed = buildErrorMessage(normalized.message, normalized);
 		if (outerAborted) failed.stopReason = "aborted";
-		return { result: failed, timedOut: false };
+		return {
+			result: failed,
+			timedOut: false,
+			status: normalized.status,
+			providerErrorCategory: normalized.providerErrorCategory,
+		};
 	} finally {
 		if (timer !== undefined) clearTimeout(timer);
 		if (outerSignal) outerSignal.removeEventListener("abort", onAbort);
@@ -484,7 +583,12 @@ async function executeTargetAttempt(
 	void _droppedApiKey;
 	void _outerSignal;
 	void _outerTimeoutMs;
-	const { result, timedOut } = await executeTarget(
+	const {
+		result,
+		timedOut,
+		status: thrownStatus,
+		providerErrorCategory,
+	} = await executeTarget(
 		state.delegate,
 		targetModel,
 		context,
@@ -492,6 +596,7 @@ async function executeTargetAttempt(
 		timeoutMs,
 		signal,
 	);
+	status ??= thrownStatus ?? result.status;
 	return {
 		targetModel,
 		targetKey,
@@ -502,6 +607,7 @@ async function executeTargetAttempt(
 		failure: classifyFailure({
 			status,
 			message: result.errorMessage,
+			providerErrorCategory: providerErrorCategory ?? result.providerErrorCategory,
 			stopReason: result.stopReason,
 			timedOut,
 		}),

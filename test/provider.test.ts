@@ -68,6 +68,24 @@ function errorMessage(
 	};
 }
 
+function structuredError(
+	category: string,
+	message: string,
+	details?: Record<string, unknown>,
+	metadataStatus?: number,
+): Error {
+	const error = new Error("external delegate failure");
+	Object.assign(error, {
+		error_metadata: {
+			category,
+			message,
+			...(metadataStatus === undefined ? {} : { status: metadataStatus }),
+			...(details ? { details } : {}),
+		},
+	});
+	return error;
+}
+
 interface Scripted {
 	delegate: Delegate;
 	calls: Array<{ model: TargetModelLike; options: RequestOptions }>;
@@ -161,6 +179,7 @@ test("no-progress timeout aborts a stalled target and advances", async () => {
 								once: true,
 							}),
 						);
+						yield* [];
 					},
 					result: async () => errorMessage(a, "stalled"),
 				};
@@ -219,6 +238,279 @@ test("a thrown delegate error fails over to the next target", async () => {
 	assert.equal(result.provider, "b");
 	assert.equal(result.model, "m2");
 	assert.equal(calls.length, 2);
+});
+
+test("transport stream-read errors are cooldown failures with a network transition reason", async () => {
+	const a = { provider: "a", id: "m1" };
+	const b = { provider: "b", id: "m2" };
+	const generated = createGeneratedModel([a, b]);
+	generated.id = "primary";
+	generated.errorHandlingMode = "switch";
+	generated.maxRetries = 0;
+	const { delegate } = scriptedDelegate(
+		new Map([
+			["a/m1", targetModel(a)],
+			["b/m2", targetModel(b)],
+		]),
+		[{ error: new Error("stream_read_error") }, { result: okMessage(b) }],
+	);
+	const state = makeState([generated], delegate);
+	const transitions: Array<{ reason: string }> = [];
+	state.onTransition = (transition) =>
+		transitions.push({ reason: transition.reason });
+
+	const { result } = await consume(runFailoverRequest(generated, {}, {}, state));
+	assert.equal(result.provider, "b");
+	assert.equal(result.model, "m2");
+	assert.equal(state.cooldownLevels.get("primary:a/m1"), 1);
+	assert.equal(transitions[0]?.reason, "network failure");
+});
+
+test("structured provider rate-limit errors fail over and arm cooldown", async () => {
+	const a = { provider: "a", id: "m1" };
+	const b = { provider: "b", id: "m2" };
+	const generated = createGeneratedModel([a, b]);
+	generated.id = "primary";
+	generated.errorHandlingMode = "switch";
+	generated.maxRetries = 0;
+	const { delegate } = scriptedDelegate(
+		new Map([
+			["a/m1", targetModel(a)],
+			["b/m2", targetModel(b)],
+		]),
+		[
+			{
+				error: structuredError(
+					"provider_rate_limit",
+					"provider rate limit exceeded",
+				),
+			},
+			{ result: okMessage(b) },
+		],
+	);
+	const state = makeState([generated], delegate);
+
+	const { result } = await consume(runFailoverRequest(generated, {}, {}, state));
+	assert.equal(result.provider, "b");
+	assert.equal(result.model, "m2");
+	assert.equal(state.cooldownLevels.get("primary:a/m1"), 1);
+});
+
+test("structured provider auth errors fail over with manual recovery and no cooldown", async () => {
+	const a = { provider: "a", id: "m1" };
+	const b = { provider: "b", id: "m2" };
+	const generated = createGeneratedModel([a, b]);
+	generated.id = "primary";
+	generated.errorHandlingMode = "switch";
+	generated.maxRetries = 0;
+	const { delegate } = scriptedDelegate(
+		new Map([
+			["a/m1", targetModel(a)],
+			["b/m2", targetModel(b)],
+		]),
+		[
+			{
+				error: structuredError("provider_auth_error", "provider auth failure"),
+			},
+			{ result: okMessage(b) },
+		],
+	);
+	const state = makeState([generated], delegate);
+
+	const { result } = await consume(runFailoverRequest(generated, {}, {}, state));
+	assert.equal(result.provider, "b");
+	assert.equal(result.model, "m2");
+	assert.equal(
+		state.manualRecovery.get("primary:a/m1"),
+		"provider auth failure",
+	);
+	assert.equal(state.cooldowns.has("primary:a/m1"), false);
+});
+
+test("structured provider API errors preserve HTTP status for cooldown classification", async () => {
+	const a = { provider: "a", id: "m1" };
+	const b = { provider: "b", id: "m2" };
+	const generated = createGeneratedModel([a, b]);
+	generated.id = "primary";
+	generated.errorHandlingMode = "switch";
+	generated.maxRetries = 0;
+	const { delegate } = scriptedDelegate(
+		new Map([
+			["a/m1", targetModel(a)],
+			["b/m2", targetModel(b)],
+		]),
+		[
+			{
+				error: structuredError(
+					"provider_api_error",
+					"OpenAI API error (502): upstream error",
+					{ status: 502 },
+				),
+			},
+			{ result: okMessage(b) },
+		],
+	);
+	const state = makeState([generated], delegate);
+	const transitions: Array<{ reason: string }> = [];
+	state.onTransition = (transition) =>
+		transitions.push({ reason: transition.reason });
+
+	const { result } = await consume(runFailoverRequest(generated, {}, {}, state));
+	assert.equal(result.provider, "b");
+	assert.equal(result.model, "m2");
+	assert.equal(state.cooldownLevels.get("primary:a/m1"), 1);
+	assert.equal(transitions[0]?.reason, "HTTP 502");
+});
+
+test("structured provider API errors read direct metadata status", async () => {
+	const a = { provider: "a", id: "m1" };
+	const b = { provider: "b", id: "m2" };
+	const generated = createGeneratedModel([a, b]);
+	generated.id = "metadata-status";
+	generated.errorHandlingMode = "switch";
+	generated.maxRetries = 0;
+	const { delegate } = scriptedDelegate(
+		new Map([
+			["a/m1", targetModel(a)],
+			["b/m2", targetModel(b)],
+		]),
+		[
+			{
+				error: structuredError(
+					"provider_api_error",
+					"upstream failure",
+					undefined,
+					502,
+				),
+			},
+			{ result: okMessage(b) },
+		],
+	);
+	const state = makeState([generated], delegate);
+	const transitions: Array<{ reason: string }> = [];
+	state.onTransition = (transition) =>
+		transitions.push({ reason: transition.reason });
+
+	const { result } = await consume(runFailoverRequest(generated, {}, {}, state));
+	assert.equal(result.provider, "b");
+	assert.equal(result.model, "m2");
+	assert.equal(state.cooldownLevels.get("metadata-status:a/m1"), 1);
+	assert.equal(transitions[0]?.reason, "HTTP 502");
+});
+
+test("explicit status takes precedence over structured provider categories", async () => {
+	const a = { provider: "a", id: "m1" };
+	const b = { provider: "b", id: "m2" };
+
+	const persistentGenerated = createGeneratedModel([a, b]);
+	persistentGenerated.id = "persistent-status";
+	persistentGenerated.errorHandlingMode = "switch";
+	persistentGenerated.maxRetries = 0;
+	const persistentScript = scriptedDelegate(
+		new Map([
+			["a/m1", targetModel(a)],
+			["b/m2", targetModel(b)],
+		]),
+		[
+			{
+				status: 401,
+				error: structuredError("provider_rate_limit", "rate limit exceeded"),
+			},
+			{ result: okMessage(b) },
+		],
+	);
+	const persistentState = makeState(
+		[persistentGenerated],
+		persistentScript.delegate,
+	);
+	const persistentOutcome = await consume(
+		runFailoverRequest(persistentGenerated, {}, {}, persistentState),
+	);
+	assert.equal(persistentOutcome.result.provider, "b");
+	assert.equal(
+		persistentState.manualRecovery.get("persistent-status:a/m1"),
+		"HTTP 401",
+	);
+	assert.equal(persistentState.cooldowns.has("persistent-status:a/m1"), false);
+
+	const cooldownGenerated = createGeneratedModel([a, b]);
+	cooldownGenerated.id = "cooldown-status";
+	cooldownGenerated.errorHandlingMode = "switch";
+	cooldownGenerated.maxRetries = 0;
+	const cooldownScript = scriptedDelegate(
+		new Map([
+			["a/m1", targetModel(a)],
+			["b/m2", targetModel(b)],
+		]),
+		[
+			{
+				status: 502,
+				error: structuredError("provider_auth_error", "auth failure"),
+			},
+			{ result: okMessage(b) },
+		],
+	);
+	const cooldownState = makeState([cooldownGenerated], cooldownScript.delegate);
+	const cooldownTransitions: Array<{ reason: string }> = [];
+	cooldownState.onTransition = (transition) =>
+		cooldownTransitions.push({ reason: transition.reason });
+	const cooldownOutcome = await consume(
+		runFailoverRequest(cooldownGenerated, {}, {}, cooldownState),
+	);
+	assert.equal(cooldownOutcome.result.provider, "b");
+	assert.equal(cooldownState.cooldownLevels.get("cooldown-status:a/m1"), 1);
+	assert.equal(cooldownState.manualRecovery.has("cooldown-status:a/m1"), false);
+	assert.equal(cooldownTransitions[0]?.reason, "HTTP 502");
+});
+
+test("a structured stream result error fails over to the next target", async () => {
+	const a = { provider: "a", id: "m1" };
+	const b = { provider: "b", id: "m2" };
+	const generated = createGeneratedModel([a, b]);
+	generated.id = "stream-primary";
+	generated.errorHandlingMode = "switch";
+	generated.maxRetries = 0;
+	let calls = 0;
+	const delegate: Delegate = {
+		resolveModel: (target) => targetModel(target),
+		complete: async (model) =>
+			okMessage({ provider: model.provider, id: model.id }),
+		stream: () => {
+			calls++;
+			if (calls === 1) {
+				return {
+					async *[Symbol.asyncIterator]() {
+						yield { type: "start" };
+					},
+					result: async () => {
+						throw structuredError(
+							"provider_api_error",
+							"stream upstream failure",
+							undefined,
+							502,
+						);
+					},
+				};
+			}
+			return {
+				async *[Symbol.asyncIterator]() {
+					yield { type: "done", reason: "stop", message: okMessage(b) };
+				},
+				result: async () => okMessage(b),
+			};
+		},
+	};
+	const state = makeState([generated], delegate);
+	const transitions: Array<{ reason: string }> = [];
+	state.onTransition = (transition) =>
+		transitions.push({ reason: transition.reason });
+
+	const { result } = await consume(runFailoverRequest(generated, {}, {}, state));
+	assert.equal(result.provider, "b");
+	assert.equal(result.model, "m2");
+	assert.equal(calls, 2);
+	assert.equal(state.cooldownLevels.get("stream-primary:a/m1"), 1);
+	assert.equal(transitions[0]?.reason, "HTTP 502");
 });
 
 test("a cooldown failure routes to the next target and records the cooldown", async () => {

@@ -10,7 +10,7 @@ import { modelKey } from "./types.ts";
 const PERSISTENT_ERROR =
 	/\b(balance|quota|usage|billing|credit|insufficient (?:funds|quota|balance)|payment required|spending limit)\b/i;
 const NETWORK_ERROR =
-	/\b(network|fetch failed|econnreset|econnrefused|enotfound|etimedout|timeout|timed out|socket|connection|dns)\b/i;
+	/\b(network|fetch failed|econnreset|econnrefused|enotfound|etimedout|timeout|timed out|socket|connection|dns|stream read error|provider api error|upstream error)\b/i;
 const API_ERROR_STATUS = /\b(?:HTTP|API)\s+error\s*\((\d{3})\)/i;
 
 function statusFromMessage(message: string): number | undefined {
@@ -36,6 +36,24 @@ function cooldownStatusFailure(
 	return undefined;
 }
 
+function providerCategoryFailure(
+	input: FailureInput,
+): FailureClassification | undefined {
+	if (input.providerErrorCategory === "provider_auth_error")
+		return {
+			kind: "persistent",
+			reason: input.message ?? "provider auth failure",
+		};
+	if (input.providerErrorCategory === "provider_rate_limit")
+		return {
+			kind: "cooldown",
+			reason: input.message ?? "provider rate limit",
+		};
+	if (input.providerErrorCategory === "provider_network_error")
+		return { kind: "cooldown", reason: "network failure" };
+	return undefined;
+}
+
 export function classifyFailure(input: FailureInput): FailureClassification {
 	if (input.toolError)
 		return { kind: "tool-failure", reason: "tool execution failure" };
@@ -48,10 +66,12 @@ export function classifyFailure(input: FailureInput): FailureClassification {
 	const status = input.status ?? statusFromMessage(message);
 	const persistentStatus = persistentStatusFailure(status);
 	if (persistentStatus) return persistentStatus;
-	if (PERSISTENT_ERROR.test(message))
-		return { kind: "persistent", reason: "balance/quota/usage failure" };
 	const cooldownStatus = cooldownStatusFailure(status);
 	if (cooldownStatus) return cooldownStatus;
+	const categoryFailure = providerCategoryFailure(input);
+	if (categoryFailure) return categoryFailure;
+	if (PERSISTENT_ERROR.test(message))
+		return { kind: "persistent", reason: "balance/quota/usage failure" };
 	if (NETWORK_ERROR.test(message))
 		return { kind: "cooldown", reason: "network failure" };
 	if (input.stopReason === "error" || message.length > 0)
@@ -163,8 +183,8 @@ export function nextCooldownLevel(level: number): number {
 	return Math.min(level + 1, COOLDOWN_LADDER_MINUTES.length - 1);
 }
 
-export const EXTENSION_RETRY_BASE_DELAY_MS = 1000;
-export const EXTENSION_RETRY_MAX_DELAY_MS = 60_000;
+const EXTENSION_RETRY_BASE_DELAY_MS = 1000;
+const EXTENSION_RETRY_MAX_DELAY_MS = 60_000;
 
 /** Delay before the retry at retryIndex (0 = first retry after the initial attempt). */
 export function retryDelayMs(retryIndex: number): number {
