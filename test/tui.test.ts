@@ -1,10 +1,19 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { FailoverProviderState } from "../src/provider.ts";
 import { createGeneratedModel } from "../src/generated-config.ts";
 import type { GeneratedFailoverModel, ModelRef } from "../src/types.ts";
+
+type FailoverHistoryEntry =
+	NonNullable<FailoverProviderState["onTransition"]> extends (
+		transition: infer Transition,
+	) => void
+		? Transition & { timestamp: number }
+		: never;
 import {
 	FailoverEditor,
+	FailoverHistoryPanel,
 	type FailoverTuiActions,
 	type FailoverTuiView,
 } from "../src/tui.ts";
@@ -24,7 +33,7 @@ function makeView(
 	available: ModelRef[] = [],
 ): FailoverTuiView {
 	return {
-		config: { version: 6, models },
+		config: { version: 7, models },
 		available,
 		cooldowns: new Map(),
 		manualRecovery: new Map(),
@@ -46,7 +55,7 @@ function makeActions(
 		onRemoveTarget: noop,
 		onMoveTarget: noop,
 		onSetReasoning: noop,
-		onSetCooldown: noop,
+		onResetCooldown: noop,
 		onSetErrorHandling: noop,
 		onSetMaxRetries: noop,
 		onSetTimeout: noop,
@@ -58,6 +67,43 @@ function makeActions(
 }
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+test("history panel renders entries and closes on q", () => {
+	const history: FailoverHistoryEntry[] = [
+		{
+			timestamp: Date.parse("2026-08-22T08:00:00Z"),
+			modelId: "default",
+			source: { provider: "a", id: "m1" },
+			target: { provider: "b", id: "m2" },
+			effort: "high",
+			mappedEffort: "high",
+			reasoningControlled: true,
+			reason: "HTTP 500",
+		},
+	];
+	let closed = false;
+	const panel = new FailoverHistoryPanel(
+		theme,
+		() => history,
+		() => {
+			closed = true;
+		},
+	);
+	const rendered = panel.render(140).join("\n");
+	assert.match(rendered, /Failover History/);
+	assert.match(rendered, /default a\/m1 -> b\/m2 \[high\] HTTP 500/);
+	panel.handleInput("q");
+	assert.equal(closed, true);
+});
+
+test("history panel renders an empty state", () => {
+	const panel = new FailoverHistoryPanel(
+		theme,
+		() => [],
+		() => undefined,
+	);
+	assert.match(panel.render(100).join("\n"), /No failover transitions recorded/);
+});
 
 test("p opens target parameters directly from model detail", () => {
 	const entry = model({ chain: [{ provider: "p", id: "a" }] });
@@ -104,6 +150,7 @@ test("main list renders generated models and Enter opens the detail view", () =>
 	const detail = editor.render(120);
 	assert.ok(detail.some((line) => line.includes("Failover Model: default")));
 	assert.ok(detail.some((line) => line.includes("1. p/a")));
+	assert.ok(detail.some((line) => line.includes("Retries: 1 (~1s total)")));
 });
 
 test("add target filters out already-configured targets and commits selection", async () => {
@@ -169,30 +216,30 @@ test("reorder dispatches move for the selected target", async () => {
 	assert.deepEqual(calls, [["default", { provider: "p", id: "a" }, 1]]);
 });
 
-test("settings edits the cooldown via numeric input", async () => {
-	const entry = model({ cooldownMinutes: 30 });
+test("settings reset cooldown dispatches for the selected model", async () => {
+	const entry = model();
 	const view = makeView([entry]);
-	let value: unknown;
+	let resetModelId: string | undefined;
 	const editor = new FailoverEditor(theme, () => view, {
 		...makeActions(),
-		onSetCooldown: async (_id, next) => {
-			value = next;
+		onResetCooldown: async (id) => {
+			resetModelId = id;
 		},
 	});
 
 	editor.handleInput("\r");
-	editor.handleInput("t");
-	assert.ok(
-		editor.render(120).some((line) => line.includes("Settings: default")),
+	assert.equal(
+		editor.render(120).some((line) => line.includes("Cooldown:")),
+		false,
 	);
-	editor.handleInput("\x1b[B"); // cooldown
-	editor.handleInput("\r");
-	editor.handleInput("\x7f");
-	editor.handleInput("\x7f");
-	editor.handleInput("45");
+	editor.handleInput("t");
+	const settings = editor.render(120).join("\n");
+	assert.match(settings, /Reset cooldown/);
+	assert.doesNotMatch(settings, /Cooldown:/);
+	for (let index = 0; index < 4; index++) editor.handleInput("\x1b[B");
 	editor.handleInput("\r");
 	await tick();
-	assert.equal(value, "45");
+	assert.equal(resetModelId, "default");
 });
 
 test("settings selects a reasoning level inline", async () => {

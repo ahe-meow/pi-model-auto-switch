@@ -57,7 +57,7 @@ test("catalog metadata uses the safe minimum across a chain", () => {
 
 test("disabled generated models are omitted from the managed catalog", () => {
 	const config = {
-		version: 6 as const,
+		version: 7 as const,
 		models: [model("enabled"), model("disabled", false)],
 	};
 	assert.deepEqual(
@@ -83,7 +83,7 @@ test("catalog reconciliation preserves unrelated providers and credentials", asy
 		if (loaded.kind !== "loaded") return;
 		const result = await reconcileFailoverCatalog(
 			path,
-			buildFailoverCatalogModels({ version: 6, models: [model("primary")] }),
+			buildFailoverCatalogModels({ version: 7, models: [model("primary")] }),
 			loaded.revision,
 		);
 		assert.deepEqual(result, { kind: "saved" });

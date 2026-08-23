@@ -6,11 +6,7 @@ import type {
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { uniqueModels } from "./catalog.ts";
 import type { ConfigSourceRevision } from "./json-file.ts";
-import {
-	isValidCooldownMinutes,
-	isValidMaxRetries,
-	isValidTimeoutSeconds,
-} from "./config.ts";
+import { isValidMaxRetries, isValidTimeoutSeconds } from "./config.ts";
 import {
 	createGeneratedConfig,
 	createGeneratedModel,
@@ -35,6 +31,7 @@ import {
 } from "./provider.ts";
 import {
 	FailoverEditor,
+	FailoverHistoryPanel,
 	type FailoverTuiActions,
 	type FailoverTuiView,
 } from "./tui.ts";
@@ -51,15 +48,60 @@ import { modelKey } from "./types.ts";
 export const FAILOVER_CONFIG_PATH = join(getAgentDir(), "model-failover.json");
 export const MODELS_JSON_PATH = join(getAgentDir(), "models.json");
 
+const MAX_HISTORY_ENTRIES = 100;
+
 interface RuntimeState {
 	config: GeneratedFailoverConfig;
 	configRevision: ConfigSourceRevision;
 	configBlocked: string | undefined;
+	configWarning: string | undefined;
 	registry: ModelRegistry | undefined;
 	providerState: FailoverProviderState;
+	history: FailoverHistoryEntry[];
+	currentTarget: FailoverTargetStatus | undefined;
+	lastTransition: FailoverTransition | undefined;
 }
 
 type ModelRegistry = ExtensionContext["modelRegistry"];
+type FailoverTargetStatus =
+	NonNullable<FailoverProviderState["onTarget"]> extends (
+		target: infer Target,
+	) => void
+		? Target
+		: never;
+type FailoverTransition =
+	NonNullable<FailoverProviderState["onTransition"]> extends (
+		transition: infer Transition,
+	) => void
+		? Transition
+		: never;
+type FailoverHistoryEntry = FailoverTransition & { timestamp: number };
+
+function footerThinking(target: FailoverTargetStatus): string {
+	if (!target.reasoningControlled) return "inherited";
+	if (!target.mappedEffort) return "unsupported";
+	if (target.mappedEffort === "none") return "off";
+	return target.mappedEffort;
+}
+
+function setFooterStatus(ctx: ExtensionContext, runtime: RuntimeState): void {
+	const current = runtime.currentTarget;
+	if (!current) return;
+	const transition = runtime.lastTransition;
+	let transitionText = "Failover: ";
+	if (
+		transition &&
+		transition.modelId === current.modelId &&
+		modelKey(transition.target) === modelKey(current.target)
+	) {
+		const source = transition.source ? modelKey(transition.source) : "start";
+		transitionText = `Failover: ${source} → ${modelKey(transition.target)} (${transition.reason}) | `;
+	}
+	ctx.ui.setStatus(
+		"failover",
+		`${transitionText}real ${modelKey(current.target)} | thinking ${footerThinking(current)}`,
+	);
+}
 
 function initialRuntime(): RuntimeState {
 	const config = createGeneratedConfig([]);
@@ -71,6 +113,7 @@ function initialRuntime(): RuntimeState {
 		availableTargetKeys: new Set(),
 		availabilityKnown: false,
 		cooldowns: new Map(),
+		cooldownLevels: new Map(),
 		manualRecovery: new Map(),
 		unsupportedCacheFields: new Map(),
 	};
@@ -78,8 +121,12 @@ function initialRuntime(): RuntimeState {
 		config,
 		configRevision: { kind: "absent" },
 		configBlocked: undefined,
+		configWarning: undefined,
 		registry: undefined,
 		providerState,
+		history: [],
+		currentTarget: undefined,
+		lastTransition: undefined,
 	};
 }
 
@@ -150,6 +197,36 @@ function seedManualRecovery(runtime: RuntimeState): void {
 	}
 }
 
+function pruneRuntimeState(
+	runtime: RuntimeState,
+	config: GeneratedFailoverConfig,
+): void {
+	const targets = new Set(
+		config.models.flatMap((model) =>
+			model.chain.map((target) => `${model.id}:${modelKey(target)}`),
+		),
+	);
+	for (const map of [
+		runtime.providerState.cooldowns,
+		runtime.providerState.cooldownLevels,
+		runtime.providerState.manualRecovery,
+	]) {
+		for (const key of [...map.keys()]) {
+			if (!targets.has(key)) map.delete(key);
+		}
+	}
+	for (const key of [...runtime.providerState.unsupportedCacheFields.keys()]) {
+		if (
+			![...targets].some(
+				(target) =>
+					key.startsWith(`${target}:`) &&
+					!key.slice(target.length + 1).includes(":"),
+			)
+		)
+			runtime.providerState.unsupportedCacheFields.delete(key);
+	}
+}
+
 function applyConfig(
 	runtime: RuntimeState,
 	config: GeneratedFailoverConfig,
@@ -158,6 +235,7 @@ function applyConfig(
 	runtime.config = config;
 	runtime.configRevision = revision;
 	runtime.providerState.config = { models: config.models };
+	pruneRuntimeState(runtime, config);
 	runtime.providerState.metadata = collectMetadata(config, runtime.registry);
 	runtime.providerState.availableTargetKeys = collectAvailableKeys(
 		config,
@@ -315,10 +393,19 @@ function setTargetParameter(
 	return { ...model, targetOverrides: overrides };
 }
 
-function clearRuntimeRecovery(runtime: RuntimeState, id: string): void {
-	for (const key of [...runtime.providerState.cooldowns.keys()]) {
-		if (key.startsWith(`${id}:`)) runtime.providerState.cooldowns.delete(key);
+function clearRuntimeCooldown(runtime: RuntimeState, id: string): void {
+	for (const map of [
+		runtime.providerState.cooldowns,
+		runtime.providerState.cooldownLevels,
+	]) {
+		for (const key of [...map.keys()]) {
+			if (key.startsWith(`${id}:`)) map.delete(key);
+		}
 	}
+}
+
+function clearRuntimeRecovery(runtime: RuntimeState, id: string): void {
+	clearRuntimeCooldown(runtime, id);
 	for (const key of [...runtime.providerState.manualRecovery.keys()]) {
 		if (key.startsWith(`${id}:`))
 			runtime.providerState.manualRecovery.delete(key);
@@ -336,14 +423,16 @@ function clearTargetRuntimeState(
 	target: ModelRef,
 ): void {
 	const prefix = `${id}:${modelKey(target)}`;
-	for (const key of [...runtime.providerState.cooldowns.keys()]) {
-		if (key === prefix) runtime.providerState.cooldowns.delete(key);
-	}
+	runtime.providerState.cooldowns.delete(prefix);
+	runtime.providerState.cooldownLevels.delete(prefix);
 	for (const key of [...runtime.providerState.manualRecovery.keys()]) {
 		if (key === prefix) runtime.providerState.manualRecovery.delete(key);
 	}
 	for (const key of [...runtime.providerState.unsupportedCacheFields.keys()]) {
-		if (key.startsWith(`${prefix}:`))
+		if (
+			key.startsWith(`${prefix}:`) &&
+			!key.slice(prefix.length + 1).includes(":")
+		)
 			runtime.providerState.unsupportedCacheFields.delete(key);
 	}
 }
@@ -462,9 +551,17 @@ async function loadAndApplyInitialConfig(
 	if (loaded.kind === "loaded") {
 		runtime.configBlocked = undefined;
 		applyConfig(runtime, loaded.config, loaded.revision);
-		// Persist the migrated v6 shape so later runs skip re-migration.
-		if (loaded.migrated)
-			await saveAndApply(runtime, loaded.config, loaded.revision);
+		// Persist the migrated shape so later runs skip re-migration.
+		if (loaded.migrated) {
+			try {
+				if (!(await saveAndApply(runtime, loaded.config, loaded.revision))) {
+					runtime.configWarning =
+						"Failover config migration was not persisted because the file changed on disk; using the validated in-memory config. Reload and review before editing again.";
+				}
+			} catch (error) {
+				runtime.configWarning = `Failover config migration could not be persisted; using the validated in-memory config. Resolve the save error, then reload. ${String(error)}`;
+			}
+		}
 	} else if (loaded.kind === "missing") {
 		runtime.configBlocked = undefined;
 		const config = createGeneratedConfig([]);
@@ -597,17 +694,8 @@ function createFailoverActions(
 			}),
 		onSetReasoning: async (id, effort) =>
 			update(id, (model) => ({ ...model, reasoningEffort: effort })),
-		onSetCooldown: async (id, value) => {
-			const minutes = parseNumericSetting(value);
-			if (minutes === undefined || !isValidCooldownMinutes(minutes)) {
-				notify(
-					ctx,
-					"Cooldown must be an integer from 0 to 1440 minutes",
-					"warning",
-				);
-				return;
-			}
-			await update(id, (model) => ({ ...model, cooldownMinutes: minutes }));
+		onResetCooldown: async (id) => {
+			clearRuntimeCooldown(runtime, id);
 		},
 		onSetErrorHandling: async (id, mode: ErrorHandlingMode) =>
 			update(id, (model) => ({ ...model, errorHandlingMode: mode })),
@@ -651,9 +739,28 @@ function registerFailoverCommand(
 ): void {
 	pi.registerCommand("failover", {
 		description: "Configure Pi model failover",
-		handler: async (_args, ctx) => {
+		handler: async (args, ctx) => {
 			if (ctx.mode !== "tui") {
 				notify(ctx, "/failover requires interactive TUI mode", "warning");
+				return;
+			}
+			const subcommand = args.trim().split(/\s+/)[0];
+			if (subcommand === "history") {
+				await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+					const panel = new FailoverHistoryPanel(
+						theme,
+						() => runtime.history,
+						() => done(),
+					);
+					return {
+						render: (width: number) => panel.render(width),
+						invalidate: () => panel.invalidate(),
+						handleInput: (data: string) => {
+							panel.handleInput(data);
+							tui.requestRender();
+						},
+					};
+				});
 				return;
 			}
 			if (runtime.configBlocked) {
@@ -687,14 +794,42 @@ export default async function modelFailoverExtension(
 	await loadAndApplyInitialConfig(pi, runtime);
 	pi.on("session_start", async (_event, ctx) => {
 		runtime.registry = ctx.modelRegistry;
+		runtime.providerState.onTarget = (target) => {
+			runtime.currentTarget = target;
+			setFooterStatus(ctx, runtime);
+		};
 		runtime.providerState.onTransition = (transition) => {
-			const source = transition.source ? modelKey(transition.source) : "start";
-			ctx.ui.setStatus(
-				"failover",
-				`Failover: ${source} → ${modelKey(transition.target)} (${transition.reason})`,
+			runtime.lastTransition = transition;
+			runtime.currentTarget = transition;
+			runtime.history.unshift({ ...transition, timestamp: Date.now() });
+			if (runtime.history.length > MAX_HISTORY_ENTRIES)
+				runtime.history.length = MAX_HISTORY_ENTRIES;
+			setFooterStatus(ctx, runtime);
+		};
+		runtime.providerState.onManualRecovery = (key, reason) => {
+			const separator = key.indexOf(":");
+			const modelId = key.slice(0, separator);
+			const targetKey = key.slice(separator + 1);
+			const config = createGeneratedConfig(
+				runtime.config.models.map((model) =>
+					model.id === modelId
+						? {
+								...model,
+								manualRecovery: {
+									...model.manualRecovery,
+									[targetKey]: reason,
+								},
+							}
+						: model,
+				),
 			);
+			void saveAndApply(runtime, config, runtime.configRevision);
 		};
 		runtime.providerState.availabilityKnown = true;
+		if (runtime.configWarning) {
+			notify(ctx, runtime.configWarning, "warning");
+			runtime.configWarning = undefined;
+		}
 		if (runtime.configBlocked) {
 			notify(
 				ctx,

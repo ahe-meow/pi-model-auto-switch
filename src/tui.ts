@@ -1,5 +1,7 @@
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { FailoverProviderState } from "./provider.ts";
+import { estimatedRetryDurationMs } from "./state.ts";
 import {
 	type Component,
 	Key,
@@ -21,6 +23,13 @@ import {
 	MODEL_PARAMETER_NAMES,
 	REASONING_EFFORTS,
 } from "./types.ts";
+
+type FailoverHistoryEntry =
+	NonNullable<FailoverProviderState["onTransition"]> extends (
+		transition: infer Transition,
+	) => void
+		? Transition & { timestamp: number }
+		: never;
 
 export interface FailoverTuiView {
 	config: GeneratedFailoverConfig;
@@ -44,7 +53,7 @@ export interface FailoverTuiActions {
 		direction: -1 | 1,
 	) => Promise<void>;
 	onSetReasoning: (id: string, effort: ReasoningEffort) => Promise<void>;
-	onSetCooldown: (id: string, minutes: string) => Promise<void>;
+	onResetCooldown: (id: string) => Promise<void>;
 	onSetErrorHandling: (id: string, mode: ErrorHandlingMode) => Promise<void>;
 	onSetMaxRetries: (id: string, value: string) => Promise<void>;
 	onSetTimeout: (id: string, value: string) => Promise<void>;
@@ -74,29 +83,45 @@ function padRight(text: string, width: number): string {
 	return text + " ".repeat(width - visibleWidth(text));
 }
 
+function createPanel(
+	width: number,
+	border: DynamicBorder,
+): {
+	lines: string[];
+	add: (line: string) => void;
+	border: string[];
+} {
+	const lines: string[] = [];
+	const add = (line: string) =>
+		lines.push(truncateToWidth(line, Math.max(1, width), ""));
+	const renderedBorder = border.render(width);
+	if (renderedBorder[0]) add(renderedBorder[0]);
+	return { lines, add, border: renderedBorder };
+}
+
 type SettingKey =
 	| "reasoning"
-	| "cooldown"
 	| "errorHandlingMode"
 	| "maxRetries"
 	| "noProgressTimeoutSeconds"
+	| "resetCooldown"
 	| "targetParameters";
 
 const SETTING_KEYS: readonly SettingKey[] = [
 	"reasoning",
-	"cooldown",
 	"errorHandlingMode",
 	"maxRetries",
 	"noProgressTimeoutSeconds",
+	"resetCooldown",
 	"targetParameters",
 ];
 
 const SETTING_LABELS: Record<SettingKey, string> = {
 	reasoning: "Reasoning level",
-	cooldown: "Cooldown",
 	errorHandlingMode: "Error behavior",
 	maxRetries: "Max retries",
 	noProgressTimeoutSeconds: "No-result timeout",
+	resetCooldown: "Reset cooldown",
 	targetParameters: "Target parameters",
 };
 
@@ -112,6 +137,12 @@ const ERROR_HANDLING_LABELS: Record<ErrorHandlingMode, string> = {
 	switch: "switch immediately",
 	retry: "retry then switch",
 };
+
+function formatRetryEstimate(maxRetries: number): string {
+	const seconds = estimatedRetryDurationMs(maxRetries) / 1000;
+	if (seconds < 60) return `~${Math.round(seconds)}s`;
+	return `~${(Math.round(seconds / 6) / 10).toFixed(1)}m`;
+}
 
 const MAX_VISIBLE_MODELS = 20;
 const TARGET_REASONING_CHOICES: readonly (ReasoningEffort | undefined)[] = [
@@ -219,6 +250,10 @@ export class FailoverEditor implements Component {
 	private beginSettingsEdit(model: GeneratedFailoverModel): void {
 		const key = SETTING_KEYS[this.settingsSelectionIndex];
 		if (!key) return;
+		if (key === "resetCooldown") {
+			this.runAction(() => this.actions.onResetCooldown(model.id));
+			return;
+		}
 		if (key === "targetParameters") {
 			if (model.chain.length === 0) return;
 			this.paramsMode = true;
@@ -246,11 +281,11 @@ export class FailoverEditor implements Component {
 			return;
 		}
 		const numericValues = {
-			cooldown: model.cooldownMinutes,
 			maxRetries: model.maxRetries,
 			noProgressTimeoutSeconds: model.noProgressTimeoutSeconds,
 		};
-		this.settingsInput = { key, value: String(numericValues[key]) };
+		if (key === "maxRetries" || key === "noProgressTimeoutSeconds")
+			this.settingsInput = { key, value: String(numericValues[key]) };
 	}
 
 	private saveNumericSetting(
@@ -259,9 +294,6 @@ export class FailoverEditor implements Component {
 		value: string,
 	): void {
 		switch (key) {
-			case "cooldown":
-				this.runAction(() => this.actions.onSetCooldown(modelId, value));
-				return;
 			case "maxRetries":
 				this.runAction(() => this.actions.onSetMaxRetries(modelId, value));
 				return;
@@ -802,7 +834,7 @@ export class FailoverEditor implements Component {
 		const lines: string[] = [
 			this.theme.fg("accent", `Failover Model: ${model.id}`),
 			`Name: ${model.name}  Enabled: ${model.enabled ? "yes" : "no"}`,
-			`Reasoning: ${model.reasoningEffort}  Cooldown: ${model.cooldownMinutes === 0 ? "off" : `${model.cooldownMinutes}m`}  Error: ${ERROR_HANDLING_LABELS[model.errorHandlingMode]}  Retries: ${model.maxRetries}  Timeout: ${model.noProgressTimeoutSeconds === 0 ? "off" : `${model.noProgressTimeoutSeconds}s`}`,
+			`Reasoning: ${model.reasoningEffort}  Error: ${ERROR_HANDLING_LABELS[model.errorHandlingMode]}  Retries: ${model.maxRetries}${model.maxRetries > 0 ? ` (${formatRetryEstimate(model.maxRetries)} total)` : ""}  Timeout: ${model.noProgressTimeoutSeconds === 0 ? "off" : `${model.noProgressTimeoutSeconds}s`}`,
 			this.theme.fg(
 				"dim",
 				"a add target  d remove  [ ] reorder  p target params  t settings  r restore  Esc back",
@@ -829,12 +861,7 @@ export class FailoverEditor implements Component {
 		add: (line: string) => void;
 		border: string[];
 	} {
-		const lines: string[] = [];
-		const add = (line: string) =>
-			lines.push(truncateToWidth(line, Math.max(1, width), ""));
-		const border = this.border.render(width);
-		if (border[0]) add(border[0]);
-		return { lines, add, border };
+		return createPanel(width, this.border);
 	}
 
 	private renderSettings(
@@ -848,10 +875,12 @@ export class FailoverEditor implements Component {
 		add("");
 		for (const [index, key] of SETTING_KEYS.entries()) {
 			const selected = index === this.settingsSelectionIndex;
+			const suffix =
+				key === "resetCooldown" ? "" : `: ${this.settingValue(model, key)}`;
 			add(
 				this.theme.fg(
 					selected ? "accent" : "text",
-					`${selected ? ">" : " "} ${SETTING_LABELS[key]}: ${this.settingValue(model, key)}`,
+					`${selected ? ">" : " "} ${SETTING_LABELS[key]}${suffix}`,
 				),
 			);
 		}
@@ -938,8 +967,6 @@ export class FailoverEditor implements Component {
 		switch (key) {
 			case "reasoning":
 				return model.reasoningEffort;
-			case "cooldown":
-				return model.cooldownMinutes === 0 ? "off" : `${model.cooldownMinutes}m`;
 			case "errorHandlingMode":
 				return ERROR_HANDLING_LABELS[model.errorHandlingMode];
 			case "maxRetries":
@@ -1002,6 +1029,95 @@ export class FailoverEditor implements Component {
 				"Enter edit  a add  d remove  e toggle  r rename  q close",
 			),
 		];
+	}
+
+	invalidate(): void {
+		this.border.invalidate();
+	}
+}
+
+function historyTimestamp(timestamp: number): string {
+	const date = new Date(timestamp);
+	return Number.isNaN(date.getTime())
+		? "---- -- -- --:--:--"
+		: date.toISOString().replace("T", " ").slice(0, 19);
+}
+
+function historyThinking(entry: FailoverHistoryEntry): string {
+	if (!entry.reasoningControlled) return "inherited";
+	if (!entry.mappedEffort) return "unsupported";
+	if (entry.mappedEffort === "none") return "off";
+	return entry.mappedEffort;
+}
+
+const MAX_VISIBLE_HISTORY = 20;
+
+export class FailoverHistoryPanel implements Component {
+	private scrollOffset = 0;
+	private readonly border: DynamicBorder;
+
+	constructor(
+		private readonly theme: Theme,
+		private readonly getHistory: () => readonly FailoverHistoryEntry[],
+		private readonly onClose: () => void,
+	) {
+		this.border = new DynamicBorder((text: string) => theme.fg("accent", text));
+	}
+
+	handleInput(data: string): void {
+		if (
+			matchesKey(data, Key.escape) ||
+			data === "q" ||
+			matchesKey(data, Key.ctrl("c"))
+		) {
+			this.onClose();
+			return;
+		}
+		if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
+			const maxOffset = Math.max(
+				0,
+				this.getHistory().length - MAX_VISIBLE_HISTORY,
+			);
+			this.scrollOffset = Math.max(
+				0,
+				Math.min(
+					maxOffset,
+					this.scrollOffset + (matchesKey(data, Key.down) ? 1 : -1),
+				),
+			);
+		}
+	}
+
+	render(width: number): string[] {
+		const { lines, add, border } = createPanel(width, this.border);
+		add(this.theme.fg("accent", "Failover History"));
+		add(this.theme.fg("dim", "Esc/q close  Up/Down scroll"));
+		add("");
+		const history = this.getHistory();
+		if (history.length === 0) {
+			add(this.theme.fg("dim", "No failover transitions recorded."));
+		} else {
+			const maxOffset = Math.max(0, history.length - MAX_VISIBLE_HISTORY);
+			this.scrollOffset = Math.min(this.scrollOffset, maxOffset);
+			const visible = history.slice(
+				this.scrollOffset,
+				this.scrollOffset + MAX_VISIBLE_HISTORY,
+			);
+			add(
+				this.theme.fg(
+					"dim",
+					`Showing ${this.scrollOffset + 1}-${this.scrollOffset + visible.length} of ${history.length}`,
+				),
+			);
+			for (const entry of visible) {
+				add(
+					`${historyTimestamp(entry.timestamp)} ${entry.modelId} ${entry.source ? modelKey(entry.source) : "start"} -> ${modelKey(entry.target)} [${historyThinking(entry)}] ${entry.reason}`,
+				);
+			}
+		}
+		const lastBorder = border.at(-1);
+		if (lastBorder) add(lastBorder);
+		return lines.map((line) => padRight(truncateToWidth(line, width, ""), width));
 	}
 
 	invalidate(): void {

@@ -1,10 +1,8 @@
 import {
-	DEFAULT_COOLDOWN_MINUTES,
 	DEFAULT_ERROR_HANDLING_MODE,
 	DEFAULT_MAX_RETRIES,
 	DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS,
 	DEFAULT_REASONING_EFFORT,
-	isValidCooldownMinutes,
 	isValidMaxRetries,
 	isValidTimeoutSeconds,
 	validateConfig,
@@ -31,20 +29,23 @@ import {
 	type ReasoningEffort,
 } from "./types.ts";
 
-const GENERATED_CONFIG_VERSION = 6 as const;
+const GENERATED_CONFIG_VERSION = 7 as const;
 const GENERATED_MODEL_KEYS = new Set([
 	"id",
 	"name",
 	"enabled",
 	"chain",
 	"reasoningEffort",
-	"cooldownMinutes",
 	"errorHandlingMode",
 	"maxRetries",
 	"noProgressTimeoutSeconds",
 	"modelParameters",
 	"targetOverrides",
 	"manualRecovery",
+]);
+const GENERATED_MODEL_V6_KEYS = new Set([
+	...GENERATED_MODEL_KEYS,
+	"cooldownMinutes",
 ]);
 export const DEFAULT_GENERATED_MODEL_ID = "default";
 export const DEFAULT_GENERATED_MODEL_NAME = "Default Failover";
@@ -59,7 +60,6 @@ export function createGeneratedModel(
 		enabled: true,
 		chain: chain.map(copyModelRef),
 		reasoningEffort: DEFAULT_REASONING_EFFORT,
-		cooldownMinutes: DEFAULT_COOLDOWN_MINUTES,
 		errorHandlingMode: DEFAULT_ERROR_HANDLING_MODE,
 		maxRetries: DEFAULT_MAX_RETRIES,
 		noProgressTimeoutSeconds: DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS,
@@ -107,7 +107,6 @@ function copyGeneratedModel(
 		enabled: model.enabled,
 		chain: model.chain.map(copyModelRef),
 		reasoningEffort: model.reasoningEffort,
-		cooldownMinutes: model.cooldownMinutes,
 		errorHandlingMode: model.errorHandlingMode,
 		maxRetries: model.maxRetries,
 		noProgressTimeoutSeconds: model.noProgressTimeoutSeconds,
@@ -240,7 +239,6 @@ function validGeneratedModelFields(
 		!errorHandlingMode ||
 		!modelParameters ||
 		manualRecovery === undefined ||
-		!isValidCooldownMinutes(value.cooldownMinutes) ||
 		!isValidMaxRetries(value.maxRetries) ||
 		!isValidTimeoutSeconds(value.noProgressTimeoutSeconds)
 	)
@@ -288,7 +286,6 @@ function readGeneratedModel(
 		enabled: value.enabled as boolean,
 		chain: fields.chain,
 		reasoningEffort: fields.reasoningEffort,
-		cooldownMinutes: value.cooldownMinutes as number,
 		errorHandlingMode: fields.errorHandlingMode,
 		maxRetries: value.maxRetries as number,
 		noProgressTimeoutSeconds: value.noProgressTimeoutSeconds as number,
@@ -298,12 +295,39 @@ function readGeneratedModel(
 	};
 }
 
-/** Convert the old v1-v5 config into one generated default model. */
+function migrateV6GeneratedModel(
+	value: unknown,
+): Record<string, unknown> | undefined {
+	if (!isRecord(value)) return undefined;
+	if (Object.keys(value).some((key) => !GENERATED_MODEL_V6_KEYS.has(key)))
+		return undefined;
+	if (
+		typeof value.cooldownMinutes !== "number" ||
+		!Number.isInteger(value.cooldownMinutes) ||
+		value.cooldownMinutes < 0 ||
+		value.cooldownMinutes > 1440
+	)
+		return undefined;
+	const { cooldownMinutes: _removed, ...migrated } = value;
+	return readGeneratedModel(migrated) ? migrated : undefined;
+}
+
+/** Convert supported older configs into generated config v7. */
 export function migrateGeneratedConfig(
 	value: unknown,
 ): Record<string, unknown> | undefined {
 	if (!isRecord(value)) return undefined;
 	if (value.version === GENERATED_CONFIG_VERSION) return value;
+	if (value.version === 6) {
+		if (!Array.isArray(value.models)) return undefined;
+		const models: Record<string, unknown>[] = [];
+		for (const entry of value.models) {
+			const migrated = migrateV6GeneratedModel(entry);
+			if (!migrated) return undefined;
+			models.push(migrated);
+		}
+		return { version: GENERATED_CONFIG_VERSION, models };
+	}
 	const legacy = validateConfig(value);
 	if (!legacy) return undefined;
 	if (legacy.models.length === 0) {
@@ -329,7 +353,6 @@ export function migrateGeneratedConfig(
 				enabled: legacy.enabled,
 				chain: legacy.models.map(copyModelRef),
 				reasoningEffort: legacy.reasoningEffort,
-				cooldownMinutes: legacy.cooldownMinutes,
 				errorHandlingMode: legacy.errorHandlingMode,
 				maxRetries: legacy.maxRetries,
 				noProgressTimeoutSeconds: legacy.noProgressTimeoutSeconds,

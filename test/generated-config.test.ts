@@ -47,7 +47,7 @@ function legacyConfig(
 test("v5 migrates to one stable generated default and drops paused", () => {
 	const migrated = validateGeneratedConfig(legacyConfig());
 	assert.ok(migrated);
-	assert.equal(migrated.version, 6);
+	assert.equal(migrated.version, 7);
 	assert.deepEqual(
 		migrated.models.map(({ id, name }) => ({ id, name })),
 		[{ id: DEFAULT_GENERATED_MODEL_ID, name: DEFAULT_GENERATED_MODEL_NAME }],
@@ -59,7 +59,7 @@ test("v5 migrates to one stable generated default and drops paused", () => {
 		{ provider: "provider-b", id: "model-b" },
 	]);
 	assert.equal(model.reasoningEffort, "high");
-	assert.equal(model.cooldownMinutes, 15);
+	assert.equal("cooldownMinutes" in model, false);
 	assert.equal(model.maxRetries, 2);
 	assert.deepEqual(model.manualRecovery, { "provider-b/model-b": "HTTP 429" });
 	assert.deepEqual(model.targetOverrides, {
@@ -80,7 +80,7 @@ test("v5 migrates to one stable generated default and drops paused", () => {
 test("generated config is strict, secret-free, and preserves stable IDs", () => {
 	const base = createGeneratedModel([{ provider: "provider-a", id: "model-a" }]);
 	const config: GeneratedFailoverConfig = {
-		version: 6,
+		version: 7,
 		models: [{ ...base, id: "primary", name: "Primary", targetOverrides: {} }],
 	};
 	assert.deepEqual(
@@ -122,10 +122,85 @@ test("generated config is strict, secret-free, and preserves stable IDs", () => 
 	);
 });
 
-test("empty legacy chains migrate to an empty v6 config without creating a model", () => {
-	const migrated = migrateGeneratedConfig(legacyConfig({ models: [] }));
-	assert.deepEqual(migrated, { version: 6, models: [] });
-	assert.deepEqual(validateGeneratedConfig(migrated)?.models, []);
+test("v6 generated config migrates to v7 and preserves every other field", () => {
+	const expected = {
+		...createGeneratedModel([{ provider: "provider-a", id: "model-a" }]),
+		id: "primary",
+		name: "Primary",
+		reasoningEffort: "max" as const,
+		errorHandlingMode: "retry" as const,
+		maxRetries: 3,
+		noProgressTimeoutSeconds: 120,
+		modelParameters: {
+			promptCacheKey: false,
+			promptCacheRetention: true,
+			reasoningEffort: false,
+			sessionAffinity: true,
+		},
+		targetOverrides: {
+			"provider-a/model-a": { reasoningEffort: "low" as const },
+		},
+		manualRecovery: { "provider-a/model-a": "HTTP 401" },
+	};
+	const migrated = validateGeneratedConfig({
+		version: 6,
+		models: [{ ...expected, cooldownMinutes: 45 }],
+	});
+	assert.ok(migrated);
+	assert.equal(migrated.version, 7);
+	assert.deepEqual(migrated.models, [expected]);
+	assert.equal("cooldownMinutes" in migrated.models[0]!, false);
+});
+
+test("v6 and v7 generated configs enforce version-specific cooldown fields", () => {
+	const model = createGeneratedModel([
+		{ provider: "provider-a", id: "model-a" },
+	]);
+	assert.equal(
+		validateGeneratedConfig({
+			version: 6,
+			models: [{ ...model, cooldownMinutes: -1 }],
+		}),
+		undefined,
+	);
+	assert.equal(
+		validateGeneratedConfig({
+			version: 6,
+			models: [{ ...model, cooldownMinutes: 30, unknown: true }],
+		}),
+		undefined,
+	);
+	assert.equal(
+		validateGeneratedConfig({ version: 6, models: [model] }),
+		undefined,
+	);
+	assert.equal(
+		validateGeneratedConfig({
+			version: 7,
+			models: [{ ...model, cooldownMinutes: 30 }],
+		}),
+		undefined,
+	);
+});
+
+test("legacy v1-v5 configs migrate directly to v7 without cooldownMinutes", () => {
+	for (const version of [1, 2, 3, 4, 5]) {
+		const migrated = validateGeneratedConfig(legacyConfig({ version }));
+		assert.ok(migrated, `version ${version}`);
+		assert.equal(migrated.version, 7);
+		assert.equal("cooldownMinutes" in migrated.models[0]!, false);
+	}
+});
+
+test("empty legacy and v6 configs migrate to empty v7 configs", () => {
+	for (const input of [
+		legacyConfig({ models: [] }),
+		{ version: 6, models: [] },
+	]) {
+		const migrated = migrateGeneratedConfig(input);
+		assert.deepEqual(migrated, { version: 7, models: [] });
+		assert.deepEqual(validateGeneratedConfig(migrated)?.models, []);
+	}
 });
 
 test("generated config persistence uses atomic CAS and strips legacy input fields", async () => {
@@ -143,9 +218,10 @@ test("generated config persistence uses atomic CAS and strips legacy input field
 			string,
 			unknown
 		>;
-		assert.equal(persisted.version, 6);
+		assert.equal(persisted.version, 7);
 		assert.equal("paused" in persisted, false);
 		assert.equal("manualRecovery" in persisted, false);
+		assert.equal(JSON.stringify(persisted).includes("cooldownMinutes"), false);
 
 		await writeFile(path, "{}\n", "utf8");
 		assert.deepEqual(

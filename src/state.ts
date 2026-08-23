@@ -149,3 +149,37 @@ export function shouldRetryCurrentModel(
 	if (mode === "retry") return true;
 	return kind !== "persistent";
 }
+
+export const COOLDOWN_LADDER_MINUTES = [10, 20, 40, 60, 90, 180, 360] as const;
+
+export function cooldownMinutesForLevel(level: number): number {
+	const maxLevel = COOLDOWN_LADDER_MINUTES.length - 1;
+	const index =
+		Number.isInteger(level) && level >= 0 ? Math.min(level, maxLevel) : maxLevel;
+	return COOLDOWN_LADDER_MINUTES[index];
+}
+
+export function nextCooldownLevel(level: number): number {
+	return Math.min(level + 1, COOLDOWN_LADDER_MINUTES.length - 1);
+}
+
+export const EXTENSION_RETRY_BASE_DELAY_MS = 1000;
+export const EXTENSION_RETRY_MAX_DELAY_MS = 60_000;
+
+/** Delay before the retry at retryIndex (0 = first retry after the initial attempt). */
+export function retryDelayMs(retryIndex: number): number {
+	if (retryIndex <= 0) return EXTENSION_RETRY_BASE_DELAY_MS;
+	return Math.min(
+		EXTENSION_RETRY_BASE_DELAY_MS * 2 ** retryIndex,
+		EXTENSION_RETRY_MAX_DELAY_MS,
+	);
+}
+
+/** Worst-case wait for all maxRetries retries of one target. */
+export function estimatedRetryDurationMs(maxRetries: number): number {
+	let total = 0;
+	for (let retryIndex = 0; retryIndex < maxRetries; retryIndex++) {
+		total += retryDelayMs(retryIndex);
+	}
+	return total;
+}

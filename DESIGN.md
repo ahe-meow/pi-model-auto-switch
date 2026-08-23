@@ -36,30 +36,32 @@ The persisted shape is intentionally small and contains no credentials:
 
 ```json
 {
-  "version": 5,
-  "enabled": true,
-  "paused": false,
+  "version": 7,
   "models": [
-    { "provider": "<provider>", "id": "<model-id>" }
-  ],
-  "reasoningEffort": "medium",
-  "cooldownMinutes": 30,
-  "errorHandlingMode": "smart",
-  "maxRetries": 1,
-  "noProgressTimeoutSeconds": 90,
-  "manualRecovery": {
-    "<provider>/<model-id>": "HTTP 401"
-  },
-  "modelParameters": {},
-  "modelReasoningEfforts": {}
+    {
+      "id": "default",
+      "name": "Default Failover",
+      "enabled": true,
+      "chain": [
+        { "provider": "<provider>", "id": "<model-id>" }
+      ],
+      "reasoningEffort": "medium",
+      "errorHandlingMode": "smart",
+      "maxRetries": 1,
+      "noProgressTimeoutSeconds": 90,
+      "modelParameters": {},
+      "targetOverrides": {},
+      "manualRecovery": {}
+    }
+  ]
 }
 ```
 
-- `version` supports deliberate future migrations.
+- `version` is the generated failover schema version `7`; generated v6 and legacy v1-v5 inputs migrate to it.
 - `enabled` defaults to `true` for a new configuration.
 - `models` is the authoritative ordered failover authorization. A model reference is identified by provider and model id and contains no authentication material.
 - `reasoningEffort` is the global fallback for best-effort OpenAI-compatible reasoning parameters and Pi's native thinking level. `modelReasoningEfforts` overrides it per configured `provider/id`; `inherit` removes an override. The selected level is inherited by child sessions and displayed by Pi's footer.
-- `cooldownMinutes`, `errorHandlingMode`, and `maxRetries` control extension-owned recovery after Pi settles.
+- The cooldown ladder is fixed and always enabled: 10, 20, 40, 60, 90, 180, and 360 minutes. It advances once per user request after a terminal cooldown-class failure and same-target retry exhaustion, and is reset by success, `Reset cooldown`, or `Restore`.
 - `noProgressTimeoutSeconds` defaults to `90`. Valid user values are `15` through `900`, or `0` to disable the extension-owned no-progress timeout.
 - `paused` records a manual `/model` or Ctrl+P choice until explicit TUI restore.
 - `manualRecovery` records non-secret permanent failure reasons for balance/quota/usage, `401`/`403`, and `404`; these statuses survive Pi restarts until restore clears them.
@@ -74,11 +76,11 @@ Runtime state is held for the active process/request and is not persisted as cre
 - the active model and the source/target/reason for the latest transition;
 - the current request's attempted model references;
 - at most one same-model continuation used by the unknown-error/no-progress path;
-- per-model cooldown expiry for transient `429`, network, and `5xx` failures; and
+- per-target cooldown expiry and the next ladder rung for transient `429`, network, and `5xx` failures; and
 - runtime-only cache-field incompatibilities keyed by provider, model, and API; and
 - whether the current request is waiting for Pi's native retry handling, settled, switching, or exhausted.
 
-Persistent non-secret recovery state is kept in the extension configuration. Cooldowns and request attempts remain process/request state; permanent recovery reasons and the manual pause flag survive restart.
+Persistent non-secret recovery state is kept in the extension configuration. Cooldown timers, ladder levels, and request attempts remain process/request state; permanent recovery reasons and the manual pause flag survive restart.
 
 A request's attempted set resets at the start of each user request. Before a new request runs, enabled automation selects the first configured model that is not in manual recovery and whose cooldown has expired; this lets recovered models re-enter rotation without waiting for the current model to fail. A model is not selected again during that request after it has been attempted, even if its cooldown has elapsed. Manual model/cycle selections pause automation, while an explicit Restore selection is honored for the next request.
 
@@ -133,7 +135,7 @@ Operational rules:
 
 1. A user request begins on the current model when automation is enabled and not paused.
 2. The extension waits for Pi's native retry handling to settle before deciding whether to switch. It does not run a competing native retry loop.
-3. A recognized transient failure is therefore first handled by Pi. If it remains a failure, the extension applies the classification table below.
+3. A recognized transient failure is therefore first handled by Pi. If it remains a failure, the extension applies the classification table below; a terminal cooldown-class failure arms the current ladder rung and advances the next rung by one.
 4. Unknown provider failures and extension-owned no-progress timeouts receive one best-effort continuation on the same model after native retries. A failed continuation advances to the next model.
 5. For a switch, the extension records the source model, target model, and reason, then asks Pi to continue on the target through the supported extension path.
 6. A model that has been attempted is not revisited in the same request. The request traverses the configured list at most once and cannot create an infinite loop.
@@ -150,9 +152,9 @@ The extension-owned no-progress timer is `90` seconds by default, can be edited 
 | Balance, quota, or usage failure | No extension retry | Mark persistent manual recovery | No | Advance once to the next unattempted model when available |
 | HTTP `401` or `403` | No extension retry | Mark persistent manual recovery | No | Advance once to the next unattempted model when available |
 | HTTP `404` | No extension retry | Mark persistent manual recovery | No | Advance once to the next unattempted model when available |
-| HTTP `429` | Pi handles recognized native retries first | Put the failed model on a 30-minute cooldown | No after native retries | Advance to the next eligible unattempted model |
-| Network failure | Pi handles recognized native retries first | Put the failed model on a 30-minute cooldown | No after native retries | Advance to the next eligible unattempted model |
-| HTTP `5xx` | Pi handles recognized native retries first | Put the failed model on a 30-minute cooldown | No after native retries | Advance to the next eligible unattempted model |
+| HTTP `429` | Pi handles recognized native retries first | Arm the current per-target cooldown rung: 10 -> 20 -> 40 -> 60 -> 90 -> 180 -> 360 minutes, capped at 6 hours | No after native retries | Advance to the next eligible unattempted model |
+| Network failure | Pi handles recognized native retries first | Arm the current per-target cooldown rung: 10 -> 20 -> 40 -> 60 -> 90 -> 180 -> 360 minutes, capped at 6 hours | No after native retries | Advance to the next eligible unattempted model |
+| HTTP `5xx` | Pi handles recognized native retries first | Arm the current per-target cooldown rung: 10 -> 20 -> 40 -> 60 -> 90 -> 180 -> 360 minutes, capped at 6 hours | No after native retries | Advance to the next eligible unattempted model |
 | Unknown provider error | Pi handles any recognized native retries first | Use the one best-effort continuation allowance | Once | Switch after the continuation fails |
 | No-progress timeout | Extension-owned timer | Use the one best-effort continuation allowance | Once | Switch after the continuation fails |
 | User presses `Esc` or `Ctrl+C` | User cancellation | Stop automatic failover | No | Never switch |
@@ -170,7 +172,8 @@ The TUI shows:
 - whether automation is enabled, paused, or disabled;
 - the ordered model list;
 - cooldown and persistent manual-recovery status;
-- the configured no-progress timeout; and
+- the configured no-progress timeout;
+- the model-level `Reset cooldown` action; and
 - the latest failover source, target, and reason.
 
 The model list renders a 20-row viewport. Arrow navigation changes the selection and scrolls the viewport instead of rendering every configured model on each keypress.
@@ -195,7 +198,7 @@ A manual model choice through `/model` or `Ctrl+P` pauses automation. Automatic 
 - Serialize every authorized write with an adjacent exclusive lock, re-read and compare the retained source revision under that lock, flush a same-directory temporary file, then atomically rename it. A revision mismatch conflicts without touching newer bytes.
 - Never delete an existing lock automatically; timeout fails closed with manual recovery guidance. Cleanup removes only this invocation's owned lock and successfully created temporary file.
 - Persist provider/model references, the manual pause flag, and permanent recovery reasons. API keys, tokens, and other credentials remain in Pi's existing authentication/configuration systems.
-- Keep request attempts, transient cooldown timestamps, and cache capability observations runtime-owned.
+- Keep request attempts, transient cooldown timestamps, cooldown ladder levels, and cache capability observations runtime-owned.
 
 ## Known Pi Limitations
 
@@ -208,7 +211,7 @@ A continuation may duplicate tool calls or other side effects when the provider 
 1. **Global integration and discovery**: register the global extension and `/failover`; observe the catalog and `ModelRegistry`; seed first-run authorization with only the current model.
 2. **Configuration and TUI**: classify config loads, preserve blocked files, serialize revision-checked atomic writes, and implement list editing, status display, settings, and restore/pause behavior.
 3. **Lifecycle and request compatibility**: observe settlement and negotiate rejected extension-injected cache fields before normal failover policy.
-4. **Failover execution**: enforce configurable retry policy, cooldowns, bounded traversal, transition notifications, and exhaustion summaries.
+4. **Failover execution**: enforce configurable retry policy, the fixed per-target cooldown ladder, bounded traversal, transition notifications, and exhaustion summaries.
 5. **Verification**: test configuration safety, authorization boundaries, request-field negotiation, session hashing, persistence, TUI behavior, each error class, and no-loop behavior.
 
 ## Acceptance Checklist
@@ -231,7 +234,7 @@ A continuation may duplicate tool calls or other side effects when the provider 
 - [x] Pi's recognized transient retries run first; native retry count/backoff remain Pi-controlled.
 - [x] The extension waits for Pi to settle before switching.
 - [x] Balance/quota/usage, `401`/`403`, and `404` errors are not retried on the same model and are marked for manual recovery.
-- [x] `429`, network, and `5xx` failures apply a 30-minute per-model cooldown after native retries.
+- [x] `429`, network, and `5xx` failures apply the fixed per-target ladder (10, 20, 40, 60, 90, 180, 360 minutes) after native retries, capped at 6 hours.
 - [x] Unknown errors and no-progress timeouts get one best-effort same-model continuation, then switch.
 - [x] The timeout defaults to 90 seconds, accepts 15-900 seconds, and supports `0` to disable.
 - [x] `Esc`, `Ctrl+C`, and tool execution failures never trigger a switch.

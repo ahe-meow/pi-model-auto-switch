@@ -1,14 +1,47 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+	COOLDOWN_LADDER_MINUTES,
 	classifyFailure,
+	cooldownMinutesForLevel,
 	createRequestState,
+	estimatedRetryDurationMs,
 	markAttempt,
+	nextCooldownLevel,
 	nextUnattemptedModel,
 	recordFailure,
 	requestSummary,
+	retryDelayMs,
 	shouldRetryCurrentModel,
 } from "../src/state.ts";
+
+test("cooldown ladder uses fixed durations and caps invalid levels", () => {
+	assert.deepEqual(COOLDOWN_LADDER_MINUTES, [10, 20, 40, 60, 90, 180, 360]);
+	assert.equal(cooldownMinutesForLevel(0), 10);
+	assert.equal(cooldownMinutesForLevel(5), 180);
+	assert.equal(cooldownMinutesForLevel(6), 360);
+	assert.equal(cooldownMinutesForLevel(99), 360);
+	assert.equal(cooldownMinutesForLevel(-1), 360);
+	assert.equal(cooldownMinutesForLevel(Number.NaN), 360);
+	assert.equal(nextCooldownLevel(0), 1);
+	assert.equal(nextCooldownLevel(5), 6);
+	assert.equal(nextCooldownLevel(6), 6);
+});
+
+test("extension retry backoff grows exponentially up to 60 seconds", () => {
+	assert.equal(retryDelayMs(0), 1000);
+	assert.equal(retryDelayMs(1), 2000);
+	assert.equal(retryDelayMs(4), 16_000);
+	assert.equal(retryDelayMs(5), 32_000);
+	assert.equal(retryDelayMs(6), 60_000);
+	assert.equal(retryDelayMs(20), 60_000);
+});
+
+test("retry duration estimate sums one backoff delay per retry", () => {
+	assert.equal(estimatedRetryDurationMs(0), 0);
+	assert.equal(estimatedRetryDurationMs(1), 1000);
+	assert.equal(estimatedRetryDurationMs(9), 243_000);
+});
 
 test("failure classification follows native-settled extension policy", () => {
 	assert.equal(classifyFailure({ status: 401 }).kind, "persistent");

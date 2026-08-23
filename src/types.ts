@@ -59,7 +59,6 @@ export interface GeneratedFailoverModel {
 	enabled: boolean;
 	chain: ModelRef[];
 	reasoningEffort: ReasoningEffort;
-	cooldownMinutes: number;
 	errorHandlingMode: ErrorHandlingMode;
 	maxRetries: number;
 	noProgressTimeoutSeconds: number;
@@ -68,9 +67,9 @@ export interface GeneratedFailoverModel {
 	manualRecovery: Record<string, string>;
 }
 
-/** Version 6 business configuration for the generated failover provider. */
+/** Version 7 business configuration for the generated failover provider. */
 export interface GeneratedFailoverConfig {
-	version: 6;
+	version: 7;
 	models: GeneratedFailoverModel[];
 }
 

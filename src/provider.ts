@@ -7,12 +7,15 @@ import type {
 import { DEFAULT_PARAMETER_TOGGLES, modelKey } from "./types.ts";
 import {
 	classifyFailure,
+	cooldownMinutesForLevel,
 	createRequestState,
 	isAutomaticFailure,
 	markAttempt,
+	nextCooldownLevel,
 	nextUnattemptedModel,
 	recordFailure,
 	requestSummary,
+	retryDelayMs,
 	shouldRetryCurrentModel,
 } from "./state.ts";
 import {
@@ -93,10 +96,20 @@ export interface Delegate {
 	): AssistantMessageEventStreamLike;
 }
 
-/** A switch from one failed chain target to the next. */
-interface FailoverTransition {
-	source?: ModelRef;
+/** The real target and effective thinking level used for one request attempt. */
+interface FailoverTargetStatus {
+	modelId: string;
 	target: ModelRef;
+	effort: ReasoningEffort;
+	/** Whether this target receives the extension's reasoning value. */
+	reasoningControlled: boolean;
+	/** Target API thinking value; undefined means the target does not support reasoning. */
+	mappedEffort?: string;
+}
+
+/** A switch from one failed chain target to the next. */
+interface FailoverTransition extends FailoverTargetStatus {
+	source?: ModelRef;
 	reason: string;
 }
 
@@ -109,10 +122,15 @@ export interface FailoverProviderState {
 	/** Whether the registry has supplied an authoritative availability snapshot. */
 	availabilityKnown: boolean;
 	cooldowns: Map<string, number>;
+	/** Next cooldown ladder rung by generated-model target key; absent means rung 0. */
+	cooldownLevels: Map<string, number>;
 	manualRecovery: Map<string, string>;
 	unsupportedCacheFields: Map<string, Set<CacheField>>;
+	/** Optional callback invoked when the router starts using a real target. */
+	onTarget?: (target: FailoverTargetStatus) => void;
 	/** Optional callback invoked when the router switches chain targets. */
 	onTransition?: (transition: FailoverTransition) => void;
+	onManualRecovery?: (key: string, reason: string) => void;
 }
 
 export interface AssistantMessageEventStreamLike {
@@ -327,6 +345,13 @@ async function executeTarget(
 	}
 }
 
+interface TargetSelection extends FailoverTargetStatus {
+	targetModel: TargetModelLike;
+	targetKey: string;
+	capabilityKey: string;
+	toggles: ModelParameterToggles;
+}
+
 interface TargetAttempt {
 	targetModel: TargetModelLike;
 	targetKey: string;
@@ -337,15 +362,11 @@ interface TargetAttempt {
 	failure: ReturnType<typeof classifyFailure>;
 }
 
-async function executeTargetAttempt(
+function resolveTargetSelection(
 	generated: GeneratedFailoverModel,
 	target: ModelRef,
-	context: RequestContext,
-	options: RequestOptions,
 	state: FailoverProviderState,
-	cacheKey: string | undefined,
-	signal: AbortSignal | undefined,
-): Promise<TargetAttempt | undefined> {
+): TargetSelection | undefined {
 	const targetModel = state.delegate.resolveModel(target);
 	if (!targetModel) return undefined;
 	const targetKey = modelKey(target);
@@ -355,7 +376,65 @@ async function executeTargetAttempt(
 		override?.modelParameters,
 	);
 	const effort = override?.reasoningEffort ?? generated.reasoningEffort;
-	const capabilityKey = `${generated.id}:${targetKey}:${targetModel.api}`;
+	return {
+		modelId: generated.id,
+		target,
+		effort,
+		mappedEffort: toggles.reasoningEffort
+			? mappedReasoning(targetModel, effort)
+			: undefined,
+		reasoningControlled: toggles.reasoningEffort,
+		targetModel,
+		targetKey,
+		capabilityKey: `${generated.id}:${targetKey}:${targetModel.api}`,
+		toggles,
+	};
+}
+
+function emitTargetTransition(
+	state: FailoverProviderState,
+	selection: TargetSelection,
+	previousTarget: ModelRef | undefined,
+	previousReason: string | undefined,
+): void {
+	if (!previousTarget || modelKey(previousTarget) === modelKey(selection.target))
+		return;
+	state.onTransition?.({
+		modelId: selection.modelId,
+		target: selection.target,
+		effort: selection.effort,
+		mappedEffort: selection.mappedEffort,
+		reasoningControlled: selection.reasoningControlled,
+		source: previousTarget,
+		reason: previousReason ?? "failure",
+	});
+}
+
+async function executeTargetAttempt(
+	generated: GeneratedFailoverModel,
+	context: RequestContext,
+	options: RequestOptions,
+	state: FailoverProviderState,
+	cacheKey: string | undefined,
+	signal: AbortSignal | undefined,
+	selection: TargetSelection | undefined,
+): Promise<TargetAttempt | undefined> {
+	if (!selection) return undefined;
+	const {
+		targetModel,
+		targetKey,
+		capabilityKey,
+		toggles,
+		effort,
+		mappedEffort,
+	} = selection;
+	state.onTarget?.({
+		modelId: selection.modelId,
+		target: selection.target,
+		effort,
+		mappedEffort,
+		reasoningControlled: selection.reasoningControlled,
+	});
 	const unsupported =
 		state.unsupportedCacheFields.get(capabilityKey) ?? EMPTY_UNSUPPORTED;
 	const timeoutMs =
@@ -374,7 +453,7 @@ async function executeTargetAttempt(
 	} = options;
 	const attemptOptions: RequestOptions = {
 		...forward,
-		reasoning: effort,
+		...(selection.reasoningControlled ? { reasoning: effort } : {}),
 		onPayload: (payload: unknown, model?: unknown) => {
 			const forwarded = outerOnPayload?.(payload, model);
 			const next = forwarded === undefined ? payload : forwarded;
@@ -383,7 +462,7 @@ async function executeTargetAttempt(
 				toggles,
 				cacheKey,
 				unsupported,
-				reasoningEffort: mappedReasoning(targetModel, effort),
+				reasoningEffort: mappedEffort,
 			});
 			return next;
 		},
@@ -429,6 +508,26 @@ async function executeTargetAttempt(
 	};
 }
 
+function waitForExtensionRetry(
+	retryIndex: number,
+	signal: AbortSignal | undefined,
+): Promise<void> {
+	if (signal?.aborted) return Promise.resolve();
+	const delayMs = retryDelayMs(retryIndex);
+	return new Promise((resolve) => {
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, delayMs);
+		const onAbort = () => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
 function applyAutomaticFailure(
 	generated: GeneratedFailoverModel,
 	state: FailoverProviderState,
@@ -461,13 +560,21 @@ function applyAutomaticFailure(
 
 	recordFailure(request, target, failure.reason);
 	const key = genKey(generated.id, target);
-	if (failure.kind === "cooldown")
-		state.cooldowns.set(key, Date.now() + generated.cooldownMinutes * 60_000);
-	if (failure.kind === "persistent")
+	if (failure.kind === "persistent") {
 		state.manualRecovery.set(key, failure.reason);
+		state.onManualRecovery?.(key, failure.reason);
+	}
 	const retry =
 		shouldRetryCurrentModel(failure.kind, generated.errorHandlingMode) &&
 		sameRetries < generated.maxRetries;
+	if (!retry && failure.kind === "cooldown") {
+		const level = state.cooldownLevels.get(key) ?? 0;
+		state.cooldowns.set(
+			key,
+			Date.now() + cooldownMinutesForLevel(level) * 60_000,
+		);
+		state.cooldownLevels.set(key, nextCooldownLevel(level));
+	}
 	return { retry, sameRetries: retry ? sameRetries + 1 : sameRetries };
 }
 
@@ -505,6 +612,7 @@ async function runFailoverLoop(
 	let sameRetries = 0;
 	let previousTarget: ModelRef | undefined;
 	let previousReason: string | undefined;
+	let selection: TargetSelection | undefined;
 	for (;;) {
 		if (signal?.aborted) {
 			const message = errorMessage("Request cancelled");
@@ -534,32 +642,28 @@ async function runFailoverLoop(
 				return;
 			}
 			markAttempt(request, current);
-			if (previousTarget && modelKey(previousTarget) !== modelKey(current)) {
-				state.onTransition?.({
-					source: previousTarget,
-					target: current,
-					reason: previousReason ?? "failure",
-				});
+			sameRetries = 0;
+			selection = resolveTargetSelection(generated, current, state);
+			if (selection) {
+				emitTargetTransition(state, selection, previousTarget, previousReason);
+				previousTarget = undefined;
+				previousReason = undefined;
 			}
-			previousTarget = undefined;
-			previousReason = undefined;
 		}
 
 		const target = current;
 		const attempt = await executeTargetAttempt(
 			generated,
-			target,
 			context,
 			options,
 			state,
 			cacheKey,
 			signal,
+			selection,
 		);
 		if (!attempt) {
 			recordFailure(request, target, "model unavailable");
 			state.manualRecovery.set(genKey(generated.id, target), "model unavailable");
-			previousTarget = target;
-			previousReason = "model unavailable";
 			current = undefined;
 			continue;
 		}
@@ -574,6 +678,11 @@ async function runFailoverLoop(
 			status,
 		} = attempt;
 		if (failure.kind === "none") {
+			const key = genKey(generated.id, target);
+			if ((requestCooldowns.get(targetKey) ?? 0) > 0) {
+				state.cooldowns.delete(key);
+				state.cooldownLevels.delete(key);
+			}
 			const withDiagnostics: AssistantMessageLike = {
 				...result,
 				diagnostics: [
@@ -612,8 +721,13 @@ async function runFailoverLoop(
 			failure,
 			sameRetries,
 		);
+		const previousSameRetries = sameRetries;
 		sameRetries = outcome.sameRetries;
-		if (outcome.retry) continue;
+		if (outcome.retry) {
+			if (sameRetries > previousSameRetries)
+				await waitForExtensionRetry(sameRetries - 1, signal);
+			continue;
+		}
 		previousTarget = target;
 		previousReason = failure.reason;
 		current = undefined;
