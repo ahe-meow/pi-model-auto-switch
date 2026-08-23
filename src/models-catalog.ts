@@ -145,7 +145,17 @@ export function buildFailoverCatalogModels(
 		.map((model) => buildFailoverCatalogModel(model, metadata));
 }
 
-export async function loadModelsJson(
+const MODELS_JSON_RETRY_WAIT_MS = 75;
+
+type AfterMalformed = () => void | Promise<void>;
+
+async function defaultAfterMalformed(): Promise<void> {
+	await new Promise<void>((resolve) =>
+		setTimeout(resolve, MODELS_JSON_RETRY_WAIT_MS),
+	);
+}
+
+async function loadModelsJsonOnce(
 	path: string,
 ): Promise<ModelsJsonLoadResult> {
 	const source = await readJsonSource(path, "models.json");
@@ -168,6 +178,21 @@ export async function loadModelsJson(
 		document: value as ModelsJsonDocument,
 		revision: source.revision,
 	};
+}
+
+export async function loadModelsJson(
+	path: string,
+	afterMalformed: AfterMalformed = defaultAfterMalformed,
+): Promise<ModelsJsonLoadResult> {
+	const first = await loadModelsJsonOnce(path);
+	if (first.kind !== "blocked" || first.reason !== "malformed") return first;
+	try {
+		await afterMalformed();
+	} catch {
+		return first;
+	}
+	const retry = await loadModelsJsonOnce(path);
+	return retry.kind === "loaded" ? retry : first;
 }
 
 function managedProvider(

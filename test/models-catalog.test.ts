@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -19,6 +19,196 @@ function model(id: string, enabled = true) {
 		enabled,
 	};
 }
+
+async function withModelsJson(
+	run: (path: string) => Promise<void>,
+): Promise<void> {
+	const directory = await mkdtemp(join(tmpdir(), "pi-model-catalog-"));
+	try {
+		await run(join(directory, "models.json"));
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+}
+
+async function replaceAtomically(path: string, bytes: string): Promise<void> {
+	const replacementPath = `${path}.replacement`;
+	await writeFile(replacementPath, bytes, "utf8");
+	await rename(replacementPath, path);
+}
+
+test("malformed models.json recovers from one atomic valid replacement", async () => {
+	await withModelsJson(async (path) => {
+		await writeFile(path, '{"providers":', "utf8");
+		const replacement = { marker: "replacement", providers: {} };
+		let hookCalls = 0;
+
+		const loaded = await loadModelsJson(path, async () => {
+			hookCalls += 1;
+			await replaceAtomically(path, `${JSON.stringify(replacement)}\n`);
+		});
+
+		assert.equal(hookCalls, 1);
+		assert.equal(loaded.kind, "loaded");
+		if (loaded.kind !== "loaded") return;
+		assert.deepEqual(loaded.document, replacement);
+
+		let unexpectedHookCalls = 0;
+		const reread = await loadModelsJson(path, async () => {
+			unexpectedHookCalls += 1;
+		});
+		assert.equal(unexpectedHookCalls, 0);
+		assert.equal(reread.kind, "loaded");
+		if (reread.kind !== "loaded") return;
+		assert.deepEqual(loaded.revision, reread.revision);
+	});
+});
+
+test("persistent malformed models.json returns the original block without writing", async () => {
+	await withModelsJson(async (path) => {
+		const original = '{"providers":';
+		await writeFile(path, original, "utf8");
+		let hookCalls = 0;
+
+		const loaded = await loadModelsJson(path, async () => {
+			hookCalls += 1;
+		});
+
+		assert.equal(hookCalls, 1);
+		assert.deepEqual(loaded, {
+			kind: "blocked",
+			reason: "malformed",
+			detail: "models.json is not valid JSON",
+		});
+		assert.equal(await readFile(path, "utf8"), original);
+	});
+});
+
+test("persistent zero-byte models.json stays malformed and is never treated as missing", async () => {
+	await withModelsJson(async (path) => {
+		await writeFile(path, "", "utf8");
+		let hookCalls = 0;
+
+		const loaded = await loadModelsJson(path, async () => {
+			hookCalls += 1;
+		});
+
+		assert.equal(hookCalls, 1);
+		assert.deepEqual(loaded, {
+			kind: "blocked",
+			reason: "malformed",
+			detail: "models.json is not valid JSON",
+		});
+		assert.equal((await readFile(path)).length, 0);
+	});
+});
+
+test("a changed but still malformed snapshot returns the original block", async () => {
+	await withModelsJson(async (path) => {
+		await writeFile(path, "{", "utf8");
+		const replacement = "[";
+		let hookCalls = 0;
+
+		const loaded = await loadModelsJson(path, async () => {
+			hookCalls += 1;
+			await replaceAtomically(path, replacement);
+		});
+
+		assert.equal(hookCalls, 1);
+		assert.deepEqual(loaded, {
+			kind: "blocked",
+			reason: "malformed",
+			detail: "models.json is not valid JSON",
+		});
+		assert.equal(await readFile(path, "utf8"), replacement);
+	});
+});
+
+test("a malformed snapshot followed by a missing file returns the original block", async () => {
+	await withModelsJson(async (path) => {
+		await writeFile(path, "{", "utf8");
+		let hookCalls = 0;
+
+		const loaded = await loadModelsJson(path, async () => {
+			hookCalls += 1;
+			await rename(path, `${path}.moved`);
+		});
+
+		assert.equal(hookCalls, 1);
+		assert.deepEqual(loaded, {
+			kind: "blocked",
+			reason: "malformed",
+			detail: "models.json is not valid JSON",
+		});
+		await assert.rejects(readFile(path), { code: "ENOENT" });
+	});
+});
+
+test("a malformed snapshot followed by schema-invalid JSON returns the original block", async () => {
+	await withModelsJson(async (path) => {
+		await writeFile(path, "{", "utf8");
+		const replacement = '{"providers":[]}\n';
+		let hookCalls = 0;
+
+		const loaded = await loadModelsJson(path, async () => {
+			hookCalls += 1;
+			await replaceAtomically(path, replacement);
+		});
+
+		assert.equal(hookCalls, 1);
+		assert.deepEqual(loaded, {
+			kind: "blocked",
+			reason: "malformed",
+			detail: "models.json is not valid JSON",
+		});
+		assert.equal(await readFile(path, "utf8"), replacement);
+	});
+});
+
+test("valid, missing, and schema-invalid initial states do not invoke the hook", async () => {
+	let hookCalls = 0;
+	const hook = async () => {
+		hookCalls += 1;
+	};
+
+	await withModelsJson(async (path) => {
+		await writeFile(path, '{"providers":{}}\n', "utf8");
+		assert.equal((await loadModelsJson(path, hook)).kind, "loaded");
+	});
+	await withModelsJson(async (path) => {
+		assert.equal((await loadModelsJson(path, hook)).kind, "missing");
+	});
+	await withModelsJson(async (path) => {
+		await writeFile(path, '{"providers":[]}\n', "utf8");
+		assert.deepEqual(await loadModelsJson(path, hook), {
+			kind: "blocked",
+			reason: "invalid",
+			detail: "models.json.providers must contain an object",
+		});
+	});
+	assert.equal(hookCalls, 0);
+});
+
+test("a failing malformed hook is called once and preserves the original block", async () => {
+	await withModelsJson(async (path) => {
+		const original = "{";
+		await writeFile(path, original, "utf8");
+		let hookCalls = 0;
+
+		const loaded = await loadModelsJson(path, async () => {
+			hookCalls += 1;
+			throw new Error("injected hook failure");
+		});
+
+		assert.equal(hookCalls, 1);
+		assert.deepEqual(loaded, {
+			kind: "blocked",
+			reason: "malformed",
+			detail: "models.json is not valid JSON",
+		});
+		assert.equal(await readFile(path, "utf8"), original);
+	});
+});
 
 test("catalog metadata uses the safe minimum across a chain", () => {
 	const first = model("primary");
