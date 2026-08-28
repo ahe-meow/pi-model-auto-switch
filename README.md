@@ -43,13 +43,15 @@ This path is fixed for the user, even when `PI_CODING_AGENT_DIR` points elsewher
 - global records keyed by exact real `provider/model`, holding `enabled`, consecutive failures, `nextEligibleAt`, cooldown state, cumulative cooldown, and manual recovery; legacy persisted runtime `lease` fields are read only as compatibility input and are removed on the next write; they do not represent current coordination;
 - chain scopes keyed by the encoded absolute agent directory plus generated model id (implemented as `encodeURIComponent(agent directory):model id`), holding chain policy and per-target overrides. Scope settings are initialized from the first real target, every override field defaults to `inherit`, and effective request settings merge scope policy with the selected target override.
 
-Failover creates its own `ModelRuntime` for every Pi session, including child and subagent sessions. It reads the shared `models.json` and authentication state directly, so child-session lifecycle hooks and version-specific `pi-subagents` patches are not required. `session_start` is used only for UI, history, and Footer/status setup.
+Failover creates its own `ModelRuntime` for every Pi session, including child and subagent sessions. It reads the shared `models.json` and authentication state directly, so child-session lifecycle hooks and version-specific `pi-subagents` patches are not required. On `session_start`, it reloads and applies the authoritative v8 chain configuration, then restores session history and installs Footer/status context. Runtime failover itself remains usable before `session_start`; an already-open editor is not live-watched, so close and reopen it or trigger `session_start` to observe an external config revision.
 
 Authentication remains owned by Pi. The extension reads `models.json` through its owned `ModelRuntime`; it never edits `models.json` directly and never stores API keys or tokens. Outer virtual request credentials and header transforms are not forwarded to real targets; each target runtime supplies its own authentication and native headers.
 
 ## `/failover`
 
-Open `/failover` in the interactive TUI. It refreshes model discovery on every open and shows:
+Open `/failover` in the interactive TUI. Every non-history open reloads and applies the authoritative v8 chain configuration and refreshes model discovery before showing:
+
+`/failover history` remains read-only and bypasses chain-config refresh.
 
 - current model and automation mode;
 - the ordered failover list;
@@ -98,7 +100,7 @@ Transitions are exposed through the Footer and `/failover history`, which record
 
 ## Development and testing
 
-Final verification passed the full custom-loader suite: 197/197 tests. `git diff --check` passed. Primary LSP diagnostics reported 0 findings across the 7 core files. `tsc --noEmit` was unavailable because this checkout has no local `tsc` or `node_modules/.bin/tsc`; no dependencies were installed. An isolated live `failover/orc-peon` smoke also passed through real Pi/provider authentication: exit code 0, exact marker `REAL_FAILOVER_SMOKE_OK`, empty stderr, and no 401, 403, or model-unavailable result. The smoke did not force a first-target failure or verify an automatic target switch.
+Final verification passed the full custom-loader suite: 202/202 tests. `git diff --check` passed. Primary LSP diagnostics reported 0 findings across the 7 core files. `node ./node_modules/typescript/lib/tsc.js --noEmit --pretty false` passed. An isolated live `failover/orc-peon` smoke also passed through real Pi/provider authentication: exit code 0, exact marker `REAL_FAILOVER_SMOKE_OK`, empty stderr, and no 401, 403, or model-unavailable result. The smoke did not force a first-target failure or verify an automatic target switch.
 
 With the local TypeScript dependency present, the standard commands are:
 

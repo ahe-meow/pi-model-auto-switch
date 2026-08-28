@@ -406,6 +406,25 @@ function queueWarning(runtime: RuntimeState, warning: string): void {
 	if (!runtime.warnings.includes(warning)) runtime.warnings.push(warning);
 }
 
+const STALE_CONFIG_WARNING_PREFIXES = [
+	"Failover target registration was rejected;",
+	"Failover target registration failed;",
+	"The migrated v8 chain is blocked because shared target registration could not be verified.",
+	"Legacy failover migration is blocked;",
+	"Failover configuration is missing;",
+	"The initial v8 chain file could not be created because the path changed concurrently.",
+	"The initial v8 chain file could not be written;",
+] as const;
+
+function clearStaleConfigWarnings(runtime: RuntimeState): void {
+	runtime.warnings = runtime.warnings.filter(
+		(warning) =>
+			!STALE_CONFIG_WARNING_PREFIXES.some((prefix) =>
+				warning.startsWith(prefix),
+			),
+	);
+}
+
 function coordinationWarning(
 	status: SharedCoordinationStatus,
 ): string | undefined {
@@ -449,6 +468,7 @@ function applyConfig(
 		copy,
 		runtime.targetRuntime,
 	);
+	clearStaleConfigWarnings(runtime);
 }
 
 async function refreshOwnedTargetRuntime(
@@ -625,6 +645,51 @@ async function applyLegacyConfig(
 	}
 }
 
+async function applyLoadedV8Config(
+	runtime: RuntimeState,
+	loaded: Extract<GeneratedConfigV8LoadResult, { kind: "loaded-v8" }>,
+): Promise<boolean> {
+	if (await reconcileApplyAndRefresh(runtime, loaded.config, loaded.revision))
+		return true;
+	blockChain(runtime, "target registration could not be verified", {
+		config: loaded.config,
+		revision: loaded.revision,
+	});
+	queueWarning(
+		runtime,
+		"Failover target registration failed; the loaded chain was not applied and editing is disabled until shared state is repaired.",
+	);
+	return false;
+}
+
+async function refreshSessionConfig(runtime: RuntimeState): Promise<boolean> {
+	const loaded = await loadGeneratedConfigV8(FAILOVER_CONFIG_PATH);
+	if (loaded.kind === "loaded-v8") return applyLoadedV8Config(runtime, loaded);
+
+	const preserved = {
+		config: runtime.config,
+		revision: runtime.chainRevision,
+	};
+	if (loaded.kind === "legacy") {
+		blockChain(runtime, "legacy configuration requires migration", preserved);
+		queueWarning(
+			runtime,
+			"Legacy failover migration is blocked; model-failover.json was preserved and provider routing and editing remain disabled. Repair shared failover state or resolve file write conflicts, then restart.",
+		);
+		return false;
+	}
+	if (loaded.kind === "missing") {
+		blockChain(runtime, "the configuration file is unavailable", preserved);
+		queueWarning(
+			runtime,
+			"Failover configuration is missing; routing and editing remain disabled until the v8 chain file is restored.",
+		);
+		return false;
+	}
+	blockChain(runtime, blockedConfigDescription(loaded.reason), preserved);
+	return false;
+}
+
 async function loadAndApplyInitialConfig(runtime: RuntimeState): Promise<void> {
 	let loaded = await loadGeneratedConfigV8(FAILOVER_CONFIG_PATH);
 	if (loaded.kind === "missing") {
@@ -660,18 +725,7 @@ async function loadAndApplyInitialConfig(runtime: RuntimeState): Promise<void> {
 	}
 
 	if (loaded.kind === "loaded-v8") {
-		if (
-			!(await reconcileApplyAndRefresh(runtime, loaded.config, loaded.revision))
-		) {
-			blockChain(runtime, "target registration could not be verified", {
-				config: loaded.config,
-				revision: loaded.revision,
-			});
-			queueWarning(
-				runtime,
-				"Failover target registration failed; the loaded chain was not applied and editing is disabled until shared state is repaired.",
-			);
-		}
+		await applyLoadedV8Config(runtime, loaded);
 		return;
 	}
 	if (loaded.kind === "legacy") {
@@ -1340,6 +1394,7 @@ function registerFailoverCommand(
 				});
 				return;
 			}
+			await refreshSessionConfig(runtime);
 			await refreshSharedSnapshot(runtime);
 			notifyPendingWarnings(ctx, runtime);
 			notifyCurrentState(ctx, runtime);
@@ -1457,6 +1512,7 @@ export async function registerFailoverExtension(
 		runtime.currentTarget = undefined;
 		runtime.sessionContext = ctx;
 		runtime.sessionPersistable = Boolean(ctx.sessionManager.getSessionFile());
+		await refreshSessionConfig(runtime);
 		await refreshSharedSnapshot(runtime);
 		notifyPendingWarnings(ctx, runtime);
 		notifyCurrentState(ctx, runtime);

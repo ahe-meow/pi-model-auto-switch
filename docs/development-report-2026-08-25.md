@@ -6,7 +6,7 @@
 
 ## 1. 结论
 
-本轮实现已完成并通过最终完整的自定义 TypeScript loader 测试套件：`197/197`。`git diff --check` 通过；primary LSP diagnostics 在 7 个核心文件中报告 0 findings。`tsc --noEmit` 在当前 checkout 不可用：没有本地 `tsc` 或 `node_modules/.bin/tsc`，且未安装依赖。本次 isolated `failover/orc-peon` live smoke 也通过了真实 Pi/provider authentication：exit code 为 0，stdout 包含精确 marker `REAL_FAILOVER_SMOKE_OK`，stderr 为空，且没有出现 401、403 或 model unavailable。该 smoke 没有强制 first target 失败，也没有验证自动 target switch。v8 的核心边界已经稳定：生成配置只保存链身份、顺序和启用状态；固定共享状态保存精确真实目标的运行协调信息，以及按生成链隔离的策略 scope 和 target override。
+本轮实现已完成并通过最终完整的自定义 TypeScript loader 测试套件：`202/202`。`git diff --check` 通过；primary LSP diagnostics 在 7 个核心文件中报告 0 findings。`node ./node_modules/typescript/lib/tsc.js --noEmit --pretty false` 通过。本次 isolated `failover/orc-peon` live smoke 也通过了真实 Pi/provider authentication：exit code 为 0，stdout 包含精确 marker `REAL_FAILOVER_SMOKE_OK`，stderr 为空，且没有出现 401、403 或 model unavailable。该 smoke 没有强制 first target 失败，也没有验证自动 target switch。v8 的核心边界已经稳定：生成配置只保存链身份、顺序和启用状态；固定共享状态保存精确真实目标的运行协调信息，以及按生成链隔离的策略 scope 和 target override。
 
 首轮启动写入的是空 v8 配置。系统不会自动把当前模型写入授权链，用户必须先创建生成链，再显式添加真实目标。配置、迁移、共享状态或协调写入无法验证时，系统采取 fail-closed 行为：保留原始字节，阻止路由和写操作，不使用未经持久化确认的本地降级状态继续运行。
 
@@ -125,7 +125,7 @@ TUI 通过可选的 shared-state 方法更新 scope 和 target override。直接
 
 transition callback 需要在 provider 注册之前就稳定存在，因为子会话可能在没有 `session_start` 的情况下发起请求。另一方面，history 不能因为 extension reload 或 session resume 而丢失，也不能把未经验证的 custom entry 直接显示到终端。
 
-修复后，稳定 callback 在 provider registration 前安装。每个扩展实例有自己的 `ModelRuntime`。`session_start` 只负责恢复当前 session 的 namespaced custom history、设置 Footer/UI context 和决定是否允许 append；它不是 provider routing 的前置条件。
+修复后，稳定 callback 在 provider registration 前安装。每个扩展实例有自己的 `ModelRuntime`。`session_start` 会先 reload 并 apply 权威 v8 chain configuration，再恢复当前 session 的 namespaced custom history、设置 Footer/UI context 和决定是否允许 append；它不是 provider routing 的前置条件。配置 malformed、missing、future-version 或 registration degraded 时，provider routing 和编辑器 fail closed；恢复有效配置后才重新应用链和 revision。`/failover` 非 history 打开也会刷新权威配置；已经打开的 editor 不 live-watch 外部 revision，需要关闭重开，或触发 session refresh。
 
 history 只接受固定 custom type、有限长度的模型引用/理由、合法时间戳、合法 reasoning 枚举，并拒绝 C0/C1 控制字符和 malformed data。重复条目去重，最多保留最新 100 条。持久 session 会 append custom entry，因此 reload 和 resume 可以恢复当前 session 历史；ephemeral session 只在内存中保留，不写 session 文件。
 
@@ -139,7 +139,7 @@ history 只接受固定 custom type、有限长度的模型引用/理由、合�
 
 每个 Pi extension instance 创建一个自有 target `ModelRuntime`，读取 `models.json` 和认证状态，且关闭网络 refresh。父会话、子会话/子代理和同用户独立进程不依赖子代理生命周期 patch；它们通过固定共享状态文件协调真实目标。
 
-provider 在 extension 初始化期间完成 delegate、回调、config、metadata 和 shared adapter 设置后注册。这样，provider 在 session lifecycle hook 之前也可以处理请求。`session_start` 不是路由依赖，只是 session UI/history 生命周期钩子。
+provider 在 extension 初始化期间完成 delegate、回调、config、metadata 和 shared adapter 设置后注册。这样，provider 在 session lifecycle hook 之前也可以处理请求。`session_start` 不是路由依赖，但除 session UI/history 生命周期外，也会 reload/apply 权威 v8 chain configuration；非 history `/failover` 打开执行同样的配置刷新。
 
 ### 4.2 配置层
 
@@ -290,9 +290,9 @@ git diff --check -- README.md DESIGN.md docs/development-report-2026-08-25.md
 
 观察结果：
 
-- 最终完整 custom-loader suite：`197/197` 通过；
+- 最终完整 custom-loader suite：`202/202` 通过；
 - primary LSP diagnostics：7 个核心文件 0 findings；
-- TypeScript：`tsc --noEmit` 未运行，因当前 checkout 没有本地 `tsc` 或 `node_modules/.bin/tsc`，且未安装依赖；
+- TypeScript：`node ./node_modules/typescript/lib/tsc.js --noEmit --pretty false` 通过；
 - `git diff --check`：通过；
 - Markdown fence/trailing-whitespace 检查：通过；
 - 过时机制 grep：确认目标文档不再把目标使用描述为独占、可释放或可续期；同时确认保留 filesystem lock 与 `releaseOwnedLock` 语义。

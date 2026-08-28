@@ -71,9 +71,9 @@ Local request progress, UI state, and compatibility memory remain process-local.
 
 ### Catalog inputs and ordering
 
-Each Pi session gets its own extension-owned `ModelRuntime`, and runtime behavior does not depend on `session_start`. Stable provider callbacks capture transitions before provider registration without attempting session persistence. On `session_start`, the extension replaces in-memory history with validated custom entries from the selected session, then enables custom-entry persistence only when that session has a file and installs the current UI/Footer context. The runtime reads `models.json` and authentication state but never writes `models.json`.
+Each Pi session gets its own extension-owned `ModelRuntime`, and runtime behavior does not depend on `session_start`. Stable provider callbacks capture transitions before provider registration without attempting session persistence. On `session_start`, the extension reloads and applies the authoritative v8 chain configuration, replaces in-memory history with validated custom entries from the selected session, then enables custom-entry persistence only when that session has a file and installs the current UI/Footer context. A malformed, missing, future-version, or registration-degraded reload clears provider routing and leaves the editor blocked until recovery. The runtime reads `models.json` and authentication state but never writes `models.json`.
 
-At `/failover` open, the extension refreshes its owned `ModelRuntime` and observes its model snapshot. `getAvailableSnapshot()` supplies authenticated candidates for Add; refresh and snapshot failures are reported separately from a successful empty result.
+At non-history `/failover` open, the extension reloads and applies the authoritative v8 chain configuration before refreshing its owned `ModelRuntime` and observing its model snapshot. `/failover history` is read-only and does not reload configuration. `getAvailableSnapshot()` supplies authenticated candidates for Add; refresh and snapshot failures are reported separately from a successful empty result. An already-open editor is not live-watched; close and reopen it, or trigger `session_start`, after an external config revision.
 
 First setup leaves the authorized list empty. The user creates a generated model and explicitly adds authenticated real targets. After that, the persisted list and its order are authoritative: discovery cannot add, remove, reorder, or rewrite authorization. Newly authenticated models remain available to add explicitly. The extension applies no image/context/capability inference.
 
@@ -156,7 +156,7 @@ A persistent classification describes the failed exact target and its required m
 
 ## TUI Behavior
 
-`/failover` opens the global failover configuration and status view. Opening it refreshes catalog data. Runtime failover does not depend on `session_start`; that hook restores the selected session's bounded transition history, activates its UI/Footer context, and enables custom-entry persistence for persisted sessions.
+`/failover` opens the global failover configuration and status view. Every non-history open reloads and applies the authoritative v8 chain configuration, then refreshes catalog data. `/failover history` is read-only and bypasses configuration refresh. Runtime failover does not depend on `session_start`; that hook performs the same authoritative v8 config refresh before restoring the selected session's bounded transition history, activating its UI/Footer context, and enabling custom-entry persistence for persisted sessions. An already-open editor is not live-watched and must be closed/reopened or followed by a session refresh after an external config change.
 
 The TUI shows:
 
@@ -228,8 +228,8 @@ Transition history is bounded to 100 entries for the selected session. Persisted
 - [x] Global target enablement, cooldown, failures, `nextEligibleAt`, cumulative cooldown, and manual recovery remain outside chain-scope policy; legacy `lease` input is stripped on write.
 - [x] Historical error tool results remain request context and do not synthesize a provider failure; Pi tool execution stays outside provider classification.
 - [x] Credential material is redacted, provider text is bounded, C0/C1 controls are removed, and unsafe history entries are rejected.
-- [x] Final full custom-loader verification passed 197/197; `git diff --check` passed; primary LSP diagnostics reported 0 findings across the 7 core files.
-- [x] `tsc --noEmit` was unavailable because this checkout has no local `tsc` or `node_modules/.bin/tsc`; no dependencies were installed. An isolated live `failover/orc-peon` smoke passed through real Pi/provider authentication with exit code 0, exact marker `REAL_FAILOVER_SMOKE_OK`, empty stderr, and no 401, 403, or model-unavailable result; it did not force a first-target failure or verify an automatic switch.
+- [x] Final full custom-loader verification passed 202/202; `git diff --check` passed; primary LSP diagnostics reported 0 findings across the 7 core files.
+- [x] `node ./node_modules/typescript/lib/tsc.js --noEmit --pretty false` passed. An isolated live `failover/orc-peon` smoke passed through real Pi/provider authentication with exit code 0, exact marker `REAL_FAILOVER_SMOKE_OK`, empty stderr, and no 401, 403, or model-unavailable result; it did not force a first-target failure or verify an automatic switch.
 
 Verification commands:
 

@@ -290,6 +290,36 @@ async function startSession(
 	return ctx;
 }
 
+interface TestEditor {
+	handleInput(data: string): void;
+	render(width: number): string[];
+	whenIdle(): Promise<void>;
+}
+
+async function openEditor(
+	harness: Harness,
+	notifications: string[] = [],
+	onClose: () => void = () => undefined,
+): Promise<TestEditor> {
+	let editor: TestEditor | undefined;
+	await harness.commands[0]!.handler(
+		"",
+		createContext({
+			notifications,
+			custom: async (create) => {
+				editor = create(
+					{ requestRender: () => undefined },
+					{ fg: (_color: string, text: string) => text },
+					{},
+					onClose,
+				) as TestEditor;
+			},
+		}),
+	);
+	if (!editor) throw new Error("failover editor was not created");
+	return editor;
+}
+
 async function renderHistory(
 	harness: Harness,
 ): Promise<{ rendered: string; closed: boolean }> {
@@ -502,6 +532,58 @@ function degradedRegistrationSharedState(
 		settle: (input) => base.settle(input),
 		updateSettings: (target, patch) => base.updateSettings(target, patch),
 		resetTargets: (targets) => base.resetTargets(targets),
+	};
+}
+
+function switchableRegistrationFailure(base: SharedStateAdapter): {
+	adapter: SharedStateAdapter;
+	failNext: () => void;
+	recover: () => void;
+} {
+	let failNext = false;
+	let degraded = false;
+	const degradedStatus = {
+		coordination: "degraded" as const,
+		reason: "write-failed" as const,
+		detail: "injected registration failure",
+	};
+	return {
+		adapter: {
+			status: () => (degraded ? degradedStatus : base.status()),
+			snapshot: async () => {
+				const snapshot = await base.snapshot();
+				return degraded ? { ...snapshot, status: degradedStatus } : snapshot;
+			},
+			reconcileRegistration: async (input) => {
+				if (failNext) {
+					failNext = false;
+					degraded = true;
+					return {
+						kind: "reconciled" as const,
+						registrationKey: resolve(agentDir),
+						targets: input.targets.map((target) =>
+							typeof target === "string"
+								? target
+								: `${target.provider}/${target.id}`,
+						),
+						...degradedStatus,
+					};
+				}
+				return base.reconcileRegistration(input);
+			},
+			claim: (input) => base.claim(input),
+			settle: (input) => base.settle(input),
+			updateSettings: (target, patch) => base.updateSettings(target, patch),
+			resetTargets: (targets) => base.resetTargets(targets),
+		},
+		failNext: () => {
+			failNext = true;
+			degraded = false;
+		},
+		recover: () => {
+			failNext = false;
+			degraded = false;
+		},
 	};
 }
 
@@ -911,6 +993,276 @@ test("TUI CRUD persists the v8 chain and reconciles shared registration", async 
 		["openai/gpt-4o"],
 	);
 	assert.equal(await readFile(modelsPath, "utf8"), modelsBytes);
+});
+
+test("second session refreshes the chain after another session adds a target", async () => {
+	await writeV8([chainModel("primary", [targetA], { name: "Primary" })]);
+	const first = await createHarness({
+		targetRuntime: makeTargetRuntime([modelA, modelB]),
+		sharedState: createFileSharedState({ path: sharedPath }),
+	});
+	const second = await createHarness({
+		targetRuntime: makeTargetRuntime([modelA, modelB]),
+		sharedState: createFileSharedState({ path: sharedPath }),
+	});
+
+	// Session B starts before A changes the authoritative chain file.
+	await startSession(second);
+	await driveEditor(first, ["\r", "a", "\r"]);
+	const afterFirst = JSON.parse(await readFile(configPath, "utf8")) as {
+		models: Array<{ chain: ModelRef[] }>;
+	};
+	assert.deepEqual(afterFirst.models[0]!.chain, [targetA, targetB]);
+
+	const notifications: string[] = [];
+	let editor:
+		| {
+				handleInput(data: string): void;
+				render(width: number): string[];
+				whenIdle(): Promise<void>;
+		  }
+		| undefined;
+	await second.commands[0]!.handler(
+		"",
+		createContext({
+			notifications,
+			custom: async (create) => {
+				editor = create(
+					{ requestRender: () => undefined },
+					{ fg: (_color: string, text: string) => text },
+					{},
+					() => undefined,
+				) as {
+					handleInput(data: string): void;
+					render(width: number): string[];
+					whenIdle(): Promise<void>;
+				};
+			},
+		}),
+	);
+	if (!editor) throw new Error("failover editor was not created");
+
+	// /failover must show the chain written by A without rebuilding B or /reload.
+	editor.handleInput("\r");
+	assert.match(editor.render(120).join("\n"), /openai\/gpt-4o/);
+
+	// B can save another change using the revision it just refreshed.
+	editor.handleInput("\x1b");
+	editor.handleInput("r");
+	editor.handleInput("!");
+	editor.handleInput("\r");
+	await editor.whenIdle();
+	assert.equal(
+		notifications.some((message) =>
+			/Failover chain changed on disk; reload and review before editing again\./.test(
+				message,
+			),
+		),
+		false,
+	);
+	const afterSecond = JSON.parse(await readFile(configPath, "utf8")) as {
+		models: Array<{ name: string; chain: ModelRef[] }>;
+	};
+	assert.equal(afterSecond.models[0]!.name, "Primary!");
+	assert.deepEqual(afterSecond.models[0]!.chain, [targetA, targetB]);
+});
+
+test("session_start refreshes the chain without a reload", async () => {
+	await writeV8([chainModel("primary", [targetA], { name: "Primary" })]);
+	const refreshedModelB = { ...modelB, contextWindow: 64_000, maxTokens: 8_192 };
+	const first = await createHarness({
+		targetRuntime: makeTargetRuntime([modelA, refreshedModelB]),
+		sharedState: createFileSharedState({ path: sharedPath }),
+	});
+	const second = await createHarness({
+		targetRuntime: makeTargetRuntime([modelA, refreshedModelB]),
+		sharedState: createFileSharedState({ path: sharedPath }),
+	});
+	const notifications: string[] = [];
+
+	await startSession(second, notifications);
+	await driveEditor(first, ["\r", "a", "\r"]);
+	await startSession(second, notifications);
+
+	const models = failoverProvider(second).getModels() as Array<{
+		id: string;
+		contextWindow: number;
+	}>;
+	assert.deepEqual(models.map((model) => model.id), ["primary"]);
+	assert.equal(models[0]!.contextWindow, 64_000);
+	assert.equal(
+		notifications.some(
+			(message) =>
+				message ===
+				"Failover chain changed on disk; reload and review before editing again.",
+		),
+		false,
+	);
+
+	const editor = await openEditor(second, notifications);
+
+	editor.handleInput("\r");
+	assert.match(editor.render(120).join("\n"), /openai\/gpt-4o/);
+});
+
+test("malformed config blocks routing and recovers on session_start", async () => {
+	await writeV8([chainModel("primary", [targetA], { name: "Primary" })]);
+	const harness = await createHarness({
+		targetRuntime: makeTargetRuntime([modelA, modelB]),
+	});
+	await writeFile(configPath, "{malformed", "utf8");
+
+	const notifications: string[] = [];
+	await startSession(harness, notifications);
+	assert.deepEqual(failoverProvider(harness).getModels(), []);
+	const blocked = await failoverProvider(harness)
+		.stream({ id: "primary" }, {}, {})
+		.result();
+	assert.equal(blocked.stopReason, "error");
+	assert.match(String(blocked.errorMessage), /Unknown failover model: primary/);
+
+	let customCalls = 0;
+	await harness.commands[0]!.handler(
+		"",
+		createContext({
+			notifications,
+			custom: async () => {
+				customCalls += 1;
+			},
+		}),
+	);
+	assert.equal(customCalls, 0);
+	assert.ok(
+		notifications.includes(
+			"Failover config unavailable: the configuration file is malformed",
+		),
+	);
+	assert.equal(notifications.some((message) => message.includes(configPath)), false);
+
+	await writeV8([
+		chainModel("recovered", [targetB], { name: "Recovered" }),
+	]);
+	notifications.length = 0;
+	await startSession(harness, notifications);
+	const recovered = failoverProvider(harness).getModels();
+	assert.deepEqual(
+		recovered.map((model) => model.id),
+		["recovered"],
+	);
+	assert.equal(
+		notifications.some((message) => /config unavailable/i.test(message)),
+		false,
+	);
+
+	let editor:
+		| {
+				handleInput(data: string): void;
+				render(width: number): string[];
+			}
+		| undefined;
+	await harness.commands[0]!.handler(
+		"",
+		createContext({
+			notifications,
+			custom: async (create) => {
+				editor = create(
+					{ requestRender: () => undefined },
+					{ fg: (_color: string, text: string) => text },
+					{},
+					() => undefined,
+				) as {
+					handleInput(data: string): void;
+					render(width: number): string[];
+				};
+			},
+		}),
+	);
+	if (!editor) throw new Error("failover editor was not created after recovery");
+	editor.handleInput("\r");
+	assert.match(editor.render(120).join("\n"), /openai\/gpt-4o/);
+});
+
+test("CAS conflict requires closing and reopening the editor", async () => {
+	await writeV8([chainModel("primary", [targetA], { name: "Primary" })]);
+	const harness = await createHarness({
+		targetRuntime: makeTargetRuntime([modelA, modelB]),
+	});
+	const notifications: string[] = [];
+	let closed = false;
+	const editor = await openEditor(harness, notifications, () => {
+		closed = true;
+	});
+
+	editor.handleInput("\r");
+	assert.match(editor.render(120).join("\n"), /openai\/gpt-5/);
+
+	await writeV8([chainModel("primary", [targetB], { name: "External" })]);
+	editor.handleInput("\x1b");
+	editor.handleInput("r");
+	editor.handleInput("!");
+	editor.handleInput("\r");
+	await editor.whenIdle();
+	const staleWarning =
+		"Failover chain changed on disk; reload and review before editing again.";
+	assert.equal(notifications.filter((message) => message === staleWarning).length, 1);
+
+	editor.handleInput("q");
+	assert.equal(closed, true);
+
+	const reopened = await openEditor(harness, notifications);
+
+	reopened.handleInput("\r");
+	assert.match(reopened.render(120).join("\n"), /openai\/gpt-4o/);
+	reopened.handleInput("\x1b");
+	reopened.handleInput("r");
+	reopened.handleInput("!");
+	reopened.handleInput("\r");
+	await reopened.whenIdle();
+	assert.equal(notifications.filter((message) => message === staleWarning).length, 1);
+	const saved = JSON.parse(await readFile(configPath, "utf8")) as {
+		models: Array<{ name: string; chain: ModelRef[] }>;
+	};
+	assert.equal(saved.models[0]!.name, "External!");
+	assert.deepEqual(saved.models[0]!.chain, [targetB]);
+});
+
+test("recovered /failover does not leak a stale registration warning", async () => {
+	await writeV8([chainModel("primary", [targetA], { name: "Primary" })]);
+	const registration = switchableRegistrationFailure(
+		createFileSharedState({ path: sharedPath }),
+	);
+	const harness = await createHarness({
+		targetRuntime: makeTargetRuntime([modelA]),
+		sharedState: registration.adapter,
+	});
+	assert.deepEqual(harness.sharedState.status(), { coordination: "shared" });
+
+	const saveNotifications: string[] = [];
+	const editor = await openEditor(harness, saveNotifications);
+	registration.failNext();
+	editor.handleInput("r");
+	editor.handleInput("!");
+	editor.handleInput("\r");
+	await editor.whenIdle();
+	assert.ok(
+		saveNotifications.some((message) =>
+			message.includes(
+				"Failover chain was written but target registration failed; restart after repairing shared state.",
+			),
+		),
+	);
+
+	registration.recover();
+	const recoveryNotifications: string[] = [];
+	await openEditor(harness, recoveryNotifications);
+	assert.equal(
+		recoveryNotifications.some((message) =>
+			/Failover target registration (?:was rejected|failed);.*(?:new chain configuration was not applied|editing is disabled)/i.test(
+				message,
+			),
+		),
+		false,
+	);
 });
 
 test("delegate routing remains usable with a frozen target thinking map", async () => {
