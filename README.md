@@ -9,7 +9,7 @@ Pi Model Failover is a global-first Pi extension that moves a settled failed req
 Install the current public GitHub package through Pi's package manager:
 
 ```bash
-pi install git:github.com/ahe-meow/pi-model-auto-switch
+pi install git:github.com/ahe-meow/pi-model-failover
 ```
 
 The npm registry package `pi-model-failover` has not been published yet, so this command currently does **not** work:
@@ -76,7 +76,7 @@ For models using Pi's OpenAI Responses, Chat Completions, or Azure OpenAI Respon
 
 `prompt_cache_key` is `SHA-256("pi-model-failover/prompt-cache-key/v1:" + session ID)`, represented as 64 lower-case hexadecimal characters. The plaintext Session ID is never sent. `prompt_cache_retention: "24h"` follows only explicit long-retention/native-field support and target compatibility; an outer `pi-cache-optimizer` strip wins. Existing session-affinity headers are replaced with the same digest without changing header spelling. An explicit `cacheRetention:none` removes cache key and retention and adds no affinity.
 
-When a structured HTTP 400/422 request-validation error identifies `prompt_cache_key` or `prompt_cache_retention`, compatibility negotiation is local to the exact target and API. It remembers only the rejected field, preserves the other field and unrelated payload data, and retries without consuming the normal retry budget; the negotiation remains bounded. Disabled fields are never negotiated. `401`/`403` authentication failures take precedence. Non-OpenAI API types are unchanged. See the [official API implementation notes](https://github.com/ahe-meow/pi-model-auto-switch/blob/main/docs/research/openai-pi-request-parameters.md) for source references and Pi hook details.
+When a structured HTTP 400/422 request-validation error identifies `prompt_cache_key` or `prompt_cache_retention`, compatibility negotiation is local to the exact target and API. It remembers only the rejected field, preserves the other field and unrelated payload data, and retries without consuming the normal retry budget; the negotiation remains bounded. Disabled fields are never negotiated. `401`/`403` authentication failures take precedence. Non-OpenAI API types are unchanged. See the [official API implementation notes](https://github.com/ahe-meow/pi-model-failover/blob/main/docs/research/openai-pi-request-parameters.md) for source references and Pi hook details.
 
 ## Failure policy
 
