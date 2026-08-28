@@ -11,7 +11,16 @@ import {
 	runFailoverRequest,
 } from "../src/provider.ts";
 import { promptCacheKeyFromSessionId } from "../src/request-params.ts";
-import type { GeneratedFailoverModel, ModelRef } from "../src/types.ts";
+import {
+	createMemorySharedState,
+	type SharedStateAdapter,
+	type SharedTargetSettingsPatch,
+} from "../src/shared-state.ts";
+import type {
+	GeneratedFailoverModel,
+	GeneratedFailoverModelV8,
+	ModelRef,
+} from "../src/types.ts";
 import { modelKey } from "../src/types.ts";
 
 interface Step {
@@ -25,6 +34,7 @@ function targetModel(ref: ModelRef): TargetModelLike {
 		provider: ref.provider,
 		id: ref.id,
 		api: "openai-responses",
+		baseUrl: "https://api.openai.com/v1",
 		reasoning: true,
 		thinkingLevelMap: {
 			off: "none",
@@ -66,6 +76,22 @@ function errorMessage(
 		errorMessage: message,
 		timestamp: 1,
 	};
+}
+
+function unsupportedCacheFieldMessage(
+	ref: ModelRef,
+	field: "prompt_cache_key" | "prompt_cache_retention",
+): AssistantMessageLike {
+	return errorMessage(
+		ref,
+		JSON.stringify({
+			error: {
+				type: "invalid_request_error",
+				param: field,
+				code: "unsupported_parameter",
+			},
+		}),
+	);
 }
 
 function structuredError(
@@ -116,6 +142,7 @@ function scriptedDelegate(
 function makeState(
 	models: GeneratedFailoverModel[],
 	delegate: Delegate,
+	sharedState?: SharedStateAdapter,
 ): FailoverProviderState {
 	return {
 		config: { models },
@@ -127,6 +154,40 @@ function makeState(
 		cooldownLevels: new Map(),
 		manualRecovery: new Map(),
 		unsupportedCacheFields: new Map(),
+		sharedState,
+	};
+}
+
+async function makeSharedState(
+	chain: readonly ModelRef[],
+	patch: SharedTargetSettingsPatch = {},
+	options: NonNullable<Parameters<typeof createMemorySharedState>[0]> = {},
+): Promise<SharedStateAdapter> {
+	const shared = createMemorySharedState(options);
+	const registration = await shared.reconcileRegistration({
+		agentDirectory: "/tmp/provider-r3a-shared",
+		targets: chain,
+	});
+	assert.equal(registration.kind, "reconciled");
+	for (const target of chain) {
+		const updated = await shared.updateSettings(target, patch);
+		assert.equal(updated.kind, "updated");
+	}
+	return shared;
+}
+
+function mutableClock(start = Date.now()): {
+	now: () => number;
+	set: (value: number) => void;
+	value: () => number;
+} {
+	let current = start;
+	return {
+		now: () => current,
+		set: (value) => {
+			current = value;
+		},
+		value: () => current,
 	};
 }
 
@@ -758,6 +819,66 @@ test("reasoning, cache, and affinity parameters apply per target", async () => {
 	const generated = createGeneratedModel([a]);
 	generated.id = "primary";
 	generated.reasoningEffort = "high";
+	let outerCallbackFinished = false;
+	let adapterPayload: Record<string, unknown> | undefined;
+	const scripted = scriptedDelegate(new Map([["a/m1", targetModel(a)]]), [
+		{ result: okMessage(a) },
+	]);
+	const delegate: Delegate = {
+		...scripted.delegate,
+		complete: async (model, context, options) => {
+			const payload: Record<string, unknown> = {
+				prompt_cache_retention: undefined,
+			};
+			const forwarded = await options.onPayload?.(payload, model);
+			adapterPayload =
+				forwarded === undefined ? payload : (forwarded as Record<string, unknown>);
+			return scripted.delegate.complete(model, context, options);
+		},
+	};
+	await consume(
+		runFailoverRequest(
+			generated,
+			{},
+			{
+				sessionId: "s1",
+				cacheRetention: "long",
+				headers: {
+					authorization: "Bearer keep",
+					"x-unrelated": "keep",
+				},
+				onPayload: async (payload) => {
+					await new Promise<void>((resolve) => setTimeout(resolve, 0));
+					outerCallbackFinished = true;
+					return payload;
+				},
+			},
+			makeState([generated], delegate),
+		),
+	);
+	const options = scripted.calls[0].options;
+	assert.equal(options.reasoning, "high");
+	assert.equal(outerCallbackFinished, true);
+
+	const payload = adapterPayload!;
+	const digest = promptCacheKeyFromSessionId("s1");
+	assert.equal(payload.prompt_cache_key, digest);
+	assert.equal(payload.prompt_cache_retention, "24h");
+	assert.deepEqual(payload.reasoning, { effort: "high" });
+
+	assert.equal(options.sessionId, "s1");
+	assert.equal(options.headers?.authorization, undefined);
+	assert.equal(options.headers?.["x-unrelated"], undefined);
+	assert.equal(options.headers?.session_id, digest);
+	assert.equal(options.headers?.["x-client-request-id"], digest);
+	assert.equal(options.headers?.["x-session-affinity"], null);
+	assert.equal(options.headers?.["x-session-id"], null);
+});
+
+test("cache retention none drops outer headers and preserves target-owned final headers", async () => {
+	const a = { provider: "a", id: "m1" };
+	const generated = createGeneratedModel([a]);
+	generated.id = "primary";
 	const { delegate, calls } = scriptedDelegate(
 		new Map([["a/m1", targetModel(a)]]),
 		[{ result: okMessage(a) }],
@@ -766,26 +887,99 @@ test("reasoning, cache, and affinity parameters apply per target", async () => {
 		runFailoverRequest(
 			generated,
 			{},
-			{ sessionId: "s1" },
+			{
+				sessionId: "session-plaintext-id",
+				cacheRetention: "none",
+				headers: {
+					"x-session-id": "plaintext",
+					authorization: "Bearer keep",
+				},
+			},
 			makeState([generated], delegate),
 		),
 	);
 	const options = calls[0].options;
-	assert.equal(options.reasoning, "high");
+	const payload: Record<string, unknown> = {
+		prompt_cache_key: "pi-native-key",
+		prompt_cache_retention: "24h",
+	};
+	await options.onPayload?.(payload);
+	assert.equal("prompt_cache_key" in payload, false);
+	assert.equal("prompt_cache_retention" in payload, false);
+	assert.equal(options.headers, undefined);
 
-	const payload: Record<string, unknown> = {};
-	options.onPayload?.(payload);
-	const digest = promptCacheKeyFromSessionId("s1");
-	assert.equal(payload.prompt_cache_key, digest);
-	assert.equal(payload.prompt_cache_retention, "24h");
-	assert.deepEqual(payload.reasoning, { effort: "high" });
-
-	const headers: Record<string, string | null> = { "X-Session-Id": "plain" };
-	options.transformHeaders?.(headers);
-	assert.equal(headers["X-Session-Id"], digest);
+	const finalHeaders: Record<string, string | null> = {
+		session_id: "session-plaintext-id",
+		"x-client-request-id": "session-plaintext-id",
+		"x-session-affinity": "session-plaintext-id",
+		"x-session-id": "session-plaintext-id",
+		authorization: "Bearer target",
+		"x-target-native": "target-native",
+	};
+	const expectedFinalHeaders = { ...finalHeaders };
+	await options.transformHeaders?.(finalHeaders);
+	assert.deepEqual(finalHeaders, expectedFinalHeaders);
 });
 
-test("cache-field rejection retries without consuming policy retries", async () => {
+test("custom providers on OpenRouter replace every native affinity name", async () => {
+	const a = { provider: "custom", id: "m1" };
+	const generated = createGeneratedModel([a]);
+	generated.id = "primary";
+	const model: TargetModelLike = {
+		...targetModel(a),
+		baseUrl: "https://openrouter.ai/api/v1",
+	};
+	const { delegate, calls } = scriptedDelegate(new Map([["custom/m1", model]]), [
+		{ result: okMessage(a) },
+	]);
+	await consume(
+		runFailoverRequest(
+			generated,
+			{},
+			{ sessionId: "session-plaintext-id" },
+			makeState([generated], delegate),
+		),
+	);
+	const digest = promptCacheKeyFromSessionId("session-plaintext-id");
+	assert.equal(calls[0].options.headers?.["x-session-id"], digest);
+	assert.equal(calls[0].options.headers?.session_id, null);
+	assert.equal(calls[0].options.headers?.["x-client-request-id"], null);
+	assert.equal(calls[0].options.headers?.["x-session-affinity"], null);
+});
+
+test("an outer payload callback can strip retention without failover re-adding it", async () => {
+	const a = { provider: "a", id: "m1" };
+	const generated = createGeneratedModel([a]);
+	generated.id = "primary";
+	const { delegate, calls } = scriptedDelegate(
+		new Map([["a/m1", targetModel(a)]]),
+		[{ result: okMessage(a) }],
+	);
+	await consume(
+		runFailoverRequest(
+			generated,
+			{},
+			{
+				sessionId: "s1",
+				cacheRetention: "long",
+				onPayload: async (payload) => {
+					if (payload && typeof payload === "object")
+						delete (payload as Record<string, unknown>).prompt_cache_retention;
+					return payload;
+				},
+			},
+			makeState([generated], delegate),
+		),
+	);
+	const payload: Record<string, unknown> = {
+		prompt_cache_retention: undefined,
+	};
+	await calls[0].options.onPayload?.(payload);
+	assert.equal(payload.prompt_cache_key, promptCacheKeyFromSessionId("s1"));
+	assert.equal("prompt_cache_retention" in payload, false);
+});
+
+test("prompt_cache_retention rejection retries with remembered deletion", async () => {
 	const a = { provider: "a", id: "m1" };
 	const generated = createGeneratedModel([a]);
 	generated.id = "primary";
@@ -795,30 +989,157 @@ test("cache-field rejection retries without consuming policy retries", async () 
 		[
 			{
 				status: 400,
-				result: errorMessage(
-					a,
-					'{"error":{"type":"invalid_request_error","param":"prompt_cache_key","code":"unsupported_parameter"}}',
-				),
+				result: unsupportedCacheFieldMessage(a, "prompt_cache_retention"),
 			},
 			{ result: okMessage(a) },
 		],
 	);
 	const state = makeState([generated], delegate);
 	const { result } = await consume(
-		runFailoverRequest(generated, {}, { sessionId: "s1" }, state),
+		runFailoverRequest(
+			generated,
+			{},
+			{ sessionId: "s1", cacheRetention: "long" },
+			state,
+		),
 	);
 	assert.equal(result.stopReason, "stop");
 	assert.equal(calls.length, 2);
 	assert.ok(
 		state.unsupportedCacheFields
 			.get("primary:a/m1:openai-responses")
-			?.has("prompt_cache_key"),
+			?.has("prompt_cache_retention"),
 	);
 
-	const retryPayload: Record<string, unknown> = {};
-	calls[1].options.onPayload?.(retryPayload);
-	assert.equal("prompt_cache_key" in retryPayload, false);
-	assert.equal(retryPayload.prompt_cache_retention, "24h");
+	const retryPayload: Record<string, unknown> = {
+		prompt_cache_key: "native-key",
+		prompt_cache_retention: "24h",
+	};
+	await calls[1].options.onPayload?.(retryPayload);
+	assert.equal(retryPayload.prompt_cache_key, promptCacheKeyFromSessionId("s1"));
+	assert.equal("prompt_cache_retention" in retryPayload, false);
+});
+
+test("key then retention rejection gets two compatibility retries", async () => {
+	const a = { provider: "a", id: "m1" };
+	const generated = createGeneratedModel([a]);
+	generated.id = "primary";
+	generated.maxRetries = 0;
+	const scripted = scriptedDelegate(new Map([["a/m1", targetModel(a)]]), [
+		{
+			status: 400,
+			result: unsupportedCacheFieldMessage(a, "prompt_cache_key"),
+		},
+		{
+			status: 400,
+			result: unsupportedCacheFieldMessage(a, "prompt_cache_retention"),
+		},
+		{ result: okMessage(a) },
+	]);
+	const payloads: Record<string, unknown>[] = [];
+	const delegate: Delegate = {
+		...scripted.delegate,
+		complete: async (model, context, options) => {
+			const payload: Record<string, unknown> = {
+				prompt_cache_key: "native-key",
+				prompt_cache_retention: undefined,
+			};
+			await options.onPayload?.(payload, model);
+			payloads.push(payload);
+			return scripted.delegate.complete(model, context, options);
+		},
+	};
+	const state = makeState([generated], delegate);
+	const { result } = await consume(
+		runFailoverRequest(
+			generated,
+			{},
+			{ sessionId: "s1", cacheRetention: "long" },
+			state,
+		),
+	);
+	assert.equal(result.stopReason, "stop");
+	assert.equal(scripted.calls.length, 3);
+	assert.deepEqual(
+		state.unsupportedCacheFields.get("primary:a/m1:openai-responses"),
+		new Set(["prompt_cache_key", "prompt_cache_retention"]),
+	);
+	assert.equal(payloads[0].prompt_cache_key, promptCacheKeyFromSessionId("s1"));
+	assert.equal(payloads[0].prompt_cache_retention, "24h");
+	assert.equal("prompt_cache_key" in payloads[1], false);
+	assert.equal(payloads[1].prompt_cache_retention, "24h");
+	assert.equal("prompt_cache_key" in payloads[2], false);
+	assert.equal("prompt_cache_retention" in payloads[2], false);
+});
+
+test("cache-field rejection stays remembered on later requests", async () => {
+	const a = { provider: "a", id: "m1" };
+	const generated = createGeneratedModel([a]);
+	generated.id = "primary";
+	generated.maxRetries = 0;
+	const { delegate, calls } = scriptedDelegate(
+		new Map([["a/m1", targetModel(a)]]),
+		[
+			{
+				status: 400,
+				result: unsupportedCacheFieldMessage(a, "prompt_cache_retention"),
+			},
+			{ result: okMessage(a) },
+			{ result: okMessage(a) },
+		],
+	);
+	const state = makeState([generated], delegate);
+	const options = { sessionId: "s1", cacheRetention: "long" as const };
+	await consume(runFailoverRequest(generated, {}, options, state));
+	await consume(runFailoverRequest(generated, {}, options, state));
+	assert.equal(calls.length, 3);
+
+	const laterPayload: Record<string, unknown> = {
+		prompt_cache_retention: "24h",
+	};
+	await calls[2].options.onPayload?.(laterPayload);
+	assert.equal("prompt_cache_retention" in laterPayload, false);
+	assert.equal(laterPayload.prompt_cache_key, promptCacheKeyFromSessionId("s1"));
+});
+
+test("compatibility retries are free but bounded outside maxRetries", async () => {
+	const a = { provider: "a", id: "m1" };
+	const generated = createGeneratedModel([a]);
+	generated.id = "primary";
+	generated.maxRetries = 0;
+	const { delegate, calls } = scriptedDelegate(
+		new Map([["a/m1", targetModel(a)]]),
+		[
+			{
+				status: 400,
+				result: unsupportedCacheFieldMessage(a, "prompt_cache_key"),
+			},
+			{
+				status: 400,
+				result: unsupportedCacheFieldMessage(a, "prompt_cache_retention"),
+			},
+			{
+				status: 400,
+				result: unsupportedCacheFieldMessage(a, "prompt_cache_key"),
+			},
+			{ result: okMessage(a) },
+		],
+	);
+	const state = makeState([generated], delegate);
+	const { result } = await consume(
+		runFailoverRequest(
+			generated,
+			{},
+			{ sessionId: "s1", cacheRetention: "long" },
+			state,
+		),
+	);
+	assert.equal(result.stopReason, "error");
+	assert.equal(calls.length, 3);
+	assert.deepEqual(
+		state.unsupportedCacheFields.get("primary:a/m1:openai-responses"),
+		new Set(["prompt_cache_key", "prompt_cache_retention"]),
+	);
 });
 
 test("disabled passive toggles leave Pi-owned payload and headers untouched", async () => {
@@ -846,15 +1167,153 @@ test("disabled passive toggles leave Pi-owned payload and headers untouched", as
 	);
 	const options = calls[0].options;
 	assert.equal(options.reasoning, undefined);
+	assert.equal(options.sessionId, "s1");
 
-	const payload: Record<string, unknown> = {};
-	options.onPayload?.(payload);
+	const payload: Record<string, unknown> = {
+		prompt_cache_retention: "24h",
+	};
+	await options.onPayload?.(payload);
 	assert.equal("reasoning" in payload, false);
 	assert.equal(payload.prompt_cache_key, promptCacheKeyFromSessionId("s1"));
+	assert.equal(payload.prompt_cache_retention, "24h");
 
 	const headers: Record<string, string | null> = { "X-Session-Id": "plain" };
-	options.transformHeaders?.(headers);
+	await options.transformHeaders?.(headers);
 	assert.equal(headers["X-Session-Id"], "plain");
+});
+
+test("non-OpenAI targets leave payload and target-owned final headers untouched", async () => {
+	const a = { provider: "anthropic", id: "m1" };
+	const generated = createGeneratedModel([a]);
+	generated.id = "primary";
+	const model = {
+		...targetModel(a),
+		api: "anthropic-messages",
+	};
+	const { delegate, calls } = scriptedDelegate(
+		new Map([["anthropic/m1", model]]),
+		[{ result: okMessage(a) }],
+	);
+	await consume(
+		runFailoverRequest(
+			generated,
+			{},
+			{
+				sessionId: "s1",
+				headers: {
+					session_id: "plaintext",
+					authorization: "Bearer keep",
+				},
+			},
+			makeState([generated], delegate),
+		),
+	);
+	const options = calls[0].options;
+	assert.equal(options.sessionId, "s1");
+	assert.equal(options.headers, undefined);
+	const payload: Record<string, unknown> = {
+		metadata: { keep: true },
+	};
+	await options.onPayload?.(payload);
+	assert.deepEqual(payload, { metadata: { keep: true } });
+	const finalHeaders: Record<string, string | null> = {
+		session_id: "target-native",
+		authorization: "Bearer target",
+		"x-anthropic-native": "target-native",
+	};
+	const expectedFinalHeaders = { ...finalHeaders };
+	await options.transformHeaders?.(finalHeaders);
+	assert.deepEqual(finalHeaders, expectedFinalHeaders);
+});
+
+test("cross-provider attempts isolate virtual credentials and header transforms", async () => {
+	const a = { provider: "openai", id: "m1" };
+	const b = { provider: "openrouter", id: "m2" };
+	const generated = createGeneratedModel([a, b]);
+	generated.id = "credential-boundary";
+	generated.maxRetries = 0;
+	const openRouterModel: TargetModelLike = {
+		...targetModel(b),
+		baseUrl: "https://openrouter.ai/api/v1",
+	};
+	const { delegate, calls } = scriptedDelegate(
+		new Map([
+			["openai/m1", targetModel(a)],
+			["openrouter/m2", openRouterModel],
+		]),
+		[
+			{ status: 500, result: errorMessage(a, "HTTP error (500)") },
+			{ result: okMessage(b) },
+		],
+	);
+	let outerTransformCalls = 0;
+	const { result } = await consume(
+		runFailoverRequest(
+			generated,
+			{},
+			{
+				apiKey: "fake-virtual-api-key",
+				env: { FAKE_PROVIDER_TOKEN: "fake-env-token" },
+				sessionId: "credential-boundary-session",
+				headers: {
+					Authorization: "Bearer fake-outer-authorization",
+					"Proxy-Authorization": "Basic fake-outer-proxy",
+					Cookie: "fake-cookie=value",
+					"x-api-key": "fake-outer-api-key",
+					"x-harmless": "fake-outer-harmless",
+				},
+				transformHeaders: async (headers) => {
+					outerTransformCalls += 1;
+					headers["x-outer-transform-secret"] = "fake-transform-secret";
+					return headers;
+				},
+			},
+			makeState([generated], delegate),
+		),
+	);
+	assert.equal(result.model, "m2");
+	assert.deepEqual(
+		calls.map((call) => `${call.model.provider}/${call.model.id}`),
+		["openai/m1", "openrouter/m2"],
+	);
+
+	const digest = promptCacheKeyFromSessionId("credential-boundary-session");
+	for (const call of calls) {
+		assert.equal(Object.hasOwn(call.options, "apiKey"), false);
+		assert.equal(Object.hasOwn(call.options, "env"), false);
+		const affinityHeaders =
+			call.model.provider === "openrouter"
+				? {
+						session_id: null,
+						"x-client-request-id": null,
+						"x-session-affinity": null,
+						"x-session-id": digest,
+					}
+				: {
+						session_id: digest,
+						"x-client-request-id": digest,
+						"x-session-affinity": null,
+						"x-session-id": null,
+					};
+		assert.deepEqual(call.options.headers, affinityHeaders);
+
+		const finalHeaders: Record<string, string | null> = {
+			Authorization: `Bearer target-${call.model.provider}`,
+			"x-target-native": `native-${call.model.provider}`,
+			session_id: "target-session",
+			"x-client-request-id": "target-request",
+			"x-session-affinity": "target-affinity",
+			"x-session-id": "target-session-id",
+		};
+		const transformed = await call.options.transformHeaders?.(finalHeaders);
+		assert.equal(transformed, finalHeaders);
+		assert.deepEqual(finalHeaders, {
+			Authorization: `Bearer target-${call.model.provider}`,
+			"x-target-native": `native-${call.model.provider}`,
+			...affinityHeaders,
+		});
+	}
+	assert.equal(outerTransformCalls, 0);
 });
 
 test("persistent failures across the chain end in exhaustion", async () => {
@@ -1080,4 +1539,1023 @@ test("an aborted signal stops the chain immediately", async () => {
 		),
 	);
 	assert.equal(result.stopReason, "aborted");
+});
+
+test("R1-002 shared attempts use caller timeout claims and bound disabled no-progress settings", async () => {
+	const a = { provider: "a", id: "m1" };
+	const generated = createGeneratedModel([a]);
+	generated.id = "shared-timeout-safety";
+	const shared = await makeSharedState([a], {
+		maxRetries: 0,
+		noProgressTimeoutSeconds: 0,
+	});
+	const claims: Array<{ effectiveRequestTimeoutMs: number }> = [];
+	const adapter: SharedStateAdapter = {
+		status: () => shared.status(),
+		snapshot: () => shared.snapshot(),
+		reconcileRegistration: (input) => shared.reconcileRegistration(input),
+		claim: async (input) => {
+			claims.push({ effectiveRequestTimeoutMs: input.effectiveRequestTimeoutMs });
+			const result = await shared.claim(input);
+			if (result.kind !== "claimed") return result;
+			return result;
+		},
+		settle: (input) => shared.settle(input),
+		updateSettings: (target, patch) => shared.updateSettings(target, patch),
+		resetTargets: (targets) => shared.resetTargets(targets),
+	};
+	let calls = 0;
+	const delegate: Delegate = {
+		resolveModel: (target) => targetModel(target),
+		complete: async (_model, _context, options) => {
+			calls += 1;
+			return new Promise<AssistantMessageLike>((resolve) => {
+				options.signal?.addEventListener(
+					"abort",
+					() => resolve(errorMessage(a, "bounded timeout")),
+					{ once: true },
+				);
+			});
+		},
+	};
+	const { result } = await consume(
+		runFailoverRequest(
+			generated,
+			{},
+			{ timeoutMs: 45_000 },
+			makeState([generated], delegate, adapter),
+		),
+	);
+	assert.equal(calls, 1);
+	assert.deepEqual(claims, [{ effectiveRequestTimeoutMs: 45_000 }]);
+	assert.match(result.errorMessage ?? "", /no-progress timeout/);
+});
+
+test("R1-004 redacts provider secrets from results, callbacks, transitions, and shared state", async () => {
+	const a = { provider: "a", id: "m1" };
+	const b = { provider: "b", id: "m2" };
+	const generated = createGeneratedModel([a, b]);
+	generated.id = "secret-redaction";
+	generated.errorHandlingMode = "switch";
+	generated.maxRetries = 0;
+	const sentinels = [
+		"sk-1234567890SECRET",
+		"bearer-secret-value",
+		"query-secret-value",
+		"metadata-token-abcdefghijklmnopqrstuvwxyz0123456789",
+		"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef==",
+		"sk-control-injection-secret-1234567890",
+	];
+	const controlInjection = `OSC52=\u001b]52;c;${sentinels[5]}\u0007 CSI=\u001b[31mred\u001b[0m BEL=\u0007 C1=\u009b31m`;
+	const controlCharacters = /[\u0000-\u001f\u007f-\u009f]/;
+	const raw = `HTTP 401 key ${sentinels[0]} Authorization: Bearer ${sentinels[1]}; api_key=${sentinels[2]} token=${sentinels[3]} credential ${sentinels[4]} ${controlInjection}`;
+	const shared = await makeSharedState([a, b], { maxRetries: 0 });
+	const scripted = scriptedDelegate(
+		new Map([
+			["a/m1", targetModel(a)],
+			["b/m2", targetModel(b)],
+		]),
+		[
+			{
+				error: structuredError(
+					`provider_auth_error token=${sentinels[3]}`,
+					raw,
+					undefined,
+					401,
+				),
+			},
+			{
+				result: {
+					...errorMessage(b, raw, "aborted"),
+					providerErrorCategory: `provider_auth_error token=${sentinels[3]}`,
+				},
+			},
+		],
+	);
+	const state = makeState([generated], scripted.delegate, shared);
+	const transitions: string[] = [];
+	const recoveries: string[] = [];
+	state.onTransition = (transition) => transitions.push(transition.reason);
+	state.onManualRecovery = (_key, reason) => recoveries.push(reason);
+
+	const outcome = await consume(runFailoverRequest(generated, {}, {}, state));
+	const sharedDocument = (await shared.snapshot()).document;
+	const sharedReason =
+		sharedDocument.targets["a/m1"].runtime.manualRecovery?.reason;
+	const exposed = JSON.stringify({
+		result: outcome.result,
+		events: outcome.events,
+		transitions,
+		recoveries,
+		manualRecovery: [...state.manualRecovery.entries()],
+		shared: sharedDocument,
+	});
+	for (const sentinel of sentinels)
+		assert.equal(exposed.includes(sentinel), false, sentinel);
+	assert.match(outcome.result.errorMessage ?? "", /HTTP 401|settlement stale/);
+	assert.equal(transitions.length, 1);
+	assert.equal(sharedReason, "HTTP 401");
+	assert.equal(sharedDocument.targets["a/m1"].runtime.cooldownUntil, null);
+
+	const legacy = createGeneratedModel([a]);
+	legacy.id = "legacy-secret-redaction";
+	legacy.errorHandlingMode = "switch";
+	legacy.maxRetries = 0;
+	const legacyScript = scriptedDelegate(new Map([["a/m1", targetModel(a)]]), [
+		{
+			error: structuredError("provider_auth_error", raw),
+		},
+	]);
+	const legacyState = makeState([legacy], legacyScript.delegate);
+	const legacyRecoveries: string[] = [];
+	legacyState.onManualRecovery = (_key, reason) => legacyRecoveries.push(reason);
+	const legacyOutcome = await consume(
+		runFailoverRequest(legacy, {}, {}, legacyState),
+	);
+	assert.equal(legacyRecoveries.length, 1);
+	const legacyExposed = JSON.stringify({
+		result: legacyOutcome.result,
+		events: legacyOutcome.events,
+		recoveries: legacyRecoveries,
+		manualRecovery: [...legacyState.manualRecovery.entries()],
+	});
+	for (const sentinel of sentinels)
+		assert.equal(legacyExposed.includes(sentinel), false, sentinel);
+	const controlSurfaces = {
+		terminal: outcome.result.errorMessage ?? "",
+		callback: legacyRecoveries[0] ?? "",
+		transition: transitions[0] ?? "",
+		persisted: sharedReason ?? "",
+	};
+	for (const [surface, text] of Object.entries(controlSurfaces)) {
+		assert.doesNotMatch(text, controlCharacters, surface);
+		assert.equal(text.includes(sentinels[5]), false, surface);
+	}
+	assert.match(controlSurfaces.terminal, /\[REDACTED\]/);
+});
+
+test("authorization variants are redacted across failover surfaces", async () => {
+	const a = { provider: "a", id: "m1" };
+	const b = { provider: "b", id: "m2" };
+	const sentinels = {
+		basic: "basicAuthMarker7Q",
+		digest: "digestAuthMarker8R",
+		proxy: "proxyAuthMarker9S",
+		keyValue: "lowerAuthMarker2T",
+		proxyKeyValue: "lowerProxyMarker5W",
+		json: "jsonAuthMarker3U",
+		jsonProxy: "jsonProxyMarker4V",
+	};
+	const raw = [
+		"HTTP 401 upstream denied",
+		`AUTHORIZATION: Basic ${sentinels.basic}`,
+		`Authorization: Digest username="demo", response="${sentinels.digest}"`,
+		`Proxy-Authorization: Unknown ${sentinels.proxy}`,
+		`authorization=${sentinels.keyValue}&request_id=req-7`,
+		`proxy_authorization=${sentinels.proxyKeyValue}&trace_id=trace-8`,
+		`{"authorization":"${sentinels.json}","proxy-authorization":"${sentinels.jsonProxy}","status":"denied"}`,
+		"safe_context=kept",
+	].join("\n");
+
+	const generated = createGeneratedModel([a, b]);
+	generated.id = "authorization-redaction";
+	generated.errorHandlingMode = "switch";
+	generated.maxRetries = 0;
+	const shared = await makeSharedState([a, b], { maxRetries: 0 });
+	const sharedScript = scriptedDelegate(
+		new Map([
+			["a/m1", targetModel(a)],
+			["b/m2", targetModel(b)],
+		]),
+		[
+			{ error: structuredError("provider_auth_error", raw) },
+			{ error: structuredError("provider_auth_error", raw) },
+		],
+	);
+	const sharedState = makeState([generated], sharedScript.delegate, shared);
+	const transitions: string[] = [];
+	sharedState.onTransition = (transition) => transitions.push(transition.reason);
+	const sharedOutcome = await consume(
+		runFailoverRequest(generated, {}, {}, sharedState),
+	);
+
+	const legacy = createGeneratedModel([a]);
+	legacy.id = "authorization-redaction-legacy";
+	legacy.errorHandlingMode = "switch";
+	legacy.maxRetries = 0;
+	const legacyScript = scriptedDelegate(new Map([["a/m1", targetModel(a)]]), [
+		{ error: structuredError("provider_auth_error", raw) },
+	]);
+	const legacyState = makeState([legacy], legacyScript.delegate);
+	const manualCallbacks: string[] = [];
+	legacyState.onManualRecovery = (_key, reason) => manualCallbacks.push(reason);
+	const legacyOutcome = await consume(
+		runFailoverRequest(legacy, {}, {}, legacyState),
+	);
+
+	const exposed = JSON.stringify({
+		sharedResult: sharedOutcome.result,
+		sharedEvents: sharedOutcome.events,
+		legacyResult: legacyOutcome.result,
+		transitions,
+		manualCallbacks,
+		sharedSnapshot: (await shared.snapshot()).document,
+	});
+	for (const sentinel of Object.values(sentinels))
+		assert.equal(exposed.includes(sentinel), false, sentinel);
+	assert.match(
+		sharedOutcome.result.errorMessage ?? "",
+		/HTTP 401|settlement stale/,
+	);
+	assert.ok((transitions[0] ?? "").length <= 256);
+	assert.ok((manualCallbacks[0] ?? "").length <= 256);
+});
+
+test("shared settings drive selection, parameters, timeout, and retry budget", async () => {
+	const a = { provider: "a", id: "m1" };
+	const b = { provider: "b", id: "m2" };
+	const generated = createGeneratedModel([a, b]);
+	generated.id = "shared-settings";
+	generated.reasoningEffort = "low";
+	generated.maxRetries = 8;
+	generated.noProgressTimeoutSeconds = 15;
+	const shared = await makeSharedState([a, b], {
+		reasoningEffort: "high",
+		maxRetries: 0,
+		noProgressTimeoutSeconds: 0,
+		modelParameters: {
+			promptCacheKey: false,
+			promptCacheRetention: false,
+			reasoningEffort: true,
+			sessionAffinity: false,
+		},
+	});
+	const calls: Array<{ model: TargetModelLike; options: RequestOptions }> = [];
+	let firstPayload: Record<string, unknown> | undefined;
+	const delegate: Delegate = {
+		resolveModel: (target) => targetModel(target),
+		complete: async (model, _context, options) => {
+			calls.push({ model, options });
+			const payload: Record<string, unknown> = {
+				prompt_cache_key: "native-key",
+				prompt_cache_retention: "24h",
+			};
+			await options.onPayload?.(payload, model);
+			if (model.id === "m1") {
+				firstPayload = payload;
+				return errorMessage(a, "stalled");
+			}
+			return okMessage(b);
+		},
+	};
+	const { result } = await consume(
+		runFailoverRequest(
+			generated,
+			{},
+			{ sessionId: "shared-session", cacheRetention: "long" },
+			makeState([generated], delegate, shared),
+		),
+	);
+	assert.equal(result.model, "m2");
+	assert.deepEqual(
+		calls.map((call) => call.model.id),
+		["m1", "m2"],
+	);
+	assert.equal(calls[0]?.options.reasoning, "high");
+	assert.ok(firstPayload);
+	assert.equal(firstPayload!.prompt_cache_key, "native-key");
+	assert.equal(firstPayload!.prompt_cache_retention, "24h");
+	assert.deepEqual(firstPayload!.reasoning, { effort: "high" });
+	assert.equal(calls[0]?.options.headers, undefined);
+	const record = (await shared.snapshot()).document.targets["a/m1"];
+	assert.equal(record.settings.reasoningEffort, "high");
+	assert.equal(record.settings.maxRetries, 0);
+	assert.equal(record.settings.noProgressTimeoutSeconds, 0);
+	assert.deepEqual(record.settings.modelParameters, {
+		promptCacheKey: false,
+		promptCacheRetention: false,
+		reasoningEffort: true,
+		sessionAffinity: false,
+	});
+});
+
+test("shared settlement keeps the V8 chain scope retry override", async () => {
+	const target = { provider: "a", id: "m1" };
+	const scopeKey = "chain-scope-override";
+	const generated: GeneratedFailoverModelV8 & { scopeKey: string } = {
+		id: "shared-scope-override",
+		name: "Shared Scope Override",
+		enabled: true,
+		chain: [target],
+		scopeKey,
+	};
+	const shared = await makeSharedState([target], { maxRetries: 5 });
+	const registration = await shared.reconcileRegistration({
+		agentDirectory: "/tmp/provider-r3a-shared",
+		targets: [target],
+		scopes: [{ key: scopeKey, targets: [target] }],
+	});
+	assert.equal(registration.kind, "reconciled");
+	const override = await shared.updateTargetOverride?.(scopeKey, target, {
+		maxRetries: 1,
+	});
+	assert.equal(override?.kind, "updated");
+
+	const driftingAdapter: SharedStateAdapter = {
+		status: () => shared.status(),
+		snapshot: () => shared.snapshot(),
+		reconcileRegistration: (input) => shared.reconcileRegistration(input),
+		claim: async (input) => {
+			const claim = await shared.claim(input);
+			if (claim.kind === "claimed") {
+				const changed = await shared.updateTargetOverride?.(scopeKey, target, {
+					maxRetries: 0,
+				});
+				assert.equal(changed?.kind, "updated");
+			}
+			return claim;
+		},
+		settle: (input) => shared.settle(input),
+		updateSettings: (targetRef, patch) => shared.updateSettings(targetRef, patch),
+		updateTargetOverride: (key, targetRef, patch) =>
+			shared.updateTargetOverride!(key, targetRef, patch),
+		resetTargets: (targets) => shared.resetTargets(targets),
+	};
+	const scripted = scriptedDelegate(new Map([["a/m1", targetModel(target)]]), [
+		{ status: 500, result: errorMessage(target, "HTTP error (500)") },
+		{ result: okMessage(target) },
+	]);
+	const providerState: FailoverProviderState & {
+		sharedState: SharedStateAdapter;
+	} = {
+		...makeState(
+			[generated as unknown as GeneratedFailoverModel],
+			scripted.delegate,
+			driftingAdapter,
+		),
+		sharedState: driftingAdapter,
+	};
+	const { result } = await consume(
+		runFailoverRequest(generated, {}, {}, providerState),
+	);
+	assert.equal(result.stopReason, "stop");
+	assert.equal(scripted.calls.length, 2);
+});
+
+test("shared retry budgets are isolated per target before chain advance", async () => {
+	const a = { provider: "a", id: "m1" };
+	const b = { provider: "b", id: "m2" };
+	const c = { provider: "c", id: "m3" };
+	const generated = createGeneratedModel([a, b]);
+	generated.id = "shared-retry-isolation";
+	const clock = mutableClock(Date.now() - 2_000);
+	const shared = await makeSharedState(
+		[a, b, c],
+		{ maxRetries: 1 },
+		{ now: clock.now },
+	);
+	const untouchedRuntime = (await shared.snapshot()).document.targets["c/m3"]
+		.runtime;
+	const { delegate, calls } = scriptedDelegate(
+		new Map([
+			["a/m1", targetModel(a)],
+			["b/m2", targetModel(b)],
+		]),
+		[
+			{ status: 500, result: errorMessage(a, "HTTP error (500)") },
+			{ status: 500, result: errorMessage(a, "HTTP error (500)") },
+			{ result: okMessage(b) },
+		],
+	);
+	const { result } = await consume(
+		runFailoverRequest(
+			generated,
+			{},
+			{},
+			makeState([generated], delegate, shared),
+		),
+	);
+	assert.equal(result.model, "m2");
+	assert.deepEqual(
+		calls.map((call) => `${call.model.provider}/${call.model.id}`),
+		["a/m1", "a/m1", "b/m2"],
+	);
+
+	const runtime = (await shared.snapshot()).document.targets;
+	assert.equal(runtime["a/m1"].runtime.consecutiveFailures, 0);
+	assert.equal(runtime["a/m1"].runtime.cooldownUntil, clock.value() + 600_000);
+	assert.equal(runtime["a/m1"].runtime.cooldownLevel, 1);
+	assert.equal(runtime["a/m1"].runtime.cumulativeCooldownMs, 600_000);
+	assert.equal(runtime["a/m1"].runtime.lastFailureReason, "HTTP 500");
+	assert.deepEqual(runtime["b/m2"].runtime, untouchedRuntime);
+	assert.deepEqual(runtime["c/m3"].runtime, untouchedRuntime);
+});
+
+test("shared cooldown state skips a failed target across adapters and falls through", async () => {
+	const a = { provider: "a", id: "m1" };
+	const b = { provider: "b", id: "m2" };
+	const generated = createGeneratedModel([a, b]);
+	generated.id = "shared-fallthrough";
+	generated.maxRetries = 8;
+	const sharedA = await makeSharedState([a, b], { maxRetries: 0 });
+	const first = scriptedDelegate(
+		new Map([
+			["a/m1", targetModel(a)],
+			["b/m2", targetModel(b)],
+		]),
+		[
+			{ status: 500, result: errorMessage(a, "HTTP error (500)") },
+			{ result: okMessage(b) },
+		],
+	);
+	const firstOutcome = await consume(
+		runFailoverRequest(
+			generated,
+			{},
+			{},
+			makeState([generated], first.delegate, sharedA),
+		),
+	);
+	assert.equal(firstOutcome.result.model, "m2");
+	const document = (await sharedA.snapshot()).document;
+	assert.ok(document.targets["a/m1"].runtime.cooldownUntil);
+
+	const sharedB = createMemorySharedState({ document });
+	const second = scriptedDelegate(
+		new Map([
+			["a/m1", targetModel(a)],
+			["b/m2", targetModel(b)],
+		]),
+		[{ result: okMessage(b) }],
+	);
+	const secondOutcome = await consume(
+		runFailoverRequest(
+			generated,
+			{},
+			{},
+			makeState([generated], second.delegate, sharedB),
+		),
+	);
+	assert.equal(secondOutcome.result.model, "m2");
+	assert.deepEqual(
+		second.calls.map((call) => call.model.id),
+		["m2"],
+	);
+});
+
+test("the shared max-retry budget is global across requests and adapters", async () => {
+	const a = { provider: "a", id: "m1" };
+	const generated = createGeneratedModel([a]);
+	generated.id = "global-budget";
+	generated.errorHandlingMode = "retry";
+	generated.maxRetries = 8;
+	const sharedA = await makeSharedState([a], { maxRetries: 0 });
+	const first = scriptedDelegate(new Map([["a/m1", targetModel(a)]]), [
+		{ status: 429, result: errorMessage(a, "HTTP error (429)") },
+	]);
+	const firstOutcome = await consume(
+		runFailoverRequest(
+			generated,
+			{},
+			{},
+			makeState([generated], first.delegate, sharedA),
+		),
+	);
+	assert.equal(firstOutcome.result.stopReason, "error");
+	assert.equal(first.calls.length, 1);
+	const document = (await sharedA.snapshot()).document;
+	assert.equal(document.targets["a/m1"].runtime.cooldownLevel, 1);
+	assert.equal(document.targets["a/m1"].runtime.cumulativeCooldownMs, 600_000);
+
+	const sharedB = createMemorySharedState({ document });
+	const second = scriptedDelegate(new Map([["a/m1", targetModel(a)]]), [
+		{ result: okMessage(a) },
+	]);
+	const secondOutcome = await consume(
+		runFailoverRequest(
+			generated,
+			{},
+			{},
+			makeState([generated], second.delegate, sharedB),
+		),
+	);
+	assert.equal(secondOutcome.result.stopReason, "error");
+	assert.equal(second.calls.length, 0);
+	assert.match(secondOutcome.result.errorMessage ?? "", /cooldown/);
+});
+
+test("shared retries and cancellation do not use lease release", async () => {
+	const a = { provider: "a", id: "m1" };
+	const generated = createGeneratedModel([a]);
+	generated.id = "retry-no-lease";
+	const shared = await makeSharedState([a], { maxRetries: 2 });
+	const settlements: string[] = [];
+	const adapter: SharedStateAdapter = {
+		status: () => shared.status(),
+		snapshot: () => shared.snapshot(),
+		reconcileRegistration: (input) => shared.reconcileRegistration(input),
+		claim: (input) => shared.claim(input),
+		settle: async (input) => {
+			settlements.push(input.outcome.kind);
+			return shared.settle(input);
+		},
+		updateSettings: (target, patch) => shared.updateSettings(target, patch),
+		resetTargets: (targets) => shared.resetTargets(targets),
+	};
+	const controller = new AbortController();
+	let calls = 0;
+	const delegate: Delegate = {
+		resolveModel: (target) => targetModel(target),
+		complete: async (model) => {
+			calls += 1;
+			setTimeout(() => controller.abort(), 20);
+			return errorMessage(model, "HTTP error (500)");
+		},
+	};
+	const { result } = await consume(
+		runFailoverRequest(
+			generated,
+			{},
+			{ signal: controller.signal },
+			makeState([generated], delegate, adapter),
+		),
+	);
+	assert.equal(result.stopReason, "aborted");
+	assert.equal(calls, 1);
+	assert.deepEqual(settlements, ["automatic-failure"]);
+	const runtime = (await shared.snapshot()).document.targets["a/m1"].runtime;
+	assert.equal("lease" in runtime, false);
+});
+test("shared compatibility negotiation does not count as a runtime failure", async () => {
+	const a = { provider: "a", id: "m1" };
+	const generated = createGeneratedModel([a]);
+	generated.id = "shared-compatibility";
+	const shared = await makeSharedState([a], { maxRetries: 0 });
+	let compatibilityRuntime:
+		| {
+				consecutiveFailures: number;
+				cooldownUntil: number | null;
+				cumulativeCooldownMs: number;
+		  }
+		| undefined;
+	const adapter: SharedStateAdapter = {
+		status: () => shared.status(),
+		snapshot: () => shared.snapshot(),
+		reconcileRegistration: (input) => shared.reconcileRegistration(input),
+		claim: (input) => shared.claim(input),
+		settle: async (input) => {
+			const result = await shared.settle(input);
+			if (
+				input.outcome.kind === "compatibility-retry" &&
+				result.kind === "settled"
+			)
+				compatibilityRuntime = result.runtime;
+			return result;
+		},
+		updateSettings: (target, patch) => shared.updateSettings(target, patch),
+		resetTargets: (targets) => shared.resetTargets(targets),
+	};
+	const scripted = scriptedDelegate(new Map([["a/m1", targetModel(a)]]), [
+		{
+			status: 400,
+			result: unsupportedCacheFieldMessage(a, "prompt_cache_retention"),
+		},
+		{ result: okMessage(a) },
+	]);
+	const state = makeState([generated], scripted.delegate, adapter);
+	const { result } = await consume(
+		runFailoverRequest(
+			generated,
+			{},
+			{ sessionId: "compatibility", cacheRetention: "long" },
+			state,
+		),
+	);
+	assert.equal(result.stopReason, "stop");
+	assert.equal(scripted.calls.length, 2);
+	assert.ok(compatibilityRuntime);
+	assert.equal(compatibilityRuntime!.consecutiveFailures, 0);
+	assert.equal(compatibilityRuntime!.cooldownUntil, null);
+	assert.equal(compatibilityRuntime!.cumulativeCooldownMs, 0);
+	assert.equal("lease" in compatibilityRuntime!, false);
+	assert.ok(
+		state.unsupportedCacheFields
+			.get("a/m1:openai-responses")
+			?.has("prompt_cache_retention"),
+	);
+});
+
+test("persistent model unavailability creates shared recovery across virtual models", async () => {
+	const a = { provider: "a", id: "m1" };
+	const first = createGeneratedModel([a]);
+	first.id = "virtual-one";
+	const second = createGeneratedModel([a]);
+	second.id = "virtual-two";
+	const shared = await makeSharedState([a], { maxRetries: 0 });
+	let unavailableCalls = 0;
+	const unavailable: Delegate = {
+		resolveModel: () => undefined,
+		complete: async () => {
+			unavailableCalls += 1;
+			return okMessage(a);
+		},
+	};
+	const firstOutcome = await consume(
+		runFailoverRequest(first, {}, {}, makeState([first], unavailable, shared)),
+	);
+	assert.equal(firstOutcome.result.stopReason, "error");
+	assert.equal(unavailableCalls, 0);
+	assert.equal(
+		(await shared.snapshot()).document.targets["a/m1"].runtime.manualRecovery
+			?.reason,
+		"model unavailable",
+	);
+
+	let secondCalls = 0;
+	const recoveredDelegate: Delegate = {
+		resolveModel: (target) => targetModel(target),
+		complete: async () => {
+			secondCalls += 1;
+			return okMessage(a);
+		},
+	};
+	const secondOutcome = await consume(
+		runFailoverRequest(
+			second,
+			{},
+			{},
+			makeState([second], recoveredDelegate, shared),
+		),
+	);
+	assert.equal(secondOutcome.result.stopReason, "error");
+	assert.equal(secondCalls, 0);
+	assert.match(secondOutcome.result.errorMessage ?? "", /manual-recovery/);
+});
+
+test("shared success clears cumulative cooldown and failure runtime", async () => {
+	const a = { provider: "a", id: "m1" };
+	const clock = mutableClock();
+	const shared = await makeSharedState(
+		[a],
+		{ maxRetries: 0 },
+		{ now: clock.now },
+	);
+	const claim = await shared.claim({ target: a, effectiveRequestTimeoutMs: 0 });
+	assert.equal(claim.kind, "claimed");
+	if (claim.kind !== "claimed") throw new Error("expected shared claim");
+	const failure = await shared.settle({
+		target: a,
+		outcome: { kind: "automatic-failure", reason: "HTTP 500" },
+	});
+	assert.equal(failure.kind, "settled");
+	if (failure.kind !== "settled" || failure.action !== "cooldown")
+		throw new Error("expected shared cooldown");
+	clock.set(failure.cooldownUntil + 1);
+
+	const generated = createGeneratedModel([a]);
+	generated.id = "runtime-success";
+	const delegate: Delegate = {
+		resolveModel: (target) => targetModel(target),
+		complete: async () => okMessage(a),
+	};
+	const { result } = await consume(
+		runFailoverRequest(
+			generated,
+			{},
+			{},
+			makeState([generated], delegate, shared),
+		),
+	);
+	assert.equal(result.stopReason, "stop");
+	assert.deepEqual((await shared.snapshot()).document.targets["a/m1"].runtime, {
+		consecutiveFailures: 0,
+		nextEligibleAt: null,
+		cooldownUntil: null,
+		cooldownLevel: 0,
+		cumulativeCooldownMs: 0,
+		manualRecovery: null,
+		lastFailureReason: null,
+		lastFailureAt: null,
+		updatedAt: clock.value(),
+	});
+});
+
+test("shared skipped reasons reach exhaustion and real-target transitions", async () => {
+	const unknown = { provider: "unknown", id: "missing" };
+	const available = { provider: "available", id: "m2" };
+	const cooling = { provider: "cooling", id: "m3" };
+	const exhaustedGenerated = createGeneratedModel([unknown, available, cooling]);
+	exhaustedGenerated.id = "skip-exhausted";
+	const exhaustedShared = await makeSharedState([unknown, available, cooling], {
+		maxRetries: 0,
+	});
+	await exhaustedShared.reconcileRegistration({
+		agentDirectory: "/tmp/provider-r3a-shared",
+		targets: [available, cooling],
+	});
+	const disabled = await exhaustedShared.updateSettings(available, {
+		enabled: false,
+	});
+	assert.equal(disabled.kind, "updated");
+	const coolingClaim = await exhaustedShared.claim({
+		target: cooling,
+		effectiveRequestTimeoutMs: 0,
+	});
+	assert.equal(coolingClaim.kind, "claimed");
+	if (coolingClaim.kind !== "claimed") throw new Error("expected cooling claim");
+	const coolingFailure = await exhaustedShared.settle({
+		target: cooling,
+		outcome: { kind: "automatic-failure", reason: "HTTP 500" },
+	});
+	assert.equal(coolingFailure.kind, "settled");
+	if (coolingFailure.kind !== "settled" || coolingFailure.action !== "cooldown")
+		throw new Error("expected cooling result");
+	let exhaustedCalls = 0;
+	const exhaustedDelegate: Delegate = {
+		resolveModel: () => {
+			exhaustedCalls += 1;
+			return targetModel(unknown);
+		},
+		complete: async () => {
+			exhaustedCalls += 1;
+			return okMessage(unknown);
+		},
+	};
+	const exhausted = await consume(
+		runFailoverRequest(
+			exhaustedGenerated,
+			{},
+			{},
+			makeState([exhaustedGenerated], exhaustedDelegate, exhaustedShared),
+		),
+	);
+	assert.equal(exhaustedCalls, 0);
+	assert.match(exhausted.result.errorMessage ?? "", /unknown-target/);
+	assert.match(exhausted.result.errorMessage ?? "", /cooldown/);
+
+	const source = { provider: "source", id: "m1" };
+	const destination = { provider: "destination", id: "m4" };
+	const transitionChain = [source, unknown, available, cooling, destination];
+	const transitionGenerated = createGeneratedModel(transitionChain);
+	transitionGenerated.id = "skip-transition";
+	const transitionShared = await makeSharedState(transitionChain, {
+		maxRetries: 0,
+	});
+	await transitionShared.reconcileRegistration({
+		agentDirectory: "/tmp/provider-r3a-shared",
+		targets: [source, available, cooling, destination],
+	});
+	const transitionDisabled = await transitionShared.updateSettings(available, {
+		enabled: false,
+	});
+	assert.equal(transitionDisabled.kind, "updated");
+	const transitionCoolingClaim = await transitionShared.claim({
+		target: cooling,
+		effectiveRequestTimeoutMs: 0,
+	});
+	assert.equal(transitionCoolingClaim.kind, "claimed");
+	if (transitionCoolingClaim.kind !== "claimed")
+		throw new Error("expected transition cooling claim");
+	const transitionCooling = await transitionShared.settle({
+		target: cooling,
+		outcome: { kind: "automatic-failure", reason: "HTTP 500" },
+	});
+	assert.equal(transitionCooling.kind, "settled");
+	if (
+		transitionCooling.kind !== "settled" ||
+		transitionCooling.action !== "cooldown"
+	)
+		throw new Error("expected transition cooldown");
+	const transitionScript = scriptedDelegate(
+		new Map([
+			["source/m1", targetModel(source)],
+			["destination/m4", targetModel(destination)],
+		]),
+		[
+			{ status: 500, result: errorMessage(source, "HTTP error (500)") },
+			{ result: okMessage(destination) },
+		],
+	);
+	const transitions: Array<{
+		modelId: string;
+		source?: ModelRef;
+		target: ModelRef;
+	}> = [];
+	const transitionState = makeState(
+		[transitionGenerated],
+		transitionScript.delegate,
+		transitionShared,
+	);
+	transitionState.onTransition = (transition) =>
+		transitions.push({
+			modelId: transition.modelId,
+			source: transition.source,
+			target: transition.target,
+		});
+	const transitionOutcome = await consume(
+		runFailoverRequest(transitionGenerated, {}, {}, transitionState),
+	);
+	assert.equal(transitionOutcome.result.model, "m4");
+	assert.deepEqual(
+		transitionScript.calls.map((call) => call.model.id),
+		["m1", "m4"],
+	);
+	assert.deepEqual(transitions, [
+		{ modelId: "skip-transition", source, target: destination },
+	]);
+});
+
+test("status hooks cannot abort legacy routing or shared lease settlement", async () => {
+	const a = { provider: "a", id: "m1" };
+	const b = { provider: "b", id: "m2" };
+	const legacy = createGeneratedModel([a, b]);
+	legacy.id = "status-hook-safety";
+	legacy.errorHandlingMode = "switch";
+	legacy.maxRetries = 0;
+	const longReason = `provider auth token=hook-secret ${"x".repeat(400)}`;
+	const legacyScript = scriptedDelegate(
+		new Map([
+			["a/m1", targetModel(a)],
+			["b/m2", targetModel(b)],
+		]),
+		[
+			{ error: structuredError("provider_auth_error", longReason) },
+			{ result: okMessage(b) },
+		],
+	);
+	const legacyState = makeState([legacy], legacyScript.delegate);
+	legacyState.onTarget = () => {
+		throw new Error("target UI destroyed");
+	};
+	const transitionReasons: string[] = [];
+	legacyState.onTransition = (transition) => {
+		transitionReasons.push(transition.reason);
+		throw new Error("transition UI destroyed");
+	};
+	legacyState.onManualRecovery = () => {
+		throw new Error("recovery UI destroyed");
+	};
+	const legacyOutcome = await consume(
+		runFailoverRequest(legacy, {}, {}, legacyState),
+	);
+	assert.equal(legacyOutcome.result.model, "m2");
+	assert.equal(legacyScript.calls.length, 2);
+	assert.equal(transitionReasons.length, 1);
+	assert.ok(transitionReasons[0]!.length <= 256);
+	assert.equal(transitionReasons[0]!.includes("hook-secret"), false);
+	const recoveryReason = legacyState.manualRecovery.get(
+		"status-hook-safety:a/m1",
+	);
+	assert.ok(recoveryReason);
+	assert.ok(recoveryReason!.length <= 256);
+	assert.equal(recoveryReason!.includes("hook-secret"), false);
+
+	const shared = await makeSharedState([a, b], { maxRetries: 0 });
+	const sharedGenerated = createGeneratedModel([a, b]);
+	sharedGenerated.id = "shared-hook-safety";
+	const sharedScript = scriptedDelegate(
+		new Map([
+			["a/m1", targetModel(a)],
+			["b/m2", targetModel(b)],
+		]),
+		[
+			{ status: 500, result: errorMessage(a, "HTTP error (500)") },
+			{ result: okMessage(b) },
+		],
+	);
+	const sharedState = makeState(
+		[sharedGenerated],
+		sharedScript.delegate,
+		shared,
+	);
+	sharedState.onTarget = () => {
+		throw new Error("shared target UI destroyed");
+	};
+	sharedState.onTransition = () => {
+		throw new Error("shared transition UI destroyed");
+	};
+	const sharedOutcome = await consume(
+		runFailoverRequest(sharedGenerated, {}, {}, sharedState),
+	);
+	assert.equal(sharedOutcome.result.model, "m2");
+	assert.equal(sharedScript.calls.length, 2);
+	const snapshot = await shared.snapshot();
+	assert.equal("lease" in snapshot.document.targets["a/m1"].runtime, false);
+	assert.equal("lease" in snapshot.document.targets["b/m2"].runtime, false);
+});
+
+test("tool execution errors remain in context for the target model", async () => {
+	const a = { provider: "a", id: "m1" };
+	const b = { provider: "b", id: "m2" };
+	const generated = createGeneratedModel([a, b]);
+	generated.id = "tool-error-terminal";
+	const context = {
+		messages: [
+			{ role: "assistant", content: [] },
+			{ role: "toolResult", isError: true },
+			{ role: "toolResult", isError: false },
+		],
+	};
+	const legacyScript = scriptedDelegate(
+		new Map([
+			["a/m1", targetModel(a)],
+			["b/m2", targetModel(b)],
+		]),
+		[{ result: okMessage(a) }, { result: okMessage(b) }],
+	);
+	const legacyState = makeState([generated], legacyScript.delegate);
+	const legacyOutcome = await consume(
+		runFailoverRequest(generated, context, {}, legacyState),
+	);
+	assert.equal(legacyOutcome.result.stopReason, "stop");
+	assert.equal(legacyOutcome.result.errorMessage, undefined);
+	assert.equal(legacyScript.calls.length, 1);
+	assert.equal(legacyState.manualRecovery.size, 0);
+	assert.equal(legacyState.cooldowns.size, 0);
+
+	const shared = await makeSharedState([a, b], { maxRetries: 0 });
+	const sharedScript = scriptedDelegate(
+		new Map([
+			["a/m1", targetModel(a)],
+			["b/m2", targetModel(b)],
+		]),
+		[{ result: okMessage(a) }, { result: okMessage(b) }],
+	);
+	const sharedState = makeState([generated], sharedScript.delegate, shared);
+	const sharedOutcome = await consume(
+		runFailoverRequest(generated, context, {}, sharedState),
+	);
+	assert.equal(sharedOutcome.result.stopReason, "stop");
+	assert.equal(sharedOutcome.result.errorMessage, undefined);
+	assert.equal(sharedScript.calls.length, 1);
+	assert.equal(
+		"lease" in (await shared.snapshot()).document.targets["a/m1"].runtime,
+		false,
+	);
+
+	const oldErrorContext = {
+		messages: [
+			{ role: "toolResult", isError: true },
+			{ role: "assistant", content: [] },
+		],
+	};
+	const cleanOutcome = await consume(
+		runFailoverRequest(generated, oldErrorContext, {}, legacyState),
+	);
+	assert.equal(cleanOutcome.result.stopReason, "stop");
+	assert.equal(legacyScript.calls.length, 2);
+});
+
+test("target-unavailable throws create manual recovery without retry or cooldown", async () => {
+	const a = { provider: "a", id: "m1" };
+	const legacy = createGeneratedModel([a]);
+	legacy.id = "target-unavailable-legacy";
+	legacy.maxRetries = 5;
+	let legacyCalls = 0;
+	const legacyDelegate: Delegate = {
+		resolveModel: (target) => targetModel(target),
+		complete: async (model) => {
+			legacyCalls++;
+			throw new Error(`Target unavailable: ${model.provider}/${model.id}`);
+		},
+	};
+	const legacyState = makeState([legacy], legacyDelegate);
+	const legacyOutcome = await consume(
+		runFailoverRequest(legacy, {}, {}, legacyState),
+	);
+	assert.equal(legacyOutcome.result.stopReason, "error");
+	assert.equal(legacyCalls, 1);
+	assert.equal(
+		legacyState.manualRecovery.get("target-unavailable-legacy:a/m1"),
+		"model unavailable",
+	);
+	assert.equal(legacyState.cooldowns.size, 0);
+	assert.equal(legacyState.cooldownLevels.size, 0);
+
+	const shared = await makeSharedState([a], { maxRetries: 5 });
+	const sharedGenerated = createGeneratedModel([a]);
+	sharedGenerated.id = "target-unavailable-shared";
+	let sharedCalls = 0;
+	const sharedDelegate: Delegate = {
+		resolveModel: (target) => targetModel(target),
+		complete: async (model) => {
+			sharedCalls++;
+			throw new Error(`Target unavailable: ${model.provider}/${model.id}`);
+		},
+	};
+	const sharedOutcome = await consume(
+		runFailoverRequest(
+			sharedGenerated,
+			{},
+			{},
+			makeState([sharedGenerated], sharedDelegate, shared),
+		),
+	);
+	assert.equal(sharedOutcome.result.stopReason, "error");
+	assert.equal(sharedCalls, 1);
+	const runtime = (await shared.snapshot()).document.targets["a/m1"].runtime;
+	assert.equal(runtime.manualRecovery?.reason, "model unavailable");
+	assert.equal(runtime.cooldownUntil, null);
+	assert.equal(runtime.nextEligibleAt, null);
+	assert.equal("lease" in runtime, false);
 });

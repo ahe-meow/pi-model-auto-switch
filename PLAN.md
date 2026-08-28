@@ -1,6 +1,8 @@
 # Failover Provider and Generated Models — Development Plan (Draft)
 
-**Status:** Draft updated with all review-round decisions. This document is the plan only; no source implementation starts before explicit user approval.
+> **Superseded:** This is a historical provider-migration plan, not the current implementation contract. Current behavior is documented in [README.md](README.md) and [DESIGN.md](DESIGN.md): v8 `getAgentDir()/model-failover.json` contains only generated model `id`/`name`/`enabled` and ordered chains; v1-v7 migration is shared-first and byte-preserving on failure; shared target settings and coordination use `~/.pi/agent/failover-state.json`; `models.json` is read-only.
+
+**Status:** Historical draft retained for design history. The implemented v8 architecture supersedes this plan; no source implementation should be started from the instructions below.
 
 Chinese review copy: [`PLAN.zh-CN.md`](PLAN.zh-CN.md)
 
@@ -38,7 +40,7 @@ The current main branch is a v5 global controller:
 
 - `src/config.ts` / `src/types.ts`: one ordered `models` chain, global policy, per-real-model request toggles, and per-real-model reasoning overrides.
 - `src/index.ts`: lifecycle failover state machine; it currently calls `pi.setModel()` and uses `pi.sendMessage()` for continuations.
-- `src/catalog.ts`: observes `ModelRegistry`; it does not register a provider or own `models.json`.
+- `src/catalog.ts`: uses model reference helpers independent of the extension-owned `ModelRuntime`; it does not register a provider or own `models.json`.
 - `src/tui.ts`: edits the one global chain and its policy.
 - Provider request hooks inject OpenAI-compatible parameters and currently synchronize Pi native thinking with `pi.setThinkingLevel()`.
 

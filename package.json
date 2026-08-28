@@ -12,8 +12,6 @@
   "main": "./src/index.ts",
   "files": [
     "src/",
-    "scripts/",
-    "patches/",
     "README.md",
     "package.json"
   ],
@@ -21,9 +19,6 @@
     "extensions": [
       "./src/index.ts"
     ]
-  },
-  "scripts": {
-    "patch:subagents": "node scripts/apply-pi-subagents-patch.mjs"
   },
   "engines": {
     "node": ">=22.19.0"
@@ -39,7 +34,7 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-coding-agent": ">=0.80.8",
     "@earendil-works/pi-tui": "*"
   },
   "peerDependenciesMeta": {

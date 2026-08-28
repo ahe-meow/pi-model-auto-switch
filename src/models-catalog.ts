@@ -101,7 +101,7 @@ function safeThinkingLevelMap(
 
 /** Build metadata that never exceeds the capabilities of any configured target. */
 export function buildFailoverCatalogModel(
-	model: GeneratedFailoverModel,
+	model: Pick<GeneratedFailoverModel, "id" | "name" | "enabled" | "chain">,
 	metadata: readonly TargetCatalogMetadata[] = [],
 ): FailoverCatalogModel {
 	const targets = model.chain.map((target) => metadataFor(target, metadata));
@@ -155,9 +155,7 @@ async function defaultAfterMalformed(): Promise<void> {
 	);
 }
 
-async function loadModelsJsonOnce(
-	path: string,
-): Promise<ModelsJsonLoadResult> {
+async function loadModelsJsonOnce(path: string): Promise<ModelsJsonLoadResult> {
 	const source = await readJsonSource(path, "models.json");
 	if (source.kind !== "parsed") return source;
 	const value = source.value;

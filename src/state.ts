@@ -12,6 +12,7 @@ const PERSISTENT_ERROR =
 const NETWORK_ERROR =
 	/\b(network|fetch failed|econnreset|econnrefused|enotfound|etimedout|timeout|timed out|socket|connection|dns|stream read error|provider api error|upstream error)\b/i;
 const API_ERROR_STATUS = /\b(?:HTTP|API)\s+error\s*\((\d{3})\)/i;
+const TARGET_UNAVAILABLE_ERROR = /^Target unavailable:\s+[^/\s]+\/\S+$/i;
 
 function statusFromMessage(message: string): number | undefined {
 	const match = message.match(API_ERROR_STATUS);
@@ -55,12 +56,13 @@ function providerCategoryFailure(
 }
 
 export function classifyFailure(input: FailureInput): FailureClassification {
-	if (input.toolError)
-		return { kind: "tool-failure", reason: "tool execution failure" };
 	if (input.timedOut)
 		return { kind: "no-progress", reason: "no-progress timeout" };
 	if (input.stopReason === "aborted")
 		return { kind: "cancelled", reason: "user cancellation" };
+
+	if (TARGET_UNAVAILABLE_ERROR.test(input.message ?? ""))
+		return { kind: "persistent", reason: "model unavailable" };
 
 	const message = (input.message ?? "").replace(/[_-]+/g, " ");
 	const status = input.status ?? statusFromMessage(message);

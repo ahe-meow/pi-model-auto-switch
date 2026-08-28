@@ -15,6 +15,18 @@ const SESSION_AFFINITY_HEADERS = new Set([
 	"x-session-id",
 ]);
 
+export type SessionAffinityFormat =
+	| "openai"
+	| "openai-nosession"
+	| "openrouter";
+
+/** The target compat fields used by failover request shaping. */
+export interface TargetCompatLike {
+	supportsLongCacheRetention?: boolean;
+	sendSessionAffinityHeaders?: boolean;
+	sessionAffinityFormat?: SessionAffinityFormat;
+}
+
 const CACHE_FIELDS = ["prompt_cache_key", "prompt_cache_retention"] as const;
 export type CacheField = (typeof CACHE_FIELDS)[number];
 
@@ -181,13 +193,63 @@ export function rejectedCacheFields(input: FailureInput): CacheField[] {
 
 export interface RequestParameterOptions {
 	api: string;
+	provider?: string;
+	baseUrl?: string;
 	toggles: ModelParameterToggles;
 	/** Already-derived session digest; undefined disables key/affinity injection. */
 	cacheKey?: string;
 	/** Cache fields remembered as rejected for this target/API. */
 	unsupported: ReadonlySet<CacheField>;
+	/** Target capabilities relevant to cache retention. */
+	compat?: Pick<TargetCompatLike, "supportsLongCacheRetention">;
+	/** Pi's explicit cache-retention preference, when one was supplied. */
+	cacheRetention?: "none" | "short" | "long";
+	/** An outer payload callback intentionally removed native retention. */
+	retentionRemovedByOuter?: boolean;
 	/** Mapped reasoning value; undefined leaves payload reasoning untouched. */
 	reasoningEffort?: string;
+}
+
+function isOpenRouterTarget(
+	provider: string | undefined,
+	baseUrl: string | undefined,
+): boolean {
+	return (
+		provider === "openrouter" || Boolean(baseUrl?.includes("openrouter.ai"))
+	);
+}
+
+function completionsDefaultToShortRetention(
+	provider: string | undefined,
+	baseUrl: string | undefined,
+): boolean {
+	return (
+		provider === "together" ||
+		Boolean(baseUrl?.includes("api.together.ai")) ||
+		Boolean(baseUrl?.includes("api.together.xyz")) ||
+		provider === "cloudflare-workers-ai" ||
+		Boolean(baseUrl?.includes("api.cloudflare.com")) ||
+		provider === "cloudflare-ai-gateway" ||
+		Boolean(baseUrl?.includes("gateway.ai.cloudflare.com")) ||
+		provider === "nvidia" ||
+		Boolean(baseUrl?.includes("integrate.api.nvidia.com")) ||
+		provider === "ant-ling" ||
+		Boolean(baseUrl?.includes("api.ant-ling.com"))
+	);
+}
+
+function supportsLongCacheRetention(
+	options: Pick<
+		RequestParameterOptions,
+		"api" | "provider" | "baseUrl" | "compat"
+	>,
+): boolean {
+	const explicit = options.compat?.supportsLongCacheRetention;
+	if (explicit !== undefined) return explicit;
+	if (options.api === "azure-openai-responses") return false;
+	if (options.api === "openai-completions")
+		return !completionsDefaultToShortRetention(options.provider, options.baseUrl);
+	return true;
 }
 
 /** Apply the passive parameter toggles to an OpenAI-compatible request payload. */
@@ -196,15 +258,30 @@ export function applyRequestParameters(
 	options: RequestParameterOptions,
 ): void {
 	if (!isOpenAIRequestApi(options.api) || !isRecord(payload)) return;
-	if (options.toggles.promptCacheKey) {
-		if (options.unsupported.has("prompt_cache_key"))
-			Reflect.deleteProperty(payload, "prompt_cache_key");
-		else if (options.cacheKey) payload.prompt_cache_key = options.cacheKey;
-	}
-	if (options.toggles.promptCacheRetention) {
-		if (options.unsupported.has("prompt_cache_retention"))
-			Reflect.deleteProperty(payload, "prompt_cache_retention");
-		else payload.prompt_cache_retention = "24h";
+	if (options.cacheRetention === "none") {
+		Reflect.deleteProperty(payload, "prompt_cache_key");
+		Reflect.deleteProperty(payload, "prompt_cache_retention");
+	} else {
+		if (options.toggles.promptCacheKey) {
+			if (options.unsupported.has("prompt_cache_key"))
+				Reflect.deleteProperty(payload, "prompt_cache_key");
+			else if (options.cacheKey) payload.prompt_cache_key = options.cacheKey;
+		}
+		if (options.toggles.promptCacheRetention) {
+			if (
+				options.unsupported.has("prompt_cache_retention") ||
+				!supportsLongCacheRetention(options)
+			) {
+				Reflect.deleteProperty(payload, "prompt_cache_retention");
+			} else if (
+				!options.retentionRemovedByOuter &&
+				options.cacheRetention === "long" &&
+				(!Object.hasOwn(payload, "prompt_cache_retention") ||
+					payload.prompt_cache_retention === undefined)
+			) {
+				payload.prompt_cache_retention = "24h";
+			}
+		}
 	}
 	if (!options.toggles.reasoningEffort) return;
 	if (options.reasoningEffort === undefined) return;
@@ -220,17 +297,87 @@ export function applyRequestParameters(
 export interface SessionAffinityOptions {
 	toggles: Pick<ModelParameterToggles, "sessionAffinity">;
 	cacheKey?: string;
+	api?: string;
+	provider?: string;
+	baseUrl?: string;
+	cacheRetention?: "none" | "short" | "long";
+	compat?: Pick<
+		TargetCompatLike,
+		"sendSessionAffinityHeaders" | "sessionAffinityFormat"
+	>;
 }
 
-/** Rewrite session-affinity headers in place, preserving original spelling/case. */
+function removeSessionAffinityHeaders(
+	headers: Record<string, string | null>,
+): Map<string, string> {
+	const spellings = new Map<string, string>();
+	for (const name of Object.keys(headers)) {
+		const canonical = name.toLowerCase();
+		if (!SESSION_AFFINITY_HEADERS.has(canonical)) continue;
+		if (!spellings.has(canonical)) spellings.set(canonical, name);
+		delete headers[name];
+	}
+	return spellings;
+}
+
+function affinityHeaderNames(
+	api: string,
+	format: SessionAffinityFormat,
+): string[] | undefined {
+	if (!isOpenAIRequestApi(api)) return undefined;
+	if (api === "azure-openai-responses") return undefined;
+	if (format === "openrouter") return ["x-session-id"];
+	if (format === "openai-nosession")
+		return api === "openai-completions"
+			? ["x-client-request-id", "x-session-affinity"]
+			: ["x-client-request-id"];
+	if (api === "openai-completions")
+		return ["session_id", "x-client-request-id", "x-session-affinity"];
+	return ["session_id", "x-client-request-id"];
+}
+
+function sessionAffinity(options: SessionAffinityOptions & { api: string }): {
+	enabled: boolean;
+	format?: SessionAffinityFormat;
+} {
+	if (options.api === "azure-openai-responses") return { enabled: false };
+	const format =
+		options.compat?.sessionAffinityFormat ??
+		(isOpenRouterTarget(options.provider, options.baseUrl)
+			? "openrouter"
+			: "openai");
+	const cachingEnabled = options.cacheRetention !== "none";
+	if (options.api === "openai-responses")
+		return { enabled: cachingEnabled, format };
+	if (options.api === "openai-completions")
+		return {
+			enabled:
+				cachingEnabled && options.compat?.sendSessionAffinityHeaders === true,
+			format,
+		};
+	return { enabled: false };
+}
+
+/** Add final provider-specific affinity headers without transmitting plaintext IDs. */
 export function replaceSessionAffinityHeaders(
 	headers: Record<string, string | null>,
 	options: SessionAffinityOptions,
 ): void {
-	if (!options.toggles.sessionAffinity) return;
-	if (!options.cacheKey) return;
-	for (const name of Object.keys(headers)) {
-		if (SESSION_AFFINITY_HEADERS.has(name.toLowerCase()))
-			headers[name] = options.cacheKey;
+	if (!options.toggles.sessionAffinity || !options.cacheKey) return;
+	const cacheKey = options.cacheKey;
+	if (options.api && !isOpenAIRequestApi(options.api)) return;
+	const spellings = removeSessionAffinityHeaders(headers);
+	const setAffinityHeader = (name: string, value: string | null) => {
+		headers[spellings.get(name) ?? name] = value;
+	};
+	if (!options.api) {
+		for (const [name] of spellings) setAffinityHeader(name, cacheKey);
+		return;
 	}
+	const resolved = sessionAffinity({ ...options, api: options.api });
+	for (const name of SESSION_AFFINITY_HEADERS) setAffinityHeader(name, null);
+	if (!resolved.enabled || !resolved.format) return;
+	const names = affinityHeaderNames(options.api, resolved.format);
+	if (names === undefined) return;
+	for (const name of names) setAffinityHeader(name, cacheKey);
 }

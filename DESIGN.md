@@ -1,26 +1,25 @@
 # Pi Model Failover Extension Design
 
-Status: implemented for Pi `0.84.x`; the extension, TUI, persistence, tests, and user documentation are present.
+Status: implemented for Pi `0.84.x`; the extension, TUI, v8 persistence, shared coordination, tests, and user documentation are present. The current architecture is documented here and in the README; the historical provider migration plan is superseded.
 
 ## Goals
 
 - Provide a global-first Pi extension with a TUI entry point at `/failover`.
-- Keep automatic failover enabled by default while allowing an explicit user-controlled pause and restore.
-- Maintain one explicitly authorized ordered model list; discovery only supplies candidates for the user to add.
+- Keep generated v8 configuration limited to model identity, enabled state, and ordered real-target chains.
+- Share global real-target enablement and automatic failover coordination across the parent, child/subagent, and independent same-user processes, while keeping request policy in chain scopes with inheritable target overrides.
 - Let users select, reorder, add, and remove authenticated models without changing Pi's global catalog or copying credentials.
-- Let Pi's native retry behavior run first for provider failures that Pi recognizes as transient.
-- Switch models only after Pi has settled the request, with bounded traversal and clear status notifications.
-- Persist only extension-owned settings and model references in the Pi agent directory.
+- Let Pi's recognized provider retries settle before applying extension policy.
+- Route provider failures with bounded exact-target retries and expose transitions through the Footer and current-session history.
 
 ## Non-goals
 
-- Replacing or configuring Pi's native retry count, backoff, or provider retry implementation.
-- Editing `getAgentDir()/models.json`, currently `/root/.pi/agent/models.json`, or copying API keys and tokens into extension storage.
+- Replacing or configuring Pi's provider retry count, backoff, or retry implementation.
+- Editing `models.json` or copying API keys and tokens into extension storage.
 - Compatibility filtering or provider capability inference when building the model list.
-- Retrying user cancellation (`Esc` or `Ctrl+C`) or tool execution failures.
-- Guaranteeing duplicate-free continuation after a provider failure that followed tool calls.
+- Classifying Pi-owned tool execution failures from request history.
+- Updating Pi's own thinking setting; reasoning control is applied only at the real-provider request boundary.
 - Running a test request as part of direct restore.
-- Retrying indefinitely or revisiting a model during one user request.
+- Retrying indefinitely or ignoring a target's shared eligibility and cooldown.
 
 ## Data Model
 
@@ -32,213 +31,210 @@ The extension-owned global configuration is stored at:
 getAgentDir()/model-failover.json
 ```
 
-The persisted shape is intentionally small and contains no credentials:
+The first-run file is empty and contains no automatically selected current model:
 
 ```json
 {
-  "version": 7,
-  "models": [
-    {
-      "id": "default",
-      "name": "Default Failover",
-      "enabled": true,
-      "chain": [
-        { "provider": "<provider>", "id": "<model-id>" }
-      ],
-      "reasoningEffort": "medium",
-      "errorHandlingMode": "smart",
-      "maxRetries": 1,
-      "noProgressTimeoutSeconds": 90,
-      "modelParameters": {},
-      "targetOverrides": {},
-      "manualRecovery": {}
-    }
-  ]
+  "version": 8,
+  "models": []
 }
 ```
 
-- `version` is the generated failover schema version `7`; generated v6 and legacy v1-v5 inputs migrate to it.
-- `enabled` defaults to `true` for a new configuration.
-- `models` is the authoritative ordered failover authorization. A model reference is identified by provider and model id and contains no authentication material.
-- `reasoningEffort` is the global fallback for best-effort OpenAI-compatible reasoning parameters and Pi's native thinking level. `modelReasoningEfforts` overrides it per configured `provider/id`; `inherit` removes an override. The selected level is inherited by child sessions and displayed by Pi's footer.
-- The cooldown ladder is fixed and always enabled: 10, 20, 40, 60, 90, 180, and 360 minutes. It advances once per user request after a terminal cooldown-class failure and same-target retry exhaustion, and is reset by success, `Reset cooldown`, or `Restore`.
-- `noProgressTimeoutSeconds` defaults to `90`. Valid user values are `15` through `900`, or `0` to disable the extension-owned no-progress timeout.
-- `paused` records a manual `/model` or Ctrl+P choice until explicit TUI restore.
-- `manualRecovery` records non-secret permanent failure reasons for balance/quota/usage, `401`/`403`, and `404`; these statuses survive Pi restarts until restore clears them.
+A user-created generated model contains exactly `id`, `name`, `enabled`, and `chain`; each chain entry contains only `provider` and `id`.
 
-The configuration is extension-owned. Pi's global models catalog remains the source for catalog discovery and is read-only to this extension.
+- `version` is the generated failover schema version `8`. v1-v7 inputs migrate shared-first; a failed migration preserves the source bytes and leaves automation blocked.
+- `enabled` controls whether a user-created generated chain is active.
+- `models` is the authoritative ordered failover configuration. First run writes an empty array; discovery never inserts the current model.
+- Target settings and coordination are not stored in this file. Pi's `models.json` remains read-only to this extension.
 
-### Runtime state
+### Shared target state and chain scopes
 
-Runtime state is held for the active process/request and is not persisted as credentials or request history. It includes:
+Global target state and chain scopes are stored at:
 
-- automation mode: enabled, paused, or disabled;
-- the active model and the source/target/reason for the latest transition;
-- the current request's attempted model references;
-- at most one same-model continuation used by the unknown-error/no-progress path;
-- per-target cooldown expiry and the next ladder rung for transient `429`, network, and `5xx` failures; and
-- runtime-only cache-field incompatibilities keyed by provider, model, and API; and
-- whether the current request is waiting for Pi's native retry handling, settled, switching, or exhausted.
+```text
+~/.pi/agent/failover-state.json
+```
 
-Persistent non-secret recovery state is kept in the extension configuration. Cooldown timers, ladder levels, and request attempts remain process/request state; permanent recovery reasons and the manual pause flag survive restart.
+This is a fixed user-global path and does not follow `PI_CODING_AGENT_DIR`. The parent, child/subagent, and independent same-user processes use the same state. It contains no credentials, messages, or Session IDs.
 
-A request's attempted set resets at the start of each user request. Before a new request runs, enabled automation selects the first configured model that is not in manual recovery and whose cooldown has expired; this lets recovered models re-enter rotation without waiting for the current model to fail. A model is not selected again during that request after it has been attempted, even if its cooldown has elapsed. Manual model/cycle selections pause automation, while an explicit Restore selection is honored for the next request.
+For each exact real `provider/model` target, the global record is authoritative for:
+
+- `enabled`;
+- next eligibility (`nextEligibleAt`), cooldown rung, and cumulative cooldown;
+- consecutive automatic failures and persistent manual recovery. Legacy persisted runtime `lease` fields are compatibility input only and are removed on the next write; they do not represent current coordination.
+
+Each generated model also has a chain scope keyed by `encodeURIComponent(absolute agent directory):generated model id`. The scope contains chain policy for error behavior, `maxRetries`, no-progress timeout, reasoning effort, and model-parameter toggles, plus one target override for each chain member. On first registration, scope policy is initialized from the first real target's policy. Every target override is created with all fields set to `inherit`. A target attempt reads the target's global `enabled` value and resolves effective policy by merging scope settings with the selected target override; an explicit override replaces `inherit`.
+
+Before a target request, an active `nextEligibleAt` deadline causes an immediate skip to the next chain target. Multiple Pi sessions and adapters may concurrently use the same real target. CAS and file locks coordinate cross-process writes to shared state; they do not reserve a target. Success or reset clears consecutive-failure and cooldown state. Persistent failure manual recovery is global for the exact real target. Policy edits are scope-local; global enablement, reset, and runtime coordination are target-global.
+
+Local request progress, UI state, and compatibility memory remain process-local. Transition history is local to the selected Pi session and persists as namespaced custom entries, newest first and bounded to 100; shared target eligibility and recovery remain user-global.
 
 ### Catalog inputs and ordering
 
-At startup and whenever `/failover` opens, the extension observes Pi's model registry. `getAvailable()` supplies authenticated candidates for Add; refresh and snapshot failures are reported separately from a successful empty result.
+Each Pi session gets its own extension-owned `ModelRuntime`, and runtime behavior does not depend on `session_start`. Stable provider callbacks capture transitions before provider registration without attempting session persistence. On `session_start`, the extension replaces in-memory history with validated custom entries from the selected session, then enables custom-entry persistence only when that session has a file and installs the current UI/Footer context. The runtime reads `models.json` and authentication state but never writes `models.json`.
 
-On first setup, only the current model is copied into the authorized list. After that, the persisted list and its order are authoritative: discovery cannot add, remove, reorder, or rewrite authorization. Newly authenticated models remain available to add explicitly. The extension applies no image/context/capability inference.
+At `/failover` open, the extension refreshes its owned `ModelRuntime` and observes its model snapshot. `getAvailableSnapshot()` supplies authenticated candidates for Add; refresh and snapshot failures are reported separately from a successful empty result.
+
+First setup leaves the authorized list empty. The user creates a generated model and explicitly adds authenticated real targets. After that, the persisted list and its order are authoritative: discovery cannot add, remove, reorder, or rewrite authorization. Newly authenticated models remain available to add explicitly. The extension applies no image/context/capability inference.
 
 ### OpenAI-compatible request boundary
 
-For `openai-responses`, `openai-completions`, and `azure-openai-responses`, request preparation injects the API-appropriate reasoning effort, a SHA-256 `prompt_cache_key`, and best-effort 24-hour cache retention. Recognized session-affinity headers, including `x-session-id`, are replaced in place with the same digest; plaintext Pi Session IDs are not transmitted by this extension.
+Pi adapters build their native payload and await async `onPayload`; failover awaits the outer callback and then applies its cache digest. Responses, Chat Completions, and Azure Responses use their API-specific reasoning fields and headers. OpenRouter is detected by provider or base URL.
 
-Each configured model can choose its own reasoning level or inherit the global fallback. The settings page's `Model parameters` entry opens a per-model page with a reasoning-level selector followed by four switches: `prompt_cache_key`, `prompt_cache_retention`, `reasoning effort`, and `session headers` (the affinity-header digest). Turning a switch off means the extension does not send that parameter for the model and leaves any Pi-owned payload fields untouched; turning it on restores the default. Settings persist under `modelParameters` and `modelReasoningEfforts`, keyed by `provider/id` in the versioned config (schema v5), defaulting to all-on/inherit for models without entries, and are pruned when the model is removed. Because negotiation only runs for fields the extension actually sent, a disabled parameter is never recorded as provider-rejected.
+For these APIs, the extension uses `reasoning.effort` for Responses (`off` maps to `none`) and `reasoning_effort` for Chat Completions. This mapping changes only the selected real-provider request; it does not update Pi's own thinking setting. It derives `prompt_cache_key` as SHA-256 of `pi-model-failover/prompt-cache-key/v1:` plus the Pi Session ID, represented as 64 lower-case hexadecimal characters. It never transmits a raw Session ID through failover headers.
 
-A structured HTTP 400/422 request-validation JSON error is eligible when its `code`, `type`, and `param` values identify an unknown or unsupported known cache field: `code` is `unknown_field`, `unknown_parameter`, `unsupported_field`, or `unsupported_parameter`; `type` is a request-validation type such as `invalid_request_error`; and `param` is `prompt_cache_key` or `prompt_cache_retention`. The extension records only that field for the active provider/model/API and sends one same-model compatibility continuation without consuming `maxRetries`. It actively deletes remembered rejected fields, including from reused payloads, while preserving the other cache field, reasoning, and unrelated data. A legacy payload with no `param` remains eligible only when its validation `type` and known field token are present; its human-language message is not matched as a fixed phrase. `401`/`403` authentication handling wins, repeated rejection of an already omitted field falls through to normal policy, and other targets probe independently. Non-OpenAI APIs are unchanged.
+The outer virtual request's `apiKey`, `env`, `headers`, and header transform are intentionally dropped before delegation. The selected target's extension-owned `ModelRuntime` supplies target authentication and native headers, preventing virtual-provider credentials from overriding real-target credentials.
+
+`prompt_cache_retention: "24h"` is requested only when explicit long retention/native support and target compatibility allow it. An explicit `cacheRetention:none` removes both cache key and retention and adds no affinity. If the outer `pi-cache-optimizer` strips the fields, that stripping wins. Recognized session-affinity headers are replaced in place with the same digest while preserving header spelling.
+
+The four target toggles are independent and passive: prompt-cache key, prompt-cache retention, reasoning effort, and session headers. A disabled toggle leaves Pi and outer-hook values unchanged. Structured HTTP 400/422 cache-field negotiation is local to the exact target and API; it removes only the rejected field, preserves unrelated data, and is free and bounded separately from the normal retry budget. Non-OpenAI APIs are unchanged.
 
 ## Event and Retry State Machine
 
-Pi remains the owner of provider-native retries. The extension observes the request lifecycle and owns only the additional decisions below.
+Pi remains the owner of provider-native retries. The extension observes the request lifecycle and owns only per-request target attempts plus shared failure accounting.
 
 ```text
 READY
-  -> REQUESTING
-  -> PI_RETRYING (Pi-owned, when Pi recognizes a transient failure)
+  -> REQUEST_TARGET
+
+REQUEST_TARGET
+  -> REQUESTING              target is globally enabled and eligible
+  -> SKIP_AND_ADVANCE        disabled, manual recovery, cooldown, or retry delay
+  -> BLOCKED                 shared coordination cannot safely read or write
+
+REQUESTING
+  -> PI_RETRYING             Pi-owned, when Pi recognizes a provider retry
   -> SETTLING
-  -> SUCCEEDED
 
 SETTLING
-  -> CANCELLED              user presses Esc or Ctrl+C
-  -> TOOL_FAILED            tool execution failure
-  -> CLASSIFY_FAILURE       provider failure or extension timeout
+  -> SUCCEEDED
+  -> CANCELLED               outer request is aborted; stop routing
+  -> CLASSIFY_FAILURE        provider/delegate failure or extension timeout
 
 CLASSIFY_FAILURE
-  -> CONTINUING_ONCE         unknown provider error or no-progress timeout
-  -> COOLDOWN_AND_ADVANCE    429, network, or 5xx after native retries
-  -> PERSISTENT_AND_ADVANCE  balance/quota/usage, 401/403, or 404
-  -> TERMINAL_FAILURE        no-switch terminal condition
+  -> COMPATIBILITY_RETRY     bounded cache-field negotiation; normal budget unchanged
+  -> MANUAL_RECOVERY_ADVANCE persistent/auth/unavailable target
+  -> RETRY_TARGET             retry-eligible automatic failure
+  -> TERMINAL_FAILURE        non-automatic provider result
 
-CONTINUING_ONCE
-  -> SUCCEEDED
-  -> COOLDOWN_AND_ADVANCE   continuation fails and the next model is eligible
-  -> EXHAUSTED               no unattempted model remains
+RETRY_TARGET
+  -> REQUESTING              same-target budget remains
+  -> COOLDOWN_AND_ADVANCE    target budget exhausted
 
-COOLDOWN_AND_ADVANCE / PERSISTENT_AND_ADVANCE
-  -> SWITCHING
-  -> REQUESTING              best-effort continuation on the target model
-  -> EXHAUSTED               no unattempted model remains
+SKIP_AND_ADVANCE / MANUAL_RECOVERY_ADVANCE / COOLDOWN_AND_ADVANCE
+  -> REQUEST_TARGET
+  -> EXHAUSTED               no configured target remains
 ```
 
 Operational rules:
 
-1. A user request begins on the current model when automation is enabled and not paused.
-2. The extension waits for Pi's native retry handling to settle before deciding whether to switch. It does not run a competing native retry loop.
-3. A recognized transient failure is therefore first handled by Pi. If it remains a failure, the extension applies the classification table below; a terminal cooldown-class failure arms the current ladder rung and advances the next rung by one.
-4. Unknown provider failures and extension-owned no-progress timeouts receive one best-effort continuation on the same model after native retries. A failed continuation advances to the next model.
-5. For a switch, the extension records the source model, target model, and reason, then asks Pi to continue on the target through the supported extension path.
-6. A model that has been attempted is not revisited in the same request. The request traverses the configured list at most once and cannot create an infinite loop.
-7. If no candidate remains, the request ends in `EXHAUSTED` and the TUI reports a failure summary.
-8. User cancellation and tool execution failure end the automatic path without switching.
+1. An enabled generated chain consults global target enablement, `nextEligibleAt`, manual recovery, cooldown, and retry delay before each target attempt.
+2. Each request resolves the effective chain-scope policy merged with the selected target override. Multiple Pi sessions and adapters may attempt the same real target concurrently; shared CAS/file-lock writes coordinate their persisted state without reserving a target.
+3. Pi handles any provider retry it recognizes before the extension classifies the settled result.
+4. `maxRetries=N` means exactly N same-target retries after the initial attempt. Backoff is 1s, 2s, 4s, then doubles up to 60s.
+5. Every retry-eligible automatic failure uses that effective target budget. There is no separate one-attempt allowance for unknown errors or no-progress timeouts.
+6. Exhausting one target's budget updates only that exact real target and advances through the configured chain. Other targets retain independent failure, cooldown, and eligibility state.
+7. User cancellation terminates the current request and stops routing; it does not change shared target state. Pi-owned tool execution happens outside this provider state machine.
+8. If no eligible target remains, the request ends in `EXHAUSTED`. If every target genuinely fails, each may independently enter cooldown during the traversal.
 
-The extension-owned no-progress timer is `90` seconds by default, can be edited to `15` through `900` seconds, and is disabled by `0`. Disabling this timer does not disable classification of provider errors.
+The no-progress timeout is a policy field in the chain scope and target override. Disabling the timeout does not disable classification of provider errors.
 
 ## Error Classification
 
-| Condition | Native Pi handling | Extension action after settlement | Same-model retry | Chain action |
+| Condition | Pi handling before extension policy | Shared target action | Same-target action | Chain action |
 | --- | --- | --- | --- | --- |
-| Recognized transient provider failure | Pi retries using Pi-controlled count/backoff | Wait for Pi to settle, then classify the final outcome | No extension-native retry loop | Continue according to the final classification |
-| Balance, quota, or usage failure | No extension retry | Mark persistent manual recovery | No | Advance once to the next unattempted model when available |
-| HTTP `401` or `403` | No extension retry | Mark persistent manual recovery | No | Advance once to the next unattempted model when available |
-| HTTP `404` | No extension retry | Mark persistent manual recovery | No | Advance once to the next unattempted model when available |
-| HTTP `429` | Pi handles recognized native retries first | Arm the current per-target cooldown rung: 10 -> 20 -> 40 -> 60 -> 90 -> 180 -> 360 minutes, capped at 6 hours | No after native retries | Advance to the next eligible unattempted model |
-| Network failure | Pi handles recognized native retries first | Arm the current per-target cooldown rung: 10 -> 20 -> 40 -> 60 -> 90 -> 180 -> 360 minutes, capped at 6 hours | No after native retries | Advance to the next eligible unattempted model |
-| HTTP `5xx` | Pi handles recognized native retries first | Arm the current per-target cooldown rung: 10 -> 20 -> 40 -> 60 -> 90 -> 180 -> 360 minutes, capped at 6 hours | No after native retries | Advance to the next eligible unattempted model |
-| Unknown provider error | Pi handles any recognized native retries first | Use the one best-effort continuation allowance | Once | Switch after the continuation fails |
-| No-progress timeout | Extension-owned timer | Use the one best-effort continuation allowance | Once | Switch after the continuation fails |
-| User presses `Esc` or `Ctrl+C` | User cancellation | Stop automatic failover | No | Never switch |
-| Tool execution failure | Tool failure | Stop automatic failover | No | Never switch |
+| Structured HTTP `400`/`422` rejecting an injected cache field | Adapter returns the settled validation error | Remember only the rejected field for the exact target/API | Bounded compatibility retry; normal budget unchanged | Stay on the target while negotiation remains valid |
+| Balance, quota, usage, HTTP `401`/`403`/`404`, or target unavailable | Any Pi handling has settled | Set persistent manual recovery | None | Advance to the next eligible target |
+| HTTP `429`, network failure, or HTTP `5xx` | Pi performs recognized retries first | Count the automatic failure; arm cooldown only after the effective budget is exhausted | Retry exactly up to `maxRetries` unless mode is `switch` | Advance after target cooldown settlement |
+| Unknown provider/delegate failure | Pi performs any recognized retries first | Same exact-target failure accounting | Use the effective scoped budget | Advance after target cooldown settlement |
+| No-progress timeout | Extension aborts the bounded target attempt | Same exact-target failure accounting | Use the effective scoped budget | Advance after target cooldown settlement |
+| User cancellation | Outer abort wins | No shared target-state mutation or failure update | None | Stop immediately |
+| Historical `toolResult` with `isError` | Remains ordinary request context | No inferred failure or settlement | None | Continue the provider request normally |
+| Pi tool execution failure | Happens after provider output, outside this router | Not classified by the extension | Not applicable | Not applicable |
 
-A persistent classification describes the failed model and the required eventual manual recovery; it does not authorize repeated attempts on that model. Provider failure after tool calls can repeat side effects during a best-effort continuation. This is an accepted, documented limitation rather than a duplicate-free execution guarantee.
+A persistent classification describes the failed exact target and its required manual recovery; it does not consume the retry budget or advance the cooldown ladder. Retry-eligible failures use the request-time effective scope/override settings. A historical tool result is never converted into a synthetic terminal response. Delegate throws, transport errors, request timeouts, and shared-settlement failures remain provider-path failures. Error text is bounded and sanitized before it reaches terminal output, callbacks, Footer/history, or persisted shared state.
 
 ## TUI Behavior
 
-`/failover` opens the global failover configuration and status view. Opening it refreshes catalog data; the same refresh also occurs at extension startup.
+`/failover` opens the global failover configuration and status view. Opening it refreshes catalog data. Runtime failover does not depend on `session_start`; that hook restores the selected session's bounded transition history, activates its UI/Footer context, and enables custom-entry persistence for persisted sessions.
 
 The TUI shows:
 
-- the current model;
-- whether automation is enabled, paused, or disabled;
-- the ordered model list;
-- cooldown and persistent manual-recovery status;
-- the configured no-progress timeout;
-- the model-level `Reset cooldown` action; and
-- the latest failover source, target, and reason.
+- the current model and enabled chain state;
+- the ordered model chains;
+- shared coordination health;
+- `nextEligibleAt`, consecutive failures, retry, cooldown, manual-recovery, and cumulative-cooldown state; and
+- the latest source, target, reason, and effective reasoning value.
 
-The model list renders a 20-row viewport. Arrow navigation changes the selection and scrolls the viewport instead of rendering every configured model on each keypress.
+All lists use a 20-row viewport: the main chain list, each detail target chain, and each add-target candidate list. Arrow navigation changes the selection and shows the visible range.
 
-The TUI allows the user to select, reorder, add, and remove models. TUI write actions execute serially so rapid keypresses operate on the latest ordered list. Configuration changes auto-save to `getAgentDir()/model-failover.json`.
+The TUI allows the user to select, reorder, add, and remove chain targets. From chain detail, `Enter` opens target override settings for the selected target; `t` opens separate `Chain Settings: generated-model-id`; `p` is inert. Target override fields are error behavior, max retries, no-progress timeout, reasoning effort, and four independent model-parameter toggles, each of which can be `inherit`. In chain detail, `e` toggles global enablement for the selected real target; in the main list, `e` toggles generated-chain enablement. TUI write actions execute serially so rapid keypresses operate on the latest ordered list. Chain changes auto-save to `getAgentDir()/model-failover.json`; scope and override changes auto-save to the fixed shared state file.
 
-Notifications are emitted for each automatic transition and include:
+The Footer omits the `Failover:` prefix and shows the active real target plus the mapped reasoning value. A target switch updates the Footer and current-session history with source, target, and sanitized reason. No separate transition popup is emitted. Chain exhaustion is returned as a terminal failure summary containing attempted targets and safe reasons.
 
-- source model;
-- target model; and
-- reason, such as cooldown, persistent provider failure, unknown error, or no-progress timeout.
-
-When the list is exhausted, the TUI shows a failure summary containing the attempted chain and the relevant reasons/statuses.
-
-A manual model choice through `/model` or `Ctrl+P` pauses automation. Automatic switching stays paused until the user explicitly chooses the TUI restore action. Direct restore changes the selected model/mode but does not run a test request.
+Reset and recovery actions operate on shared target state. Direct restore does not run a test request.
 
 ## Persistence and Security
 
-- Read `models.json` and `ModelRegistry` data; never write Pi's catalog.
-- Classify configuration as missing, loaded, or blocked. Malformed, semantically invalid, unreadable, and future-version files are preserved; blocked configuration disables automation until the user repairs it and explicitly reopens `/failover`.
-- Preserve authorized order and compatible settings when migrating supported older versions.
-- Serialize every authorized write with an adjacent exclusive lock, re-read and compare the retained source revision under that lock, flush a same-directory temporary file, then atomically rename it. A revision mismatch conflicts without touching newer bytes.
-- Never delete an existing lock automatically; timeout fails closed with manual recovery guidance. Cleanup removes only this invocation's owned lock and successfully created temporary file.
-- Persist provider/model references, the manual pause flag, and permanent recovery reasons. API keys, tokens, and other credentials remain in Pi's existing authentication/configuration systems.
-- Keep request attempts, transient cooldown timestamps, cooldown ladder levels, and cache capability observations runtime-owned.
+- Read `models.json` through the extension-owned `ModelRuntime`; never write Pi's catalog directly.
+- Keep v8 `model-failover.json` limited to generated model identity, enabled state, and ordered chains. Malformed, semantically invalid, unreadable, and future-version files are preserved; blocked configuration disables automation until the user repairs it and explicitly reopens `/failover`.
+- Migrate v1-v7 inputs shared-first. A failed registration, shared-state write, source revision check, or generated-config write preserves the legacy source bytes and blocks routing and editing.
+- Serialize authorized config writes with an adjacent exclusive filesystem lock, re-read and compare the retained source revision under that lock, flush a same-directory temporary file, then atomically rename it. A revision mismatch conflicts without touching newer bytes.
+- Never delete an existing lock automatically; timeout fails closed with manual recovery guidance. `releaseOwnedLock` removes only this invocation's owned filesystem lock; temporary-file cleanup removes only successfully created files.
+- Store global real-target enablement and runtime coordination plus chain scopes and target overrides at the fixed `~/.pi/agent/failover-state.json` path, regardless of `PI_CODING_AGENT_DIR`.
+- Treat malformed, unreadable, locked, write-failed, or compare-and-swap-exhausted shared state as unavailable. Target attempts and all mutations return a coordination failure; provider routing and TUI writes remain blocked until a verified read/write check restores shared status.
+- Treat scope registration and target references as configuration relationships only; removing a registration only changes configuration relationships and does not alter other target runtime records.
+- Keep credentials, messages, and raw Session IDs out of shared and generated state. Target authentication comes from the selected target runtime, not outer virtual request credentials.
+- Keep cache negotiation capability memory local to the exact target and API. Redact credential material, strip C0/C1 terminal controls from provider text, and reject malformed/control-bearing session-history entries.
 
 ## Known Pi Limitations
 
-Pi has no public exact API for retrying the current turn. Any extension continuation, whether after a same-model continuation allowance or after switching models, is therefore best-effort through the available extension lifecycle/model-selection behavior.
+Pi controls the retry count and backoff inside its real-provider adapters. The extension observes only the settled provider outcome and then applies its separate scoped budget.
 
-A continuation may duplicate tool calls or other side effects when the provider failed after tool execution. The extension must surface this limitation in project documentation and must not promise duplicate-free continuation. Pi's native retry count and backoff remain Pi-controlled.
+Routing stays inside one virtual provider request and reuses the request context supplied by Pi; no message-injection API is involved. Tool execution occurs after a successful provider result and is therefore not visible to this provider classifier. Historical tool results remain context, not control signals.
+
+Reasoning effort is mapped into supported real-provider request fields and reported by the extension Footer/history. The extension does not alter Pi's own thinking setting.
+
+Transition history is bounded to 100 entries for the selected session. Persisted sessions restore validated namespaced custom entries; ephemeral sessions keep history only in memory. Live provider/network behavior and visual terminal interaction still require verification in a Pi session.
 
 ## Implementation Phases
 
-1. **Global integration and discovery**: register the global extension and `/failover`; observe the catalog and `ModelRegistry`; seed first-run authorization with only the current model.
-2. **Configuration and TUI**: classify config loads, preserve blocked files, serialize revision-checked atomic writes, and implement list editing, status display, settings, and restore/pause behavior.
-3. **Lifecycle and request compatibility**: observe settlement and negotiate rejected extension-injected cache fields before normal failover policy.
-4. **Failover execution**: enforce configurable retry policy, the fixed per-target cooldown ladder, bounded traversal, transition notifications, and exhaustion summaries.
-5. **Verification**: test configuration safety, authorization boundaries, request-field negotiation, session hashing, persistence, TUI behavior, each error class, and no-loop behavior.
+1. **Global integration and discovery**: register the global extension and `/failover`; install stable provider callbacks before provider registration; own one target `ModelRuntime` per extension instance; initialize an empty v8 chain file.
+2. **Configuration and TUI**: classify config loads, preserve blocked files, serialize revision-checked atomic writes, and implement chain CRUD, chain-scope policy, inheritable target overrides, shared runtime status, and recovery actions.
+3. **Lifecycle and request compatibility**: route without depending on `session_start`, isolate outer virtual credentials, await the outer payload callback, apply final request parameters, and negotiate rejected extension-injected cache fields.
+4. **Shared failover execution**: enforce effective scope/override policy, exact-target retry budgets, shared eligibility and manual recovery, cooldowns, bounded traversal, Footer/history transitions, and exhaustion summaries.
+5. **Verification**: cover empty first run, v1-v7 migration, fail-closed coordination, auth isolation, request-field negotiation, session hashing/history, TUI action serialization, failure classes, concurrent exact-target traversal, and legacy runtime-field compatibility.
 
 ## Acceptance Checklist
 
 - [x] The extension is designed for global installation and exposes `/failover`.
-- [x] Automatic failover defaults to enabled.
-- [x] First setup authorizes only the current model; other discovered models require an explicit Add action.
-- [x] Discovery is observational and cannot prune, reorder, or rewrite the configured authorization list.
-- [x] The TUI can select, reorder, add, and remove models and auto-saves the ordered list.
-- [x] Startup and `/failover` opening refresh catalog data.
-- [x] The extension reads Pi's catalog but never edits `getAgentDir()/models.json`.
-- [x] Malformed, invalid, unreadable, and future-version configuration is preserved and disables automation.
-- [x] Authorized writes use lock + source revision CAS + flushed temporary file + atomic rename.
-- [x] The extension-owned config contains no API keys or tokens.
-- [x] `prompt_cache_key` and `prompt_cache_retention` negotiate field-specific 400/422 rejection without consuming normal retries.
-- [x] Supported OpenAI-compatible `x-session-id` values are hashed; non-OpenAI paths remain unchanged.
-- [x] Permanent balance/quota/authentication/model-recovery reasons persist across Pi restarts until explicit restore.
-- [x] Manual `/model` and `Ctrl+P` selection pauses automation until explicit TUI restore.
-- [x] Direct restore does not issue a test request.
-- [x] Pi's recognized transient retries run first; native retry count/backoff remain Pi-controlled.
-- [x] The extension waits for Pi to settle before switching.
-- [x] Balance/quota/usage, `401`/`403`, and `404` errors are not retried on the same model and are marked for manual recovery.
-- [x] `429`, network, and `5xx` failures apply the fixed per-target ladder (10, 20, 40, 60, 90, 180, 360 minutes) after native retries, capped at 6 hours.
-- [x] Unknown errors and no-progress timeouts get one best-effort same-model continuation, then switch.
-- [x] The timeout defaults to 90 seconds, accepts 15-900 seconds, and supports `0` to disable.
-- [x] `Esc`, `Ctrl+C`, and tool execution failures never trigger a switch.
-- [x] Each request attempts the configured model list at most once and cannot loop indefinitely.
-- [x] Notifications show source, target, and reason.
-- [x] Chain exhaustion shows a failure summary.
-- [x] Documentation states that continuation may duplicate tool calls/side effects.
+- [x] First run writes an empty v8 configuration and leaves `models.json` unchanged.
+- [x] A v8 generated model contains only identity, enablement, and its ordered real-target chain.
+- [x] v1-v7 migration registers shared targets/scopes before writing v8; any failed step preserves source bytes and blocks routing/editing.
+- [x] Parent, child/subagent, and independent same-user processes share exact-target runtime coordination; policy remains chain-scoped.
+- [x] Scope keys combine the encoded absolute agent directory with generated model id; scope policy starts from the first target and every override field starts as `inherit`.
+- [x] Each request snapshots effective scope/override settings; cancellation stops the current request without changing shared target state.
+- [x] Malformed, unreadable, locked, write-failed, and compare-and-swap-exhausted shared state blocks target attempts and mutations until verified recovery.
+- [x] The TUI opens target overrides with `Enter`, chain settings with `t`, leaves `p` inert, and uses detail `e` for global target enablement.
+- [x] Rapid reorder, enable, and override actions execute serially against the latest state.
+- [x] The Footer and `/failover history` expose transitions; the implementation emits no per-transition popup.
+- [x] Current-session history uses validated namespaced custom entries, local timestamps, deduplication, and a 100-entry bound.
+- [x] Outer virtual credentials and header transforms are dropped; the selected target runtime supplies authentication.
+- [x] Reasoning effort is applied only to supported real-provider request fields and does not alter Pi's own thinking setting.
+- [x] Prompt-cache keys use a namespaced SHA-256 digest; raw Session IDs are neither sent nor persisted by failover.
+- [x] Cache-field negotiation is structured, exact-target/API-local, bounded, and excluded from `maxRetries`.
+- [x] `maxRetries` is the exact same-target retry count after the initial attempt; all retry-eligible automatic failures use the effective target budget.
+- [x] Retry and cooldown state is isolated by exact real target; one target's exhaustion does not consume another target's budget.
+- [x] Global target enablement, cooldown, failures, `nextEligibleAt`, cumulative cooldown, and manual recovery remain outside chain-scope policy; legacy `lease` input is stripped on write.
+- [x] Historical error tool results remain request context and do not synthesize a provider failure; Pi tool execution stays outside provider classification.
+- [x] Credential material is redacted, provider text is bounded, C0/C1 controls are removed, and unsafe history entries are rejected.
+- [x] Final full custom-loader verification passed 197/197; `git diff --check` passed; primary LSP diagnostics reported 0 findings across the 7 core files.
+- [x] `tsc --noEmit` was unavailable because this checkout has no local `tsc` or `node_modules/.bin/tsc`; no dependencies were installed. An isolated live `failover/orc-peon` smoke passed through real Pi/provider authentication with exit code 0, exact marker `REAL_FAILOVER_SMOKE_OK`, empty stderr, and no 401, 403, or model-unavailable result; it did not force a first-target failure or verify an automatic switch.
+
+Verification commands:
+
+```bash
+node --loader ./test/typescript-loader.mjs --test test/*.test.ts
+node ./node_modules/typescript/lib/tsc.js --noEmit --pretty false
+git diff --check
+```

@@ -1,5 +1,6 @@
 import type {
 	GeneratedFailoverModel,
+	GeneratedFailoverModelV8,
 	ModelParameterToggles,
 	ModelRef,
 	ReasoningEffort,
@@ -20,6 +21,7 @@ import {
 } from "./state.ts";
 import {
 	type CacheField,
+	type TargetCompatLike,
 	applyRequestParameters,
 	isOpenAIRequestApi,
 	promptCacheKeyFromSessionId,
@@ -31,6 +33,12 @@ import {
 	buildFailoverCatalogModel,
 	type TargetCatalogMetadata,
 } from "./models-catalog.ts";
+import type {
+	ClaimResult,
+	SettleResult,
+	SharedStateAdapter,
+	SharedTargetSettings,
+} from "./shared-state.ts";
 
 const FAILOVER_MODEL_API = "openai-responses";
 const FAILOVER_BASE_URL = "https://failover.invalid/v1";
@@ -40,8 +48,10 @@ export interface TargetModelLike {
 	provider: string;
 	id: string;
 	api: string;
+	baseUrl: string;
 	reasoning?: boolean;
 	thinkingLevelMap?: Partial<Record<ReasoningEffort, string | null>>;
+	compat?: TargetCompatLike;
 }
 
 /** Minimal structural view of a Pi AssistantMessage (runtime boundary cast). */
@@ -63,11 +73,15 @@ export interface AssistantMessageLike {
 export interface RequestOptions {
 	signal?: AbortSignal;
 	sessionId?: string;
+	cacheRetention?: "none" | "short" | "long";
 	reasoning?: string;
 	headers?: Record<string, string | null>;
 	maxRetries?: number;
 	timeoutMs?: number;
-	onPayload?: (payload: unknown, model?: unknown) => unknown | void;
+	onPayload?: (
+		payload: unknown,
+		model?: unknown,
+	) => unknown | undefined | Promise<unknown | undefined>;
 	onResponse?: (
 		response: { status: number; headers: Record<string, string> },
 		model?: unknown,
@@ -98,6 +112,14 @@ export interface Delegate {
 	): AssistantMessageEventStreamLike;
 }
 
+/** Chain-only model data used by shared routing and native model discovery. */
+export type FailoverChainModel = Pick<
+	GeneratedFailoverModelV8,
+	"id" | "name" | "enabled" | "chain"
+> & {
+	scopeKey?: string;
+};
+
 /** The real target and effective thinking level used for one request attempt. */
 interface FailoverTargetStatus {
 	modelId: string;
@@ -116,7 +138,7 @@ interface FailoverTransition extends FailoverTargetStatus {
 }
 
 export interface FailoverProviderState {
-	config: { models: GeneratedFailoverModel[] };
+	config: { models: FailoverChainModel[] };
 	metadata: readonly TargetCatalogMetadata[];
 	delegate: Delegate;
 	/** Target keys known to be authenticated; empty means "not yet determined". */
@@ -128,6 +150,8 @@ export interface FailoverProviderState {
 	cooldownLevels: Map<string, number>;
 	manualRecovery: Map<string, string>;
 	unsupportedCacheFields: Map<string, Set<CacheField>>;
+	/** Optional shared coordinator; absent means the legacy v7 policy owns runtime state. */
+	sharedState?: SharedStateAdapter;
 	/** Optional callback invoked when the router starts using a real target. */
 	onTarget?: (target: FailoverTargetStatus) => void;
 	/** Optional callback invoked when the router switches chain targets. */
@@ -209,6 +233,9 @@ function createBufferedStream(
 
 const MAX_EXTERNAL_ERROR_CATEGORY_LENGTH = 128;
 const MAX_EXTERNAL_ERROR_MESSAGE_LENGTH = 4096;
+const MAX_PROVIDER_STATUS_REASON_LENGTH = 256;
+const REDACTED_PROVIDER_TEXT = "[REDACTED]";
+const SHARED_ATTEMPT_TIMEOUT_FLOOR_MS = 30_000;
 
 interface NormalizedProviderError {
 	message: string;
@@ -223,6 +250,68 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function boundedString(value: unknown, maxLength: number): string | undefined {
 	if (typeof value !== "string" || value.trim().length === 0) return undefined;
 	return value.length > maxLength ? value.slice(0, maxLength) : value;
+}
+
+function sanitizeProviderText(value: string): string {
+	let text = value.replace(
+		/(\b(?:proxy[-_])?authorization\b[ \t]*:[ \t]*)(?:[^\r\n;]+)(\r\n|[\r\n;]|$)/gi,
+		(_match, prefix: string, delimiter: string) => {
+			const boundary =
+				delimiter === ";" || delimiter === "" ? delimiter : `;${delimiter}`;
+			return `${prefix}${REDACTED_PROVIDER_TEXT}${boundary}`;
+		},
+	);
+	text = text.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ");
+	text = text.replace(
+		/\bBearer\s+["']?[^\s,;"']+["']?/gi,
+		`Bearer ${REDACTED_PROVIDER_TEXT}`,
+	);
+	text = text.replace(
+		/(["']?)(proxy[_-]?authorization|authorization|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|auth[_-]?token|client[_-]?secret|query[_-]?secret|token|secret)\1(\s*[:=]\s*)(["'])(.*?)\4/gi,
+		(
+			_match,
+			keyQuote: string,
+			key: string,
+			separator: string,
+			valueQuote: string,
+		) =>
+			`${keyQuote}${key}${keyQuote}${separator}${valueQuote}${REDACTED_PROVIDER_TEXT}${valueQuote}`,
+	);
+	text = text.replace(
+		/(["']?)(proxy[_-]?authorization|authorization|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|auth[_-]?token|client[_-]?secret|query[_-]?secret|token|secret)\1(\s*[:=]\s*)([^\s&#,;"']+)/gi,
+		(_match, keyQuote: string, key: string, separator: string) =>
+			`${keyQuote}${key}${keyQuote}${separator}${REDACTED_PROVIDER_TEXT}`,
+	);
+	text = text.replace(/\bsk-[A-Za-z0-9_-]{8,}\b/gi, REDACTED_PROVIDER_TEXT);
+	text = text.replace(
+		/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g,
+		REDACTED_PROVIDER_TEXT,
+	);
+	text = text.replace(
+		/(^|[^A-Za-z0-9_+./=-])([A-Za-z0-9][A-Za-z0-9_+./=-]{31,})(?=$|[^A-Za-z0-9_+./=-])/g,
+		(_match, prefix: string) => `${prefix}${REDACTED_PROVIDER_TEXT}`,
+	);
+	return text;
+}
+
+function boundedProviderText(
+	value: unknown,
+	maxLength: number,
+): string | undefined {
+	if (typeof value !== "string" || value.trim().length === 0) return undefined;
+	const sample = value.slice(0, maxLength + 1_024);
+	return boundedString(sanitizeProviderText(sample), maxLength);
+}
+
+function invokeProviderHookSafely<TArgs extends unknown[]>(
+	callback: ((...args: TArgs) => void) | undefined,
+	...args: TArgs
+): void {
+	try {
+		callback?.(...args);
+	} catch {
+		// UI/status hooks must not affect routing or shared state.
+	}
 }
 
 function numericStatus(value: unknown): number | undefined {
@@ -250,17 +339,17 @@ function normalizeProviderError(error: unknown): NormalizedProviderError {
 		record && isRecord(record.error_metadata) ? record.error_metadata : undefined;
 	const details =
 		metadata && isRecord(metadata.details) ? metadata.details : undefined;
-	const providerErrorCategory = boundedString(
+	const providerErrorCategory = boundedProviderText(
 		metadata?.category,
 		MAX_EXTERNAL_ERROR_CATEGORY_LENGTH,
 	);
-	const metadataMessage = boundedString(
+	const metadataMessage = boundedProviderText(
 		metadata?.message,
 		MAX_EXTERNAL_ERROR_MESSAGE_LENGTH,
 	);
 	const message =
 		metadataMessage ??
-		boundedString(
+		boundedProviderText(
 			fallbackErrorMessage(error),
 			MAX_EXTERNAL_ERROR_MESSAGE_LENGTH,
 		) ??
@@ -279,6 +368,13 @@ function buildErrorMessage(
 	message: string,
 	metadata?: Pick<NormalizedProviderError, "status" | "providerErrorCategory">,
 ): AssistantMessageLike {
+	const safeMessage =
+		boundedProviderText(message, MAX_EXTERNAL_ERROR_MESSAGE_LENGTH) ??
+		"Unknown provider error";
+	const safeCategory = boundedProviderText(
+		metadata?.providerErrorCategory,
+		MAX_EXTERNAL_ERROR_CATEGORY_LENGTH,
+	);
 	return {
 		role: "assistant",
 		content: [],
@@ -294,11 +390,9 @@ function buildErrorMessage(
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason: "error",
-		errorMessage: message,
-		...(metadata?.status !== undefined ? { status: metadata.status } : {}),
-		...(metadata?.providerErrorCategory
-			? { providerErrorCategory: metadata.providerErrorCategory }
-			: {}),
+		errorMessage: safeMessage,
+		...(metadata?.status === undefined ? {} : { status: metadata.status }),
+		...(safeCategory ? { providerErrorCategory: safeCategory } : {}),
 		timestamp: Date.now(),
 	};
 }
@@ -306,6 +400,31 @@ function buildErrorMessage(
 function errorMessage(error: unknown): AssistantMessageLike {
 	const normalized = normalizeProviderError(error);
 	return buildErrorMessage(normalized.message, normalized);
+}
+
+function sanitizeAssistantMessage(
+	message: AssistantMessageLike,
+): AssistantMessageLike {
+	const {
+		errorMessage: rawErrorMessage,
+		providerErrorCategory: rawCategory,
+		...rest
+	} = message;
+	const safeErrorMessage = boundedProviderText(
+		rawErrorMessage,
+		MAX_EXTERNAL_ERROR_MESSAGE_LENGTH,
+	);
+	const safeCategory = boundedProviderText(
+		rawCategory,
+		MAX_EXTERNAL_ERROR_CATEGORY_LENGTH,
+	);
+	return {
+		...rest,
+		...(rawErrorMessage === undefined
+			? {}
+			: { errorMessage: safeErrorMessage ?? "Unknown provider error" }),
+		...(safeCategory ? { providerErrorCategory: safeCategory } : {}),
+	};
 }
 
 function genKey(generatedId: string, target: ModelRef): string {
@@ -366,6 +485,7 @@ async function executeTarget(
 	options: RequestOptions,
 	timeoutMs: number | undefined,
 	outerSignal: AbortSignal | undefined,
+	attemptTimeoutMs?: number,
 ): Promise<{
 	result: AssistantMessageLike;
 	timedOut: boolean;
@@ -373,7 +493,8 @@ async function executeTarget(
 	providerErrorCategory?: string;
 }> {
 	const controller = new AbortController();
-	let timer: ReturnType<typeof setTimeout> | undefined;
+	let progressTimer: ReturnType<typeof setTimeout> | undefined;
+	let attemptTimer: ReturnType<typeof setTimeout> | undefined;
 	let timeoutReject!: (error: unknown) => void;
 	let abortReject!: (error: unknown) => void;
 	let timedOut = false;
@@ -393,14 +514,16 @@ async function executeTarget(
 		if (outerSignal.aborted) onAbort();
 		else outerSignal.addEventListener("abort", onAbort, { once: true });
 	}
+	const expireAttempt = () => {
+		if (timedOut) return;
+		timedOut = true;
+		controller.abort();
+		timeoutReject(new NoProgressTimeoutError());
+	};
 	const resetTimer = () => {
-		if (timeoutMs === undefined) return;
-		if (timer !== undefined) clearTimeout(timer);
-		timer = setTimeout(() => {
-			timedOut = true;
-			controller.abort();
-			timeoutReject(new NoProgressTimeoutError());
-		}, timeoutMs);
+		if (timeoutMs === undefined || timedOut) return;
+		if (progressTimer !== undefined) clearTimeout(progressTimer);
+		progressTimer = setTimeout(expireAttempt, timeoutMs);
 	};
 	const attemptOptions: RequestOptions = {
 		...options,
@@ -408,6 +531,8 @@ async function executeTarget(
 	};
 	try {
 		resetTimer();
+		if (attemptTimeoutMs !== undefined)
+			attemptTimer = setTimeout(expireAttempt, attemptTimeoutMs);
 		const work = delegate.stream
 			? (async () => {
 					const stream = delegate.stream!(model, context, attemptOptions);
@@ -417,7 +542,9 @@ async function executeTarget(
 			: delegate.complete(model, context, attemptOptions);
 		// Keep consuming a timed-out stream in the background so its rejection is handled.
 		void work.catch(() => undefined);
-		const result = await Promise.race([work, timeout, aborted]);
+		const result = sanitizeAssistantMessage(
+			await Promise.race([work, timeout, aborted]),
+		);
 		return { result, timedOut: false };
 	} catch (error) {
 		const normalized = normalizeProviderError(error);
@@ -439,7 +566,8 @@ async function executeTarget(
 			providerErrorCategory: normalized.providerErrorCategory,
 		};
 	} finally {
-		if (timer !== undefined) clearTimeout(timer);
+		if (progressTimer !== undefined) clearTimeout(progressTimer);
+		if (attemptTimer !== undefined) clearTimeout(attemptTimer);
 		if (outerSignal) outerSignal.removeEventListener("abort", onAbort);
 	}
 }
@@ -490,6 +618,32 @@ function resolveTargetSelection(
 	};
 }
 
+function resolveSharedTargetSelection(
+	generated: FailoverChainModel,
+	target: ModelRef,
+	state: FailoverProviderState,
+	settings: SharedTargetSettings,
+): TargetSelection | undefined {
+	const targetModel = state.delegate.resolveModel(target);
+	if (!targetModel) return undefined;
+	const targetKey = modelKey(target);
+	const toggles = { ...DEFAULT_PARAMETER_TOGGLES, ...settings.modelParameters };
+	const effort = settings.reasoningEffort;
+	return {
+		modelId: generated.id,
+		target,
+		effort,
+		mappedEffort: toggles.reasoningEffort
+			? mappedReasoning(targetModel, effort)
+			: undefined,
+		reasoningControlled: toggles.reasoningEffort,
+		targetModel,
+		targetKey,
+		capabilityKey: `${targetKey}:${targetModel.api}`,
+		toggles,
+	};
+}
+
 function emitTargetTransition(
 	state: FailoverProviderState,
 	selection: TargetSelection,
@@ -498,25 +652,31 @@ function emitTargetTransition(
 ): void {
 	if (!previousTarget || modelKey(previousTarget) === modelKey(selection.target))
 		return;
-	state.onTransition?.({
+	const reason =
+		boundedProviderText(
+			previousReason ?? "failure",
+			MAX_PROVIDER_STATUS_REASON_LENGTH,
+		) ?? "failure";
+	invokeProviderHookSafely(state.onTransition, {
 		modelId: selection.modelId,
 		target: selection.target,
 		effort: selection.effort,
 		mappedEffort: selection.mappedEffort,
 		reasoningControlled: selection.reasoningControlled,
 		source: previousTarget,
-		reason: previousReason ?? "failure",
+		reason,
 	});
 }
 
 async function executeTargetAttempt(
-	generated: GeneratedFailoverModel,
 	context: RequestContext,
 	options: RequestOptions,
 	state: FailoverProviderState,
 	cacheKey: string | undefined,
 	signal: AbortSignal | undefined,
 	selection: TargetSelection | undefined,
+	timeoutSeconds: number,
+	attemptTimeoutMs?: number,
 ): Promise<TargetAttempt | undefined> {
 	if (!selection) return undefined;
 	const {
@@ -527,7 +687,7 @@ async function executeTargetAttempt(
 		effort,
 		mappedEffort,
 	} = selection;
-	state.onTarget?.({
+	invokeProviderHookSafely(state.onTarget, {
 		modelId: selection.modelId,
 		target: selection.target,
 		effort,
@@ -536,31 +696,52 @@ async function executeTargetAttempt(
 	});
 	const unsupported =
 		state.unsupportedCacheFields.get(capabilityKey) ?? EMPTY_UNSUPPORTED;
-	const timeoutMs =
-		generated.noProgressTimeoutSeconds > 0
-			? generated.noProgressTimeoutSeconds * 1000
-			: undefined;
+	const timeoutMs = timeoutSeconds > 0 ? timeoutSeconds * 1000 : undefined;
 	let status: number | undefined;
 	const {
 		apiKey: _droppedApiKey,
+		env: _droppedEnv,
+		headers: _droppedHeaders,
 		signal: _outerSignal,
 		timeoutMs: _outerTimeoutMs,
 		onPayload: outerOnPayload,
 		onResponse: outerOnResponse,
-		transformHeaders: outerTransformHeaders,
+		transformHeaders: _droppedTransformHeaders,
 		...forward
 	} = options;
+	const headers: Record<string, string | null> = {};
+	replaceSessionAffinityHeaders(headers, {
+		api: targetModel.api,
+		provider: targetModel.provider,
+		baseUrl: targetModel.baseUrl,
+		compat: targetModel.compat,
+		toggles,
+		cacheKey,
+		cacheRetention: forward.cacheRetention,
+	});
 	const attemptOptions: RequestOptions = {
 		...forward,
+		...(Object.keys(headers).length > 0 ? { headers } : {}),
 		...(selection.reasoningControlled ? { reasoning: effort } : {}),
-		onPayload: (payload: unknown, model?: unknown) => {
-			const forwarded = outerOnPayload?.(payload, model);
+		onPayload: async (payload: unknown, model?: unknown) => {
+			const hadRetention =
+				isRecord(payload) && Object.hasOwn(payload, "prompt_cache_retention");
+			const forwarded = await outerOnPayload?.(payload, model);
 			const next = forwarded === undefined ? payload : forwarded;
 			applyRequestParameters(next, {
 				api: targetModel.api,
+				provider: targetModel.provider,
+				baseUrl: targetModel.baseUrl,
 				toggles,
 				cacheKey,
 				unsupported,
+				compat: targetModel.compat,
+				cacheRetention: forward.cacheRetention,
+				retentionRemovedByOuter:
+					Boolean(outerOnPayload) &&
+					hadRetention &&
+					isRecord(next) &&
+					!Object.hasOwn(next, "prompt_cache_retention"),
 				reasoningEffort: mappedEffort,
 			});
 			return next;
@@ -573,16 +754,24 @@ async function executeTargetAttempt(
 			await outerOnResponse?.(response, model);
 		},
 		transformHeaders: async (headers: Record<string, string | null>) => {
-			const next = outerTransformHeaders
-				? await outerTransformHeaders(headers)
-				: headers;
-			replaceSessionAffinityHeaders(next, { toggles, cacheKey });
-			return next;
+			replaceSessionAffinityHeaders(headers, {
+				api: targetModel.api,
+				provider: targetModel.provider,
+				baseUrl: targetModel.baseUrl,
+				compat: targetModel.compat,
+				toggles,
+				cacheKey,
+				cacheRetention: forward.cacheRetention,
+			});
+			return headers;
 		},
 	};
 	void _droppedApiKey;
+	void _droppedEnv;
+	void _droppedHeaders;
 	void _outerSignal;
 	void _outerTimeoutMs;
+	void _droppedTransformHeaders;
 	const {
 		result,
 		timedOut,
@@ -595,6 +784,7 @@ async function executeTargetAttempt(
 		attemptOptions,
 		timeoutMs,
 		signal,
+		attemptTimeoutMs,
 	);
 	status ??= thrownStatus ?? result.status;
 	return {
@@ -664,11 +854,14 @@ function applyAutomaticFailure(
 		}
 	}
 
-	recordFailure(request, target, failure.reason);
+	const safeFailureReason =
+		boundedProviderText(failure.reason, MAX_PROVIDER_STATUS_REASON_LENGTH) ??
+		"failure";
+	recordFailure(request, target, safeFailureReason);
 	const key = genKey(generated.id, target);
 	if (failure.kind === "persistent") {
-		state.manualRecovery.set(key, failure.reason);
-		state.onManualRecovery?.(key, failure.reason);
+		state.manualRecovery.set(key, safeFailureReason);
+		invokeProviderHookSafely(state.onManualRecovery, key, safeFailureReason);
 	}
 	const retry =
 		shouldRetryCurrentModel(failure.kind, generated.errorHandlingMode) &&
@@ -682,6 +875,517 @@ function applyAutomaticFailure(
 		state.cooldownLevels.set(key, nextCooldownLevel(level));
 	}
 	return { retry, sameRetries: retry ? sameRetries + 1 : sameRetries };
+}
+
+function sharedRequestTimeoutMs(value: unknown): number {
+	return Number.isSafeInteger(value) && (value as number) > 0
+		? Math.max(value as number, SHARED_ATTEMPT_TIMEOUT_FLOOR_MS)
+		: SHARED_ATTEMPT_TIMEOUT_FLOOR_MS;
+}
+
+function sharedAttemptTimeouts(
+	settings: SharedTargetSettings,
+	effectiveRequestTimeoutMs: number,
+): { noProgressTimeoutSeconds: number; attemptTimeoutMs: number } {
+	const storedTimeoutMs =
+		settings.noProgressTimeoutSeconds > 0
+			? settings.noProgressTimeoutSeconds * 1_000
+			: 0;
+	const plannedAttemptTimeoutMs = Math.max(
+		effectiveRequestTimeoutMs,
+		storedTimeoutMs,
+		SHARED_ATTEMPT_TIMEOUT_FLOOR_MS,
+	);
+	const noProgressTimeoutMs =
+		storedTimeoutMs > 0 ? storedTimeoutMs : effectiveRequestTimeoutMs;
+	return {
+		noProgressTimeoutSeconds: noProgressTimeoutMs / 1_000,
+		attemptTimeoutMs: plannedAttemptTimeoutMs,
+	};
+}
+
+function sharedClaimFailure(
+	result: Extract<ClaimResult, { kind: "invalid" }>,
+): string {
+	return `shared claim invalid: ${result.detail}`;
+}
+
+function sharedSettlementFailure(
+	result: SettleResult,
+	operation: string,
+): string | undefined {
+	if (result.kind === "stale") return `${operation} stale`;
+	if (result.kind === "invalid") return `${operation} invalid: ${result.detail}`;
+	return undefined;
+}
+
+function emitSharedTerminal(
+	emit: (event: StreamEvent) => void,
+	end: (result: unknown) => void,
+	reason: string,
+	mode: "error" | "aborted" = "error",
+): void {
+	const message = errorMessage(reason);
+	if (mode === "aborted") message.stopReason = "aborted";
+	emit({
+		type: "error",
+		reason: mode,
+		error: message,
+	});
+	end(message);
+}
+
+async function settleSharedState(
+	adapter: SharedStateAdapter,
+	target: ModelRef,
+	outcome: Parameters<SharedStateAdapter["settle"]>[0]["outcome"],
+	effectiveSettings: SharedTargetSettings,
+	scopeKey?: string,
+): Promise<SettleResult | undefined> {
+	try {
+		return await adapter.settle({
+			target,
+			outcome,
+			effectiveSettings,
+			...(scopeKey === undefined ? {} : { scopeKey }),
+		});
+	} catch {
+		return undefined;
+	}
+}
+
+async function emitUnexpectedSharedTerminal(
+	error: unknown,
+	emit: (event: StreamEvent) => void,
+	end: (result: unknown) => void,
+): Promise<void> {
+	const reason =
+		boundedProviderText(
+			normalizeProviderError(error).message,
+			MAX_PROVIDER_STATUS_REASON_LENGTH,
+		) ?? "Unknown provider error";
+	emitSharedTerminal(emit, end, `Unexpected shared failover error: ${reason}`);
+}
+
+function nextSharedTarget(
+	chain: readonly ModelRef[],
+	attempted: ReadonlySet<string>,
+): ModelRef | undefined {
+	for (const target of chain) {
+		if (!attempted.has(modelKey(target))) return { ...target };
+	}
+	return undefined;
+}
+
+function waitForSharedRetry(
+	nextEligibleAt: number,
+	signal: AbortSignal | undefined,
+): Promise<boolean> {
+	if (signal?.aborted) return Promise.resolve(true);
+	const delayMs = Math.max(0, nextEligibleAt - Date.now());
+	if (delayMs === 0) return Promise.resolve(false);
+	return new Promise((resolve) => {
+		let finished = false;
+		const finish = (aborted: boolean) => {
+			if (finished) return;
+			finished = true;
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			resolve(aborted);
+		};
+		const onAbort = () => finish(true);
+		const timer = setTimeout(() => finish(false), delayMs);
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+async function runSharedFailoverLoop(
+	generated: FailoverChainModel,
+	context: RequestContext,
+	options: RequestOptions,
+	state: FailoverProviderState,
+	signal: AbortSignal | undefined,
+	chain: readonly ModelRef[],
+	cacheKey: string | undefined,
+	request: ReturnType<typeof createRequestState>,
+	emit: (event: StreamEvent) => void,
+	end: (result: unknown) => void,
+): Promise<void> {
+	const sharedState = state.sharedState;
+	if (!sharedState) {
+		emitSharedTerminal(emit, end, "Shared failover state is not configured.");
+		return;
+	}
+	if (!generated.enabled) {
+		emitSharedTerminal(
+			emit,
+			end,
+			`Failover model "${generated.name}" is disabled.`,
+		);
+		return;
+	}
+	if (chain.length === 0) {
+		emitSharedTerminal(
+			emit,
+			end,
+			`Failover model "${generated.name}" has no configured targets.`,
+		);
+		return;
+	}
+
+	let current: ModelRef | undefined;
+	let selection: TargetSelection | undefined;
+	let settings: SharedTargetSettings | undefined;
+	let previousTarget: ModelRef | undefined;
+	let previousReason: string | undefined;
+	for (;;) {
+		if (signal?.aborted) {
+			emitSharedTerminal(emit, end, "Request cancelled", "aborted");
+			return;
+		}
+
+		if (!current) {
+			const target = nextSharedTarget(chain, request.attempted);
+			if (!target) {
+				const summary = requestSummary(request, chain);
+				emitSharedTerminal(
+					emit,
+					end,
+					`Failover exhausted for "${generated.name}": ${summary || "no eligible targets"}`,
+				);
+				return;
+			}
+
+			let claim: ClaimResult;
+			try {
+				claim = await sharedState.claim({
+					target,
+					effectiveRequestTimeoutMs: sharedRequestTimeoutMs(options.timeoutMs),
+					...(generated.scopeKey === undefined
+						? {}
+						: { scopeKey: generated.scopeKey }),
+				});
+			} catch {
+				markAttempt(request, target, "claim failure");
+				emitSharedTerminal(emit, end, "Shared claim failed.");
+				return;
+			}
+			if (claim.kind === "skipped") {
+				markAttempt(request, target, claim.skipReason);
+				continue;
+			}
+			if (claim.kind === "invalid") {
+				markAttempt(request, target, "invalid");
+				emitSharedTerminal(emit, end, sharedClaimFailure(claim));
+				return;
+			}
+			if (signal?.aborted) {
+				emitSharedTerminal(emit, end, "Request cancelled", "aborted");
+				return;
+			}
+			markAttempt(request, target);
+
+			current = target;
+			try {
+				settings = claim.settings;
+				selection = resolveSharedTargetSelection(
+					generated,
+					target,
+					state,
+					claim.settings,
+				);
+			} catch (error) {
+				await emitUnexpectedSharedTerminal(error, emit, end);
+				return;
+			}
+			if (!selection) {
+				recordFailure(request, target, "model unavailable");
+				const unavailable = await settleSharedState(
+					sharedState,
+					target,
+					{
+						kind: "persistent-failure",
+						reason: "model unavailable",
+					},
+					claim.settings,
+					generated.scopeKey,
+				);
+				if (!unavailable) {
+					emitSharedTerminal(
+						emit,
+						end,
+						"Shared model-unavailable settlement failed.",
+					);
+					return;
+				}
+				const unavailableIssue = sharedSettlementFailure(
+					unavailable,
+					"Shared model-unavailable settlement",
+				);
+				if (unavailableIssue) {
+					emitSharedTerminal(emit, end, unavailableIssue);
+					return;
+				}
+				if (
+					unavailable.kind !== "settled" ||
+					unavailable.action !== "manual-recovery"
+				) {
+					emitSharedTerminal(
+						emit,
+						end,
+						"Shared model-unavailable settlement returned an unexpected result.",
+					);
+					return;
+				}
+				current = undefined;
+				selection = undefined;
+				settings = undefined;
+				continue;
+			}
+			emitTargetTransition(state, selection, previousTarget, previousReason);
+			previousTarget = undefined;
+			previousReason = undefined;
+		}
+
+		const target = current;
+		const targetSettings = settings;
+		if (!target || !targetSettings || !selection) {
+			emitSharedTerminal(emit, end, "Shared failover state is incomplete.");
+			return;
+		}
+		let attempt: TargetAttempt | undefined;
+		try {
+			const sharedTimeouts = sharedAttemptTimeouts(
+				targetSettings,
+				sharedRequestTimeoutMs(options.timeoutMs),
+			);
+			attempt = await executeTargetAttempt(
+				context,
+				options,
+				state,
+				cacheKey,
+				signal,
+				selection,
+				sharedTimeouts.noProgressTimeoutSeconds,
+				sharedTimeouts.attemptTimeoutMs,
+			);
+		} catch (error) {
+			await emitUnexpectedSharedTerminal(error, emit, end);
+			return;
+		}
+		if (!attempt) {
+			emitSharedTerminal(emit, end, "Shared target selection became unavailable.");
+			return;
+		}
+
+		const { result, failure, targetModel, capabilityKey, toggles, status } =
+			attempt;
+		if (failure.kind === "none") {
+			const settled = await settleSharedState(
+				sharedState,
+				target,
+				{ kind: "success" },
+				targetSettings,
+				generated.scopeKey,
+			);
+			if (!settled) {
+				emitSharedTerminal(emit, end, "Shared success settlement failed.");
+				return;
+			}
+			const issue = sharedSettlementFailure(settled, "Shared success settlement");
+			if (issue) {
+				emitSharedTerminal(emit, end, issue);
+				return;
+			}
+			if (settled.kind !== "settled" || settled.action !== "success") {
+				emitSharedTerminal(
+					emit,
+					end,
+					"Shared success settlement returned an unexpected result.",
+				);
+				return;
+			}
+			const withDiagnostics: AssistantMessageLike = {
+				...result,
+				diagnostics: [
+					...(result.diagnostics ?? []),
+					{ failoverModel: generated.id, target: attempt.targetKey },
+				],
+			};
+			emit({ type: "done", reason: result.stopReason, message: withDiagnostics });
+			end(withDiagnostics);
+			return;
+		}
+
+		const rejected = negotiateDisabledFields(
+			rejectedCacheFields({ status, message: result.errorMessage }),
+			toggles,
+		);
+		if (rejected.length > 0 && isOpenAIRequestApi(targetModel.api)) {
+			const remembered = state.unsupportedCacheFields.get(capabilityKey);
+			const newly = rejected.filter(
+				(field) => !remembered || !remembered.has(field),
+			);
+			if (newly.length > 0) {
+				const unsupported = remembered ?? new Set<CacheField>();
+				for (const field of newly) unsupported.add(field);
+				state.unsupportedCacheFields.set(capabilityKey, unsupported);
+				const compatibility = await settleSharedState(
+					sharedState,
+					target,
+					{ kind: "compatibility-retry" },
+					targetSettings,
+					generated.scopeKey,
+				);
+				if (!compatibility) {
+					emitSharedTerminal(emit, end, "Shared compatibility settlement failed.");
+					return;
+				}
+				const compatibilityIssue = sharedSettlementFailure(
+					compatibility,
+					"Shared compatibility settlement",
+				);
+				if (compatibilityIssue) {
+					emitSharedTerminal(emit, end, compatibilityIssue);
+					return;
+				}
+				if (
+					compatibility.kind !== "settled" ||
+					compatibility.action !== "compatibility-retry"
+				) {
+					emitSharedTerminal(
+						emit,
+						end,
+						"Shared compatibility settlement returned an unexpected result.",
+					);
+					return;
+				}
+				continue;
+			}
+		}
+		const safeFailureReason =
+			boundedProviderText(failure.reason, MAX_PROVIDER_STATUS_REASON_LENGTH) ??
+			"failure";
+		recordFailure(request, target, safeFailureReason);
+		if (failure.kind === "persistent") {
+			const settled = await settleSharedState(
+				sharedState,
+				target,
+				{
+					kind: "persistent-failure",
+					reason: safeFailureReason,
+				},
+				targetSettings,
+				generated.scopeKey,
+			);
+			if (!settled) {
+				emitSharedTerminal(emit, end, "Shared persistent settlement failed.");
+				return;
+			}
+			const issue = sharedSettlementFailure(
+				settled,
+				"Shared persistent settlement",
+			);
+			if (issue) {
+				emitSharedTerminal(emit, end, issue);
+				return;
+			}
+			if (settled.kind !== "settled" || settled.action !== "manual-recovery") {
+				emitSharedTerminal(
+					emit,
+					end,
+					"Shared persistent settlement returned an unexpected result.",
+				);
+				return;
+			}
+			previousTarget = target;
+			previousReason = safeFailureReason;
+			current = undefined;
+			selection = undefined;
+			settings = undefined;
+			continue;
+		}
+
+		if (failure.kind === "cancelled") {
+			const message = { ...result, stopReason: "aborted" as const };
+			emit({
+				type: "error",
+				reason: "aborted",
+				error: message,
+			});
+			end(message);
+			return;
+		}
+
+		if (!isAutomaticFailure(failure.kind)) {
+			emitSharedTerminal(emit, end, safeFailureReason);
+			return;
+		}
+
+		const settled = await settleSharedState(
+			sharedState,
+			target,
+			{
+				kind: "automatic-failure",
+				reason: safeFailureReason,
+			},
+			targetSettings,
+			generated.scopeKey,
+		);
+		if (!settled) {
+			emitSharedTerminal(emit, end, "Shared automatic settlement failed.");
+			return;
+		}
+		const issue = sharedSettlementFailure(settled, "Shared automatic settlement");
+		if (issue) {
+			emitSharedTerminal(emit, end, issue);
+			return;
+		}
+		if (settled.kind !== "settled") {
+			emitSharedTerminal(
+				emit,
+				end,
+				"Shared automatic settlement returned an unexpected result.",
+			);
+			return;
+		}
+		if (settled.action === "retry") {
+			if (settled.nextEligibleAt === undefined) {
+				emitSharedTerminal(
+					emit,
+					end,
+					"Shared retry settlement omitted its eligibility time.",
+				);
+				return;
+			}
+			const retryAborted = await waitForSharedRetry(
+				settled.nextEligibleAt,
+				signal,
+			);
+			if (retryAborted) {
+				emitSharedTerminal(emit, end, "Request cancelled", "aborted");
+				return;
+			}
+			continue;
+		}
+		if (settled.action !== "cooldown") {
+			emitSharedTerminal(
+				emit,
+				end,
+				"Shared automatic settlement returned an unsupported action.",
+			);
+			return;
+		}
+		previousTarget = target;
+		previousReason =
+			boundedProviderText(
+				settled.failureReason ?? safeFailureReason,
+				MAX_PROVIDER_STATUS_REASON_LENGTH,
+			) ?? "failure";
+		current = undefined;
+		selection = undefined;
+		settings = undefined;
+	}
 }
 
 async function runFailoverLoop(
@@ -759,13 +1463,13 @@ async function runFailoverLoop(
 
 		const target = current;
 		const attempt = await executeTargetAttempt(
-			generated,
 			context,
 			options,
 			state,
 			cacheKey,
 			signal,
 			selection,
+			generated.noProgressTimeoutSeconds,
 		);
 		if (!attempt) {
 			recordFailure(request, target, "model unavailable");
@@ -840,24 +1544,62 @@ async function runFailoverLoop(
 	}
 }
 
-export function runFailoverRequest(
-	generated: GeneratedFailoverModel,
+function isLegacyFailoverModel(
+	generated: FailoverChainModel,
+): generated is GeneratedFailoverModel {
+	return (
+		"reasoningEffort" in generated &&
+		"errorHandlingMode" in generated &&
+		"maxRetries" in generated &&
+		"noProgressTimeoutSeconds" in generated &&
+		"modelParameters" in generated &&
+		"targetOverrides" in generated &&
+		"manualRecovery" in generated
+	);
+}
+
+function runFailoverRequestInternal(
+	generated: FailoverChainModel,
 	context: RequestContext,
 	options: RequestOptions,
 	state: FailoverProviderState,
 ): AssistantMessageEventStreamLike {
 	const signal = options.signal;
 	const chain = generated.chain;
-	const cacheKey = promptCacheKeyFromSessionId(options.sessionId);
+	const cacheKey =
+		options.cacheRetention === "none"
+			? undefined
+			: promptCacheKeyFromSessionId(options.sessionId);
 	const request = createRequestState(Date.now());
-	const requestCooldowns = new Map<string, number>(
-		chain.map((target) => [
-			modelKey(target),
-			state.cooldowns.get(genKey(generated.id, target)) ?? 0,
-		]),
-	);
-	return createBufferedStream((emit, end) =>
-		runFailoverLoop(
+	return createBufferedStream((emit, end) => {
+		if (state.sharedState)
+			return runSharedFailoverLoop(
+				generated,
+				context,
+				options,
+				state,
+				signal,
+				chain,
+				cacheKey,
+				request,
+				emit,
+				end,
+			);
+		if (!isLegacyFailoverModel(generated)) {
+			emitSharedTerminal(
+				emit,
+				end,
+				"Version 8 failover models require shared failover state.",
+			);
+			return;
+		}
+		const requestCooldowns = new Map<string, number>(
+			chain.map((target) => [
+				modelKey(target),
+				state.cooldowns.get(genKey(generated.id, target)) ?? 0,
+			]),
+		);
+		return runFailoverLoop(
 			generated,
 			context,
 			options,
@@ -869,12 +1611,33 @@ export function runFailoverRequest(
 			requestCooldowns,
 			emit,
 			end,
-		),
-	);
+		);
+	});
+}
+
+export function runFailoverRequest(
+	generated: GeneratedFailoverModelV8,
+	context: RequestContext,
+	options: RequestOptions,
+	state: FailoverProviderState & { sharedState: SharedStateAdapter },
+): AssistantMessageEventStreamLike;
+export function runFailoverRequest(
+	generated: GeneratedFailoverModel,
+	context: RequestContext,
+	options: RequestOptions,
+	state: FailoverProviderState,
+): AssistantMessageEventStreamLike;
+export function runFailoverRequest(
+	generated: FailoverChainModel,
+	context: RequestContext,
+	options: RequestOptions,
+	state: FailoverProviderState,
+): AssistantMessageEventStreamLike {
+	return runFailoverRequestInternal(generated, context, options, state);
 }
 
 function buildVirtualModel(
-	generated: GeneratedFailoverModel,
+	generated: FailoverChainModel,
 	metadata: readonly TargetCatalogMetadata[],
 ): Record<string, unknown> {
 	const catalog = buildFailoverCatalogModel(generated, metadata);
@@ -932,7 +1695,7 @@ export function createFailoverProvider(
 				end(message);
 			});
 		}
-		return runFailoverRequest(generated, context, options, state);
+		return runFailoverRequestInternal(generated, context, options, state);
 	};
 
 	return {

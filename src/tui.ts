@@ -1,18 +1,19 @@
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { FailoverProviderState } from "./provider.ts";
-import { estimatedRetryDurationMs } from "./state.ts";
-import {
-	type Component,
-	Key,
-	matchesKey,
-	truncateToWidth,
-	visibleWidth,
-} from "@earendil-works/pi-tui";
+import type {
+	Inheritable,
+	SharedChainScope,
+	SharedChainSettings,
+	SharedCoordinationStatus,
+	SharedTargetOverride,
+	SharedTargetRuntime,
+	SharedTargetSettings,
+} from "./shared-state.ts";
 import type {
 	ErrorHandlingMode,
-	GeneratedFailoverConfig,
-	GeneratedFailoverModel,
+	GeneratedFailoverConfigV8,
+	GeneratedFailoverModelV8,
 	ModelParameterName,
 	ModelRef,
 	ReasoningEffort,
@@ -23,6 +24,13 @@ import {
 	MODEL_PARAMETER_NAMES,
 	REASONING_EFFORTS,
 } from "./types.ts";
+import {
+	Key,
+	matchesKey,
+	truncateToWidth,
+	type Component,
+	visibleWidth,
+} from "@earendil-works/pi-tui";
 
 type FailoverHistoryEntry =
 	NonNullable<FailoverProviderState["onTransition"]> extends (
@@ -32,10 +40,14 @@ type FailoverHistoryEntry =
 		: never;
 
 export interface FailoverTuiView {
-	config: GeneratedFailoverConfig;
+	config: GeneratedFailoverConfigV8;
 	available: readonly ModelRef[];
-	cooldowns: ReadonlyMap<string, number>;
-	manualRecovery: ReadonlyMap<string, string>;
+	targets: ReadonlyMap<
+		string,
+		{ settings: SharedTargetSettings; runtime: SharedTargetRuntime }
+	>;
+	scopes: ReadonlyMap<string, SharedChainScope>;
+	coordination: SharedCoordinationStatus;
 }
 
 export interface FailoverTuiActions {
@@ -52,23 +64,49 @@ export interface FailoverTuiActions {
 		target: ModelRef,
 		direction: -1 | 1,
 	) => Promise<void>;
-	onSetReasoning: (id: string, effort: ReasoningEffort) => Promise<void>;
-	onResetCooldown: (id: string) => Promise<void>;
-	onSetErrorHandling: (id: string, mode: ErrorHandlingMode) => Promise<void>;
-	onSetMaxRetries: (id: string, value: string) => Promise<void>;
-	onSetTimeout: (id: string, value: string) => Promise<void>;
 	onSetTargetReasoning: (
-		id: string,
 		target: ModelRef,
-		effort: ReasoningEffort | undefined,
+		effort: Inheritable<ReasoningEffort>,
+		modelId: string,
+	) => Promise<void>;
+	onSetTargetErrorHandling: (
+		target: ModelRef,
+		mode: Inheritable<ErrorHandlingMode>,
+		modelId: string,
+	) => Promise<void>;
+	onSetTargetMaxRetries: (
+		target: ModelRef,
+		value: string,
+		modelId: string,
+	) => Promise<void>;
+	onSetTargetTimeout: (
+		target: ModelRef,
+		value: string,
+		modelId: string,
 	) => Promise<void>;
 	onSetTargetParameter: (
-		id: string,
 		target: ModelRef,
+		parameter: ModelParameterName,
+		enabled: Inheritable<boolean>,
+		modelId: string,
+	) => Promise<void>;
+	onSetScopeReasoning: (
+		modelId: string,
+		effort: ReasoningEffort,
+	) => Promise<void>;
+	onSetScopeErrorHandling: (
+		modelId: string,
+		mode: ErrorHandlingMode,
+	) => Promise<void>;
+	onSetScopeMaxRetries: (modelId: string, value: string) => Promise<void>;
+	onSetScopeTimeout: (modelId: string, value: string) => Promise<void>;
+	onSetScopeParameter: (
+		modelId: string,
 		parameter: ModelParameterName,
 		enabled: boolean,
 	) => Promise<void>;
-	onRestore: (id: string) => Promise<void>;
+	onToggleTarget: (target: ModelRef, enabled: boolean) => Promise<void>;
+	onResetTarget: (target: ModelRef) => Promise<void>;
 }
 
 function runTuiAction(
@@ -99,56 +137,109 @@ function createPanel(
 	return { lines, add, border: renderedBorder };
 }
 
+type NumericSettingKey = "maxRetries" | "noProgressTimeoutSeconds";
 type SettingKey =
 	| "reasoning"
 	| "errorHandlingMode"
-	| "maxRetries"
-	| "noProgressTimeoutSeconds"
-	| "resetCooldown"
-	| "targetParameters";
+	| NumericSettingKey
+	| "resetTarget"
+	| ModelParameterName;
 
 const SETTING_KEYS: readonly SettingKey[] = [
 	"reasoning",
 	"errorHandlingMode",
 	"maxRetries",
 	"noProgressTimeoutSeconds",
-	"resetCooldown",
-	"targetParameters",
+	"resetTarget",
+	...MODEL_PARAMETER_NAMES,
 ];
 
 const SETTING_LABELS: Record<SettingKey, string> = {
-	reasoning: "Reasoning level",
+	reasoning: "Reasoning",
 	errorHandlingMode: "Error behavior",
 	maxRetries: "Max retries",
 	noProgressTimeoutSeconds: "No-result timeout",
-	resetCooldown: "Reset cooldown",
-	targetParameters: "Target parameters",
-};
-
-const PARAMETER_LABELS: Record<ModelParameterName, string> = {
+	resetTarget: "Reset target state",
 	promptCacheKey: "prompt_cache_key",
 	promptCacheRetention: "prompt_cache_retention",
 	reasoningEffort: "reasoning effort",
 	sessionAffinity: "session headers",
 };
 
+const SCOPE_SETTING_KEYS = SETTING_KEYS.filter((key) => key !== "resetTarget");
+const TARGET_ERROR_HANDLING_MODES: readonly Inheritable<ErrorHandlingMode>[] = [
+	"inherit",
+	...ERROR_HANDLING_MODES,
+];
+const TARGET_REASONING_EFFORTS: readonly Inheritable<ReasoningEffort>[] = [
+	"inherit",
+	...REASONING_EFFORTS,
+];
 const ERROR_HANDLING_LABELS: Record<ErrorHandlingMode, string> = {
 	smart: "smart",
 	switch: "switch immediately",
 	retry: "retry then switch",
 };
 
-function formatRetryEstimate(maxRetries: number): string {
-	const seconds = estimatedRetryDurationMs(maxRetries) / 1000;
-	if (seconds < 60) return `~${Math.round(seconds)}s`;
-	return `~${(Math.round(seconds / 6) / 10).toFixed(1)}m`;
+const MAX_VISIBLE_ROWS = 20;
+
+function isParameterKey(value: SettingKey): value is ModelParameterName {
+	return (MODEL_PARAMETER_NAMES as readonly string[]).includes(value);
 }
 
-const MAX_VISIBLE_MODELS = 20;
-const TARGET_REASONING_CHOICES: readonly (ReasoningEffort | undefined)[] = [
-	undefined,
-	...REASONING_EFFORTS,
-];
+type TargetSettingsContext = {
+	kind: "target";
+	model: GeneratedFailoverModelV8;
+	target: ModelRef;
+	settings: SharedTargetSettings;
+	override: SharedTargetOverride;
+};
+
+type ScopeSettingsContext = {
+	kind: "scope";
+	model: GeneratedFailoverModelV8;
+	settings: SharedChainSettings;
+};
+
+type SettingsContext = TargetSettingsContext | ScopeSettingsContext;
+
+function formatDuration(ms: number): string {
+	const seconds = Math.max(0, Math.ceil(ms / 1_000));
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.ceil(seconds / 60);
+	if (minutes < 60) return `${minutes}m`;
+	return `${Math.ceil(minutes / 60)}h`;
+}
+
+function formatCooldownMinutes(ms: number): string {
+	return `${Math.max(1, Math.ceil(Math.max(0, ms) / 60_000))}m`;
+}
+
+function coordinationLine(status: SharedCoordinationStatus): string {
+	return status.coordination === "shared"
+		? "Coordination: shared"
+		: `Coordination: local-only (${status.reason})`;
+}
+
+function targetStatus(
+	runtime: SharedTargetRuntime | undefined,
+	now: number,
+): string {
+	if (!runtime) return " eligible";
+	let status: string;
+	if (runtime.manualRecovery) {
+		status = ` manual recovery: ${runtime.manualRecovery.reason}`;
+	} else if (runtime.cooldownUntil !== null && runtime.cooldownUntil > now) {
+		status = ` cooldown ${formatCooldownMinutes(runtime.cooldownUntil - now)}`;
+	} else if (runtime.nextEligibleAt !== null && runtime.nextEligibleAt > now) {
+		status = ` retry delay ${formatDuration(runtime.nextEligibleAt - now)}`;
+	} else {
+		status = " eligible";
+	}
+	if (runtime.cumulativeCooldownMs > 0)
+		status += `; cumulative cooldown ${formatDuration(runtime.cumulativeCooldownMs)}`;
+	return status;
+}
 
 export class FailoverEditor implements Component {
 	private selectedIndex = 0;
@@ -158,19 +249,21 @@ export class FailoverEditor implements Component {
 	private detailScrollOffset = 0;
 	private addTargetCandidates: readonly ModelRef[] | undefined;
 	private addTargetSelectionIndex: number | undefined;
+	private addTargetScrollOffset = 0;
 	private addModelName: string | undefined;
 	private renameModelName: string | undefined;
-	private settingsMode = false;
+	private settingsTarget: ModelRef | undefined;
+	private settingsScopeModelId: string | undefined;
 	private settingsSelectionIndex = 0;
-	private settingsInput: { key: SettingKey; value: string } | undefined;
+	private settingsInput: { key: NumericSettingKey; value: string } | undefined;
 	private behaviorSelectionIndex: number | undefined;
 	private reasoningSelectionIndex: number | undefined;
-	private paramsMode = false;
-	private paramsReturnToSettings = false;
-	private paramsTargetIndex = 0;
-	private paramsSelectionIndex = 0;
-	private targetReasoningSelectionIndex: number | undefined;
-	private actionQueue = Promise.resolve();
+	private readonly pendingTargetParameters = new Map<
+		string,
+		{ value: Inheritable<boolean> }
+	>();
+	private readonly pendingTargetEnabled = new Map<string, { value: boolean }>();
+	private actionQueue: Promise<void> = Promise.resolve();
 	private readonly border: DynamicBorder;
 
 	constructor(
@@ -189,11 +282,16 @@ export class FailoverEditor implements Component {
 		);
 	}
 
-	private selectedModel(): GeneratedFailoverModel | undefined {
+	/** Resolve when every serialized UI action dispatched so far has settled. */
+	whenIdle(): Promise<void> {
+		return this.actionQueue;
+	}
+
+	private selectedModel(): GeneratedFailoverModelV8 | undefined {
 		return this.getView().config.models[this.selectedIndex];
 	}
 
-	private detailModel(): GeneratedFailoverModel | undefined {
+	private detailModel(): GeneratedFailoverModelV8 | undefined {
 		if (this.detailModelId === undefined) return undefined;
 		return this.getView().config.models.find(
 			(model) => model.id === this.detailModelId,
@@ -208,11 +306,11 @@ export class FailoverEditor implements Component {
 		const count = this.getView().config.models.length;
 		this.selectedIndex =
 			count === 0 ? 0 : Math.min(this.selectedIndex, count - 1);
-		const maxOffset = Math.max(0, count - MAX_VISIBLE_MODELS);
+		const maxOffset = Math.max(0, count - MAX_VISIBLE_ROWS);
 		if (this.selectedIndex < this.scrollOffset)
 			this.scrollOffset = this.selectedIndex;
-		else if (this.selectedIndex >= this.scrollOffset + MAX_VISIBLE_MODELS)
-			this.scrollOffset = this.selectedIndex - MAX_VISIBLE_MODELS + 1;
+		else if (this.selectedIndex >= this.scrollOffset + MAX_VISIBLE_ROWS)
+			this.scrollOffset = this.selectedIndex - MAX_VISIBLE_ROWS + 1;
 		this.scrollOffset = Math.min(this.scrollOffset, maxOffset);
 	}
 
@@ -220,15 +318,26 @@ export class FailoverEditor implements Component {
 		const count = this.detailModel()?.chain.length ?? 0;
 		this.detailTargetIndex =
 			count === 0 ? 0 : Math.min(this.detailTargetIndex, count - 1);
-		const maxOffset = Math.max(0, count - MAX_VISIBLE_MODELS);
+		const maxOffset = Math.max(0, count - MAX_VISIBLE_ROWS);
 		if (this.detailTargetIndex < this.detailScrollOffset)
 			this.detailScrollOffset = this.detailTargetIndex;
-		else if (
-			this.detailTargetIndex >=
-			this.detailScrollOffset + MAX_VISIBLE_MODELS
-		)
-			this.detailScrollOffset = this.detailTargetIndex - MAX_VISIBLE_MODELS + 1;
+		else if (this.detailTargetIndex >= this.detailScrollOffset + MAX_VISIBLE_ROWS)
+			this.detailScrollOffset = this.detailTargetIndex - MAX_VISIBLE_ROWS + 1;
 		this.detailScrollOffset = Math.min(this.detailScrollOffset, maxOffset);
+	}
+
+	private clampAddTarget(): void {
+		const count = this.addTargetCandidates?.length ?? 0;
+		const index = this.addTargetSelectionIndex ?? 0;
+		if (count === 0) {
+			this.addTargetScrollOffset = 0;
+			return;
+		}
+		const maxOffset = Math.max(0, count - MAX_VISIBLE_ROWS);
+		if (index < this.addTargetScrollOffset) this.addTargetScrollOffset = index;
+		else if (index >= this.addTargetScrollOffset + MAX_VISIBLE_ROWS)
+			this.addTargetScrollOffset = index - MAX_VISIBLE_ROWS + 1;
+		this.addTargetScrollOffset = Math.min(this.addTargetScrollOffset, maxOffset);
 	}
 
 	private isCancelInput(data: string): boolean {
@@ -247,65 +356,189 @@ export class FailoverEditor implements Component {
 		this.detailScrollOffset = 0;
 	}
 
-	private beginSettingsEdit(model: GeneratedFailoverModel): void {
-		const key = SETTING_KEYS[this.settingsSelectionIndex];
+	private closeSettings(): void {
+		this.settingsTarget = undefined;
+		this.settingsScopeModelId = undefined;
+		this.settingsInput = undefined;
+		this.behaviorSelectionIndex = undefined;
+		this.reasoningSelectionIndex = undefined;
+	}
+
+	private resetSettingsNavigation(): void {
+		this.settingsSelectionIndex = 0;
+		this.settingsInput = undefined;
+		this.behaviorSelectionIndex = undefined;
+		this.reasoningSelectionIndex = undefined;
+	}
+
+	private openTargetSettings(): void {
+		const target = this.detailTarget();
+		if (!target) return;
+		this.settingsTarget = { ...target };
+		this.settingsScopeModelId = undefined;
+		this.resetSettingsNavigation();
+	}
+
+	private openScopeSettings(): void {
+		const model = this.detailModel();
+		if (!model || !this.getView().scopes.has(model.id)) return;
+		this.settingsTarget = undefined;
+		this.settingsScopeModelId = model.id;
+		this.resetSettingsNavigation();
+	}
+
+	private settingsContext(): SettingsContext | undefined {
+		const view = this.getView();
+		if (this.settingsTarget) {
+			const target = this.settingsTarget;
+			const model = this.detailModel();
+			if (!model) return undefined;
+			const key = modelKey(target);
+			const currentTarget = model.chain.find((entry) => modelKey(entry) === key);
+			const record = view.targets.get(key);
+			const override = view.scopes.get(model.id)?.overrides[key];
+			if (!currentTarget || !record || !override) return undefined;
+			return {
+				kind: "target",
+				model,
+				target: currentTarget,
+				settings: record.settings,
+				override,
+			};
+		}
+		const modelId = this.settingsScopeModelId;
+		if (!modelId) return undefined;
+		const model = view.config.models.find((entry) => entry.id === modelId);
+		const scope = view.scopes.get(modelId);
+		if (!model || !scope) return undefined;
+		return { kind: "scope", model, settings: scope.settings };
+	}
+
+	private settingsKeys(context: SettingsContext): readonly SettingKey[] {
+		return context.kind === "target" ? SETTING_KEYS : SCOPE_SETTING_KEYS;
+	}
+
+	private settingValue(context: SettingsContext, key: SettingKey): string {
+		if (key === "resetTarget") return "action";
+		const settings =
+			context.kind === "target" ? context.override : context.settings;
+		if (key === "reasoning") return settings.reasoningEffort;
+		if (key === "errorHandlingMode") {
+			const value = settings.errorHandlingMode;
+			return value === "inherit" ? value : ERROR_HANDLING_LABELS[value];
+		}
+		if (key === "maxRetries") return String(settings.maxRetries);
+		if (key === "noProgressTimeoutSeconds") {
+			const value = settings.noProgressTimeoutSeconds;
+			if (value === "inherit") return value;
+			return value === 0 ? "off" : `${value}s`;
+		}
+		const value = settings.modelParameters[key];
+		return value === "inherit" ? value : value ? "on" : "off";
+	}
+
+	private beginSettingsEdit(context: SettingsContext): void {
+		const key = this.settingsKeys(context)[this.settingsSelectionIndex];
 		if (!key) return;
-		if (key === "resetCooldown") {
-			this.runAction(() => this.actions.onResetCooldown(model.id));
+		if (key === "resetTarget") {
+			if (context.kind === "target")
+				this.runAction(() => this.actions.onResetTarget(context.target));
 			return;
 		}
-		if (key === "targetParameters") {
-			if (model.chain.length === 0) return;
-			this.paramsMode = true;
-			this.paramsReturnToSettings = true;
-			this.paramsTargetIndex = Math.min(
-				this.detailTargetIndex,
-				model.chain.length - 1,
-			);
-			this.paramsSelectionIndex = 0;
-			this.targetReasoningSelectionIndex = undefined;
+		if (isParameterKey(key)) {
+			if (context.kind === "target") {
+				const pendingKey = `${context.model.id}:${modelKey(context.target)}:${key}`;
+				const pending = this.pendingTargetParameters.get(pendingKey);
+				const current = pending?.value ?? context.override.modelParameters[key];
+				const next: Inheritable<boolean> =
+					current === "inherit" ? true : current ? false : "inherit";
+				const pendingUpdate = { value: next };
+				this.pendingTargetParameters.set(pendingKey, pendingUpdate);
+				this.runAction(async () => {
+					try {
+						await this.actions.onSetTargetParameter(
+							context.target,
+							key,
+							next,
+							context.model.id,
+						);
+					} finally {
+						if (this.pendingTargetParameters.get(pendingKey) === pendingUpdate)
+							this.pendingTargetParameters.delete(pendingKey);
+					}
+				});
+			} else {
+				this.runAction(() =>
+					this.actions.onSetScopeParameter(
+						context.model.id,
+						key,
+						!context.settings.modelParameters[key],
+					),
+				);
+			}
 			return;
 		}
 		if (key === "errorHandlingMode") {
-			this.behaviorSelectionIndex = Math.max(
-				0,
-				ERROR_HANDLING_MODES.indexOf(model.errorHandlingMode),
-			);
+			const choices: readonly string[] =
+				context.kind === "target"
+					? TARGET_ERROR_HANDLING_MODES
+					: ERROR_HANDLING_MODES;
+			const current =
+				context.kind === "target"
+					? context.override.errorHandlingMode
+					: context.settings.errorHandlingMode;
+			this.behaviorSelectionIndex = Math.max(0, choices.indexOf(current));
 			return;
 		}
 		if (key === "reasoning") {
-			this.reasoningSelectionIndex = Math.max(
-				0,
-				REASONING_EFFORTS.indexOf(model.reasoningEffort),
-			);
+			const choices: readonly string[] =
+				context.kind === "target" ? TARGET_REASONING_EFFORTS : REASONING_EFFORTS;
+			const current =
+				context.kind === "target"
+					? context.override.reasoningEffort
+					: context.settings.reasoningEffort;
+			this.reasoningSelectionIndex = Math.max(0, choices.indexOf(current));
 			return;
 		}
-		const numericValues = {
-			maxRetries: model.maxRetries,
-			noProgressTimeoutSeconds: model.noProgressTimeoutSeconds,
-		};
-		if (key === "maxRetries" || key === "noProgressTimeoutSeconds")
-			this.settingsInput = { key, value: String(numericValues[key]) };
+		const settings =
+			context.kind === "target" ? context.override : context.settings;
+		this.settingsInput = { key, value: String(settings[key]) };
 	}
 
 	private saveNumericSetting(
-		modelId: string,
-		key: SettingKey,
+		context: SettingsContext,
+		key: NumericSettingKey,
 		value: string,
 	): void {
-		switch (key) {
-			case "maxRetries":
-				this.runAction(() => this.actions.onSetMaxRetries(modelId, value));
+		if (context.kind === "target") {
+			if (key === "maxRetries") {
+				this.runAction(() =>
+					this.actions.onSetTargetMaxRetries(
+						context.target,
+						value,
+						context.model.id,
+					),
+				);
 				return;
-			case "noProgressTimeoutSeconds":
-				this.runAction(() => this.actions.onSetTimeout(modelId, value));
-				return;
-			default:
-				return;
+			}
+			this.runAction(() =>
+				this.actions.onSetTargetTimeout(context.target, value, context.model.id),
+			);
+			return;
 		}
+		if (key === "maxRetries") {
+			this.runAction(() =>
+				this.actions.onSetScopeMaxRetries(context.model.id, value),
+			);
+			return;
+		}
+		this.runAction(() => this.actions.onSetScopeTimeout(context.model.id, value));
 	}
 
-	private handleNumericSettingInput(data: string, modelId: string): void {
+	private handleNumericSettingInput(
+		data: string,
+		context: SettingsContext,
+	): void {
 		const edit = this.settingsInput;
 		if (!edit) return;
 		if (this.isCancelInput(data)) {
@@ -313,20 +546,33 @@ export class FailoverEditor implements Component {
 			return;
 		}
 		if (matchesKey(data, Key.backspace)) {
-			edit.value = edit.value.slice(0, -1);
+			edit.value = edit.value === "inherit" ? "" : edit.value.slice(0, -1);
 			return;
 		}
 		if (matchesKey(data, Key.enter)) {
 			this.settingsInput = undefined;
-			this.saveNumericSetting(modelId, edit.key, edit.value);
+			this.saveNumericSetting(context, edit.key, edit.value);
 			return;
 		}
-		if (/^\d+$/.test(data)) edit.value += data;
+		if (/^\d+$/.test(data)) {
+			edit.value = /^\d+$/.test(edit.value) ? edit.value + data : data;
+			return;
+		}
+		if (context.kind === "target" && /^[a-z]+$/i.test(data)) {
+			edit.value =
+				/^[a-z]+$/i.test(edit.value) && edit.value !== "inherit"
+					? edit.value + data.toLowerCase()
+					: data.toLowerCase();
+		}
 	}
 
-	private handleBehaviorInput(data: string, modelId: string): void {
+	private handleBehaviorInput(data: string, context: SettingsContext): void {
 		const index = this.behaviorSelectionIndex;
 		if (index === undefined) return;
+		const choices: readonly string[] =
+			context.kind === "target"
+				? TARGET_ERROR_HANDLING_MODES
+				: ERROR_HANDLING_MODES;
 		if (this.isCancelInput(data)) {
 			this.behaviorSelectionIndex = undefined;
 			return;
@@ -336,22 +582,36 @@ export class FailoverEditor implements Component {
 			return;
 		}
 		if (matchesKey(data, Key.down)) {
-			this.behaviorSelectionIndex = Math.min(
-				ERROR_HANDLING_MODES.length - 1,
-				index + 1,
-			);
+			this.behaviorSelectionIndex = Math.min(choices.length - 1, index + 1);
 			return;
 		}
 		if (!matchesKey(data, Key.enter)) return;
-		const mode = ERROR_HANDLING_MODES[index];
+		const mode = choices[index];
 		this.behaviorSelectionIndex = undefined;
-		if (mode)
-			this.runAction(() => this.actions.onSetErrorHandling(modelId, mode));
+		if (!mode) return;
+		if (context.kind === "target") {
+			this.runAction(() =>
+				this.actions.onSetTargetErrorHandling(
+					context.target,
+					mode as Inheritable<ErrorHandlingMode>,
+					context.model.id,
+				),
+			);
+			return;
+		}
+		this.runAction(() =>
+			this.actions.onSetScopeErrorHandling(
+				context.model.id,
+				mode as ErrorHandlingMode,
+			),
+		);
 	}
 
-	private handleReasoningInput(data: string, modelId: string): void {
+	private handleReasoningInput(data: string, context: SettingsContext): void {
 		const index = this.reasoningSelectionIndex;
 		if (index === undefined) return;
+		const choices: readonly string[] =
+			context.kind === "target" ? TARGET_REASONING_EFFORTS : REASONING_EFFORTS;
 		if (this.isCancelInput(data)) {
 			this.reasoningSelectionIndex = undefined;
 			return;
@@ -361,168 +621,69 @@ export class FailoverEditor implements Component {
 			return;
 		}
 		if (matchesKey(data, Key.down)) {
-			this.reasoningSelectionIndex = Math.min(
-				REASONING_EFFORTS.length - 1,
-				index + 1,
-			);
+			this.reasoningSelectionIndex = Math.min(choices.length - 1, index + 1);
 			return;
 		}
 		if (!matchesKey(data, Key.enter)) return;
-		const effort = REASONING_EFFORTS[index];
+		const effort = choices[index];
 		this.reasoningSelectionIndex = undefined;
-		if (effort)
-			this.runAction(() => this.actions.onSetReasoning(modelId, effort));
-	}
-
-	private handleSettingsMenuInput(
-		data: string,
-		model: GeneratedFailoverModel,
-	): void {
-		if (this.isCancelInput(data)) {
-			this.settingsMode = false;
+		if (!effort) return;
+		if (context.kind === "target") {
+			this.runAction(() =>
+				this.actions.onSetTargetReasoning(
+					context.target,
+					effort as Inheritable<ReasoningEffort>,
+					context.model.id,
+				),
+			);
 			return;
 		}
+		this.runAction(() =>
+			this.actions.onSetScopeReasoning(
+				context.model.id,
+				effort as ReasoningEffort,
+			),
+		);
+	}
+
+	private handleSettingsInput(data: string): void {
+		const context = this.settingsContext();
+		if (!context) {
+			this.closeSettings();
+			return;
+		}
+		if (this.settingsInput) {
+			this.handleNumericSettingInput(data, context);
+			return;
+		}
+		if (this.behaviorSelectionIndex !== undefined) {
+			this.handleBehaviorInput(data, context);
+			return;
+		}
+		if (this.reasoningSelectionIndex !== undefined) {
+			this.handleReasoningInput(data, context);
+			return;
+		}
+		if (this.isCancelInput(data)) {
+			this.closeSettings();
+			return;
+		}
+		const keys = this.settingsKeys(context);
 		if (matchesKey(data, Key.up)) {
 			this.settingsSelectionIndex = Math.max(0, this.settingsSelectionIndex - 1);
 			return;
 		}
 		if (matchesKey(data, Key.down)) {
 			this.settingsSelectionIndex = Math.min(
-				SETTING_KEYS.length - 1,
+				keys.length - 1,
 				this.settingsSelectionIndex + 1,
 			);
 			return;
 		}
-		if (matchesKey(data, Key.enter)) this.beginSettingsEdit(model);
+		if (matchesKey(data, Key.enter)) this.beginSettingsEdit(context);
 	}
 
-	private targetReasoningChoiceIndex(
-		model: GeneratedFailoverModel,
-		target: ModelRef,
-	): number {
-		const override = model.targetOverrides[modelKey(target)];
-		const effort = override?.reasoningEffort;
-		if (effort === undefined) return 0;
-		const index = REASONING_EFFORTS.indexOf(effort);
-		return index < 0 ? 0 : index + 1;
-	}
-
-	private handleTargetReasoningInput(
-		data: string,
-		model: GeneratedFailoverModel,
-		target: ModelRef,
-	): void {
-		const index = this.targetReasoningSelectionIndex;
-		if (index === undefined) return;
-		if (this.isCancelInput(data)) {
-			this.targetReasoningSelectionIndex = undefined;
-			return;
-		}
-		if (matchesKey(data, Key.up)) {
-			this.targetReasoningSelectionIndex = Math.max(0, index - 1);
-			return;
-		}
-		if (matchesKey(data, Key.down)) {
-			this.targetReasoningSelectionIndex = Math.min(
-				TARGET_REASONING_CHOICES.length - 1,
-				index + 1,
-			);
-			return;
-		}
-		if (!matchesKey(data, Key.enter)) return;
-		const effort = TARGET_REASONING_CHOICES[index];
-		this.targetReasoningSelectionIndex = undefined;
-		this.runAction(() =>
-			this.actions.onSetTargetReasoning(model.id, target, effort),
-		);
-	}
-
-	private parameterEnabled(
-		model: GeneratedFailoverModel,
-		target: ModelRef,
-		parameter: ModelParameterName,
-	): boolean {
-		const override = model.targetOverrides[modelKey(target)]?.modelParameters;
-		const base = model.modelParameters;
-		if (!override) return base[parameter];
-		return override[parameter];
-	}
-
-	private handleParamsInput(
-		data: string,
-		model: GeneratedFailoverModel,
-		target: ModelRef,
-	): void {
-		if (this.targetReasoningSelectionIndex !== undefined) {
-			this.handleTargetReasoningInput(data, model, target);
-			return;
-		}
-		if (this.isCancelInput(data)) {
-			this.paramsMode = false;
-			if (!this.paramsReturnToSettings) this.settingsMode = false;
-			this.paramsReturnToSettings = false;
-			return;
-		}
-		if (matchesKey(data, Key.up)) {
-			this.paramsSelectionIndex = Math.max(0, this.paramsSelectionIndex - 1);
-			return;
-		}
-		if (matchesKey(data, Key.down)) {
-			this.paramsSelectionIndex = Math.min(
-				MODEL_PARAMETER_NAMES.length,
-				this.paramsSelectionIndex + 1,
-			);
-			return;
-		}
-		if (!matchesKey(data, Key.enter) && data !== " ") return;
-		if (this.paramsSelectionIndex === 0) {
-			this.targetReasoningSelectionIndex = this.targetReasoningChoiceIndex(
-				model,
-				target,
-			);
-			return;
-		}
-		const parameter = MODEL_PARAMETER_NAMES[this.paramsSelectionIndex - 1];
-		if (!parameter) return;
-		const enabled = this.parameterEnabled(model, target, parameter);
-		this.runAction(() =>
-			this.actions.onSetTargetParameter(model.id, target, parameter, !enabled),
-		);
-	}
-
-	private handleSettingsInput(
-		data: string,
-		model: GeneratedFailoverModel,
-	): void {
-		if (this.paramsMode) {
-			const target = model.chain[this.paramsTargetIndex];
-			if (!target) {
-				// The chain shrank underneath params mode; fall back instead of
-				// swallowing every key with no way out.
-				this.paramsMode = false;
-				this.settingsMode = this.paramsReturnToSettings;
-				this.paramsReturnToSettings = false;
-				return;
-			}
-			this.handleParamsInput(data, model, target);
-			return;
-		}
-		if (this.settingsInput) {
-			this.handleNumericSettingInput(data, model.id);
-			return;
-		}
-		if (this.behaviorSelectionIndex !== undefined) {
-			this.handleBehaviorInput(data, model.id);
-			return;
-		}
-		if (this.reasoningSelectionIndex !== undefined) {
-			this.handleReasoningInput(data, model.id);
-			return;
-		}
-		this.handleSettingsMenuInput(data, model);
-	}
-
-	private openAddTarget(model: GeneratedFailoverModel): void {
+	private openAddTarget(model: GeneratedFailoverModelV8): void {
 		const configured = new Set(model.chain.map(modelKey));
 		const candidates = this.getView().available.filter(
 			(target) => !configured.has(modelKey(target)),
@@ -530,6 +691,7 @@ export class FailoverEditor implements Component {
 		if (candidates.length === 0) return;
 		this.addTargetCandidates = candidates;
 		this.addTargetSelectionIndex = 0;
+		this.addTargetScrollOffset = 0;
 	}
 
 	private handleAddTargetInput(data: string, modelId: string): void {
@@ -539,20 +701,24 @@ export class FailoverEditor implements Component {
 		if (this.isCancelInput(data)) {
 			this.addTargetCandidates = undefined;
 			this.addTargetSelectionIndex = undefined;
+			this.addTargetScrollOffset = 0;
 			return;
 		}
 		if (matchesKey(data, Key.up)) {
 			this.addTargetSelectionIndex = Math.max(0, index - 1);
+			this.clampAddTarget();
 			return;
 		}
 		if (matchesKey(data, Key.down)) {
 			this.addTargetSelectionIndex = Math.min(candidates.length - 1, index + 1);
+			this.clampAddTarget();
 			return;
 		}
 		if (!matchesKey(data, Key.enter)) return;
 		const target = candidates[index];
 		this.addTargetCandidates = undefined;
 		this.addTargetSelectionIndex = undefined;
+		this.addTargetScrollOffset = 0;
 		if (target) this.runAction(() => this.actions.onAddTarget(modelId, target));
 	}
 
@@ -577,12 +743,12 @@ export class FailoverEditor implements Component {
 			if (value) commit(value);
 			return;
 		}
-		if (data.length === 1 && !matchesKey(data, Key.enter)) set(get() + data);
+		if (data.length === 1) set(get() + data);
 	}
 
 	private handleDetailCommand(
 		data: string,
-		model: GeneratedFailoverModel,
+		model: GeneratedFailoverModelV8,
 	): void {
 		switch (data) {
 			case "a":
@@ -594,33 +760,46 @@ export class FailoverEditor implements Component {
 					this.runAction(() => this.actions.onRemoveTarget(model.id, target));
 				return;
 			}
-			case "t":
-				this.settingsMode = true;
-				this.paramsMode = false;
-				this.paramsReturnToSettings = false;
-				this.settingsSelectionIndex = 0;
-				return;
-			case "p": {
-				if (model.chain.length === 0) return;
-				this.settingsMode = true;
-				this.paramsMode = true;
-				this.paramsReturnToSettings = false;
-				this.paramsTargetIndex = this.detailTargetIndex;
-				this.paramsSelectionIndex = 0;
-				this.targetReasoningSelectionIndex = undefined;
+			case "e": {
+				const target = this.detailTarget();
+				if (target) {
+					const targetKey = modelKey(target);
+					const enabled =
+						this.pendingTargetEnabled.get(targetKey)?.value ??
+						this.getView().targets.get(targetKey)?.settings.enabled !== false;
+					const pendingUpdate = { value: !enabled };
+					this.pendingTargetEnabled.set(targetKey, pendingUpdate);
+					this.runAction(async () => {
+						try {
+							await this.actions.onToggleTarget(target, pendingUpdate.value);
+						} finally {
+							if (this.pendingTargetEnabled.get(targetKey) === pendingUpdate)
+								this.pendingTargetEnabled.delete(targetKey);
+						}
+					});
+				}
 				return;
 			}
-			case "r":
-				this.runAction(() => this.actions.onRestore(model.id));
+			case "t":
+				this.openScopeSettings();
 				return;
+			case "r": {
+				const target = this.detailTarget();
+				if (target) this.runAction(() => this.actions.onResetTarget(target));
+				return;
+			}
 			default:
 				return;
 		}
 	}
 
-	private handleDetailInput(data: string, model: GeneratedFailoverModel): void {
+	private handleDetailInput(
+		data: string,
+		model: GeneratedFailoverModelV8,
+	): void {
 		if (this.isCancelInput(data)) {
 			this.detailModelId = undefined;
+			this.closeSettings();
 			return;
 		}
 		if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
@@ -635,14 +814,23 @@ export class FailoverEditor implements Component {
 		if (matchesKey(data, Key.leftbracket) || matchesKey(data, Key.rightbracket)) {
 			const direction = matchesKey(data, Key.leftbracket) ? -1 : 1;
 			const target = this.detailTarget();
-			if (target)
-				this.runAction(() =>
-					this.actions.onMoveTarget(model.id, target, direction),
-				);
-			this.detailTargetIndex = Math.min(
-				Math.max(0, model.chain.length - 1),
-				Math.max(0, this.detailTargetIndex + direction),
-			);
+			if (target) {
+				this.runAction(async () => {
+					await this.actions.onMoveTarget(model.id, target, direction);
+					const latest = this.detailModel();
+					if (!latest) return;
+					const index = latest.chain.findIndex(
+						(entry) => modelKey(entry) === modelKey(target),
+					);
+					if (index < 0) return;
+					this.detailTargetIndex = index;
+					this.clampDetailTarget();
+				});
+			}
+			return;
+		}
+		if (matchesKey(data, Key.enter)) {
+			this.openTargetSettings();
 			return;
 		}
 		this.handleDetailCommand(data, model);
@@ -665,9 +853,7 @@ export class FailoverEditor implements Component {
 			}
 			case "r": {
 				const model = this.selectedModel();
-				if (model) {
-					this.renameModelName = model.name;
-				}
+				if (model) this.renameModelName = model.name;
 				return;
 			}
 			default:
@@ -729,13 +915,11 @@ export class FailoverEditor implements Component {
 			);
 			return;
 		}
-		if (this.settingsMode) {
-			const model = this.detailModel();
-			if (model) {
-				this.handleSettingsInput(data, model);
-				return;
-			}
-			this.settingsMode = false;
+		if (
+			this.settingsTarget !== undefined ||
+			this.settingsScopeModelId !== undefined
+		) {
+			this.handleSettingsInput(data);
 			return;
 		}
 		if (this.addTargetSelectionIndex !== undefined) {
@@ -755,25 +939,13 @@ export class FailoverEditor implements Component {
 		this.handleMainInput(data);
 	}
 
-	private modelStatus(
-		view: FailoverTuiView,
-		id: string,
-		key: string,
-		now: number,
-	): string {
-		const cooldown = view.cooldowns.get(`${id}:${key}`);
-		if (cooldown && cooldown > now)
-			return ` cooldown ${Math.ceil((cooldown - now) / 60000)}m`;
-		const recovery = view.manualRecovery.get(`${id}:${key}`);
-		return recovery ? ` manual recovery: ${recovery}` : "";
-	}
-
 	private renderModelList(view: FailoverTuiView): string[] {
 		if (view.config.models.length === 0)
 			return [this.theme.fg("warning", "No failover models configured")];
+		this.clampSelection();
 		const lines: string[] = [];
 		const start = this.scrollOffset;
-		const end = Math.min(start + MAX_VISIBLE_MODELS, view.config.models.length);
+		const end = Math.min(start + MAX_VISIBLE_ROWS, view.config.models.length);
 		lines.push(
 			this.theme.fg(
 				"dim",
@@ -804,100 +976,157 @@ export class FailoverEditor implements Component {
 
 	private renderChain(
 		view: FailoverTuiView,
-		model: GeneratedFailoverModel,
+		model: GeneratedFailoverModelV8,
 	): string[] {
 		if (model.chain.length === 0)
 			return [this.theme.fg("warning", "No targets configured")];
+		this.clampDetailTarget();
 		const lines: string[] = [];
 		const start = this.detailScrollOffset;
-		const end = Math.min(start + MAX_VISIBLE_MODELS, model.chain.length);
+		const end = Math.min(start + MAX_VISIBLE_ROWS, model.chain.length);
+		lines.push(
+			this.theme.fg(
+				"dim",
+				`Targets: ${model.chain.length}  Showing ${start + 1}-${end}`,
+			),
+		);
 		const now = Date.now();
 		for (let index = start; index < end; index++) {
 			const target = model.chain[index];
 			if (!target) continue;
-			const key = modelKey(target);
 			const selected = index === this.detailTargetIndex;
+			const key = modelKey(target);
+			const enabled = view.targets.get(key)?.settings.enabled !== false;
 			lines.push(
 				this.theme.fg(
 					selected ? "accent" : "text",
-					`${selected ? ">" : " "} ${index + 1}. ${key}${this.modelStatus(view, model.id, key, now)}`,
+					`${selected ? ">" : " "} ${index + 1}. ${key}${enabled ? "" : " [disabled]"}${targetStatus(view.targets.get(key)?.runtime, now)}`,
 				),
 			);
 		}
+		if (end < model.chain.length)
+			lines.push(
+				this.theme.fg(
+					"dim",
+					`... ${model.chain.length - end} more; use arrows to scroll`,
+				),
+			);
+		return lines;
+	}
+
+	private renderAddTargetCandidates(): string[] {
+		const candidates = this.addTargetCandidates;
+		const selectedIndex = this.addTargetSelectionIndex;
+		if (!candidates || selectedIndex === undefined) return [];
+		this.clampAddTarget();
+		const start = this.addTargetScrollOffset;
+		const end = Math.min(start + MAX_VISIBLE_ROWS, candidates.length);
+		const selected = candidates[selectedIndex];
+		const lines = [
+			this.theme.fg(
+				"dim",
+				`Candidates: ${candidates.length}  Showing ${start + 1}-${end}`,
+			),
+			...(selected
+				? [
+						this.theme.fg(
+							"accent",
+							`Add target ${selectedIndex + 1}/${candidates.length}: ${modelKey(selected)}  Up/Down move  Enter add  Esc cancel`,
+						),
+					]
+				: []),
+		];
+		for (let index = start; index < end; index++) {
+			const target = candidates[index];
+			if (!target) continue;
+			lines.push(
+				this.theme.fg(
+					index === selectedIndex ? "accent" : "text",
+					`${index === selectedIndex ? ">" : " "} ${index + 1}. ${modelKey(target)}`,
+				),
+			);
+		}
+		if (end < candidates.length)
+			lines.push(
+				this.theme.fg(
+					"dim",
+					`... ${candidates.length - end} more; use arrows to scroll`,
+				),
+			);
 		return lines;
 	}
 
 	private renderDetail(
 		view: FailoverTuiView,
-		model: GeneratedFailoverModel,
+		model: GeneratedFailoverModelV8,
 	): string[] {
-		const lines: string[] = [
+		return [
 			this.theme.fg("accent", `Failover Model: ${model.id}`),
 			`Name: ${model.name}  Enabled: ${model.enabled ? "yes" : "no"}`,
-			`Reasoning: ${model.reasoningEffort}  Error: ${ERROR_HANDLING_LABELS[model.errorHandlingMode]}  Retries: ${model.maxRetries}${model.maxRetries > 0 ? ` (${formatRetryEstimate(model.maxRetries)} total)` : ""}  Timeout: ${model.noProgressTimeoutSeconds === 0 ? "off" : `${model.noProgressTimeoutSeconds}s`}`,
 			this.theme.fg(
 				"dim",
-				"a add target  d remove  [ ] reorder  p target params  t settings  r restore  Esc back",
+				"Enter target settings  t chain settings  a add  d remove  e toggle  [ ] reorder  r reset  Esc back",
 			),
 			"",
 			...this.renderChain(view, model),
+			...(this.addTargetSelectionIndex === undefined
+				? []
+				: this.renderAddTargetCandidates()),
 		];
-		if (this.addTargetSelectionIndex !== undefined && this.addTargetCandidates) {
-			const target = this.addTargetCandidates[this.addTargetSelectionIndex];
-			if (target)
-				lines.push(
-					this.theme.fg(
-						"accent",
-						`Add target ${this.addTargetSelectionIndex + 1}/${this.addTargetCandidates.length}: ${modelKey(target)}  \u2191\u2193 move  Enter add  Esc cancel`,
-					),
-				);
+	}
+
+	private renderSettings(width: number): string[] {
+		const context = this.settingsContext();
+		if (!context) {
+			this.closeSettings();
+			return [];
 		}
-		return lines;
-	}
-
-	/** Start a bordered panel: collected lines plus a width-clamping writer. */
-	private beginPanel(width: number): {
-		lines: string[];
-		add: (line: string) => void;
-		border: string[];
-	} {
-		return createPanel(width, this.border);
-	}
-
-	private renderSettings(
-		model: GeneratedFailoverModel,
-		width: number,
-	): string[] {
-		if (this.paramsMode) return this.renderParams(model, width);
-		const { lines, add, border } = this.beginPanel(width);
-		add(this.theme.fg("accent", `Settings: ${model.id}`));
-		add(this.theme.fg("dim", "\u2191\u2193 select  Enter edit  Esc back"));
+		const { lines, add, border } = createPanel(width, this.border);
+		const title =
+			context.kind === "target"
+				? `Target Settings: ${modelKey(context.target)}`
+				: `Chain Settings: ${context.model.id}`;
+		add(this.theme.fg("accent", title));
+		add(coordinationLine(this.getView().coordination));
+		add(this.theme.fg("dim", "Up/Down select  Enter edit/cycle  Esc back"));
 		add("");
-		for (const [index, key] of SETTING_KEYS.entries()) {
+		for (const [index, key] of this.settingsKeys(context).entries()) {
 			const selected = index === this.settingsSelectionIndex;
-			const suffix =
-				key === "resetCooldown" ? "" : `: ${this.settingValue(model, key)}`;
+			const value =
+				key === "resetTarget" ? "" : `: ${this.settingValue(context, key)}`;
 			add(
 				this.theme.fg(
 					selected ? "accent" : "text",
-					`${selected ? ">" : " "} ${SETTING_LABELS[key]}${suffix}`,
+					`${selected ? ">" : " "} ${SETTING_LABELS[key]}${value}`,
 				),
 			);
 		}
 		if (this.behaviorSelectionIndex !== undefined) {
-			const choices = ERROR_HANDLING_MODES.map((mode, index) =>
-				index === this.behaviorSelectionIndex
-					? `[${ERROR_HANDLING_LABELS[mode]}]`
-					: ERROR_HANDLING_LABELS[mode],
-			).join("  ");
+			const modes: readonly string[] =
+				context.kind === "target"
+					? TARGET_ERROR_HANDLING_MODES
+					: ERROR_HANDLING_MODES;
+			const choices = modes
+				.map((mode, index) => {
+					const label =
+						mode === "inherit"
+							? mode
+							: ERROR_HANDLING_LABELS[mode as ErrorHandlingMode];
+					return index === this.behaviorSelectionIndex ? `[${label}]` : label;
+				})
+				.join("  ");
 			add(this.theme.fg("accent", `Error behavior: ${choices}`));
-			add(this.theme.fg("dim", "\u2191\u2193 move  Enter save  Esc cancel"));
+			add(this.theme.fg("dim", "Up/Down move  Enter save  Esc cancel"));
 		} else if (this.reasoningSelectionIndex !== undefined) {
-			const choices = REASONING_EFFORTS.map((effort, index) =>
-				index === this.reasoningSelectionIndex ? `[${effort}]` : effort,
-			).join("  ");
-			add(this.theme.fg("accent", `Reasoning level: ${choices}`));
-			add(this.theme.fg("dim", "\u2191\u2193 move  Enter save  Esc cancel"));
+			const efforts: readonly string[] =
+				context.kind === "target" ? TARGET_REASONING_EFFORTS : REASONING_EFFORTS;
+			const choices = efforts
+				.map((effort, index) =>
+					index === this.reasoningSelectionIndex ? `[${effort}]` : effort,
+				)
+				.join("  ");
+			add(this.theme.fg("accent", `Reasoning: ${choices}`));
+			add(this.theme.fg("dim", "Up/Down move  Enter save  Esc cancel"));
 		} else if (this.settingsInput) {
 			add(
 				this.theme.fg(
@@ -905,93 +1134,30 @@ export class FailoverEditor implements Component {
 					`Enter ${SETTING_LABELS[this.settingsInput.key]}: ${this.settingsInput.value || "_"}`,
 				),
 			);
-			add(this.theme.fg("dim", "digits  Enter save  Esc cancel"));
-		}
-		const lastBorder = border.at(-1);
-		if (lastBorder) add(lastBorder);
-		return lines.map((line) => padRight(truncateToWidth(line, width, ""), width));
-	}
-
-	private renderParams(model: GeneratedFailoverModel, width: number): string[] {
-		const { lines, add, border } = this.beginPanel(width);
-		add(this.theme.fg("accent", `Target Parameters: ${model.id}`));
-		const target = model.chain[this.paramsTargetIndex];
-		if (!target) {
-			add(this.theme.fg("warning", "No target selected"));
-			const lastBorder = border.at(-1);
-			if (lastBorder) add(lastBorder);
-			return lines.map((line) =>
-				padRight(truncateToWidth(line, width, ""), width),
-			);
-		}
-		add(this.theme.fg("dim", `Target: ${modelKey(target)}`));
-		add(this.theme.fg("dim", "Enter select/toggle  Esc back"));
-		add("");
-		const override = model.targetOverrides[modelKey(target)];
-		const selectedReasoning = this.paramsSelectionIndex === 0;
-		const configuredReasoning = override?.reasoningEffort;
-		add(
-			this.theme.fg(
-				selectedReasoning ? "accent" : "text",
-				`${selectedReasoning ? ">" : " "} Reasoning level: ${configuredReasoning ?? "inherit"}`,
-			),
-		);
-		for (const [index, parameter] of MODEL_PARAMETER_NAMES.entries()) {
-			const selected = index + 1 === this.paramsSelectionIndex;
-			const enabled = this.parameterEnabled(model, target, parameter);
 			add(
 				this.theme.fg(
-					selected ? "accent" : "text",
-					`${selected ? ">" : " "} ${PARAMETER_LABELS[parameter]}: ${enabled ? "on" : "off"}`,
-				),
-			);
-		}
-		if (this.targetReasoningSelectionIndex !== undefined) {
-			const choices = TARGET_REASONING_CHOICES.map((effort, index) => {
-				const label = effort ?? "inherit";
-				return index === this.targetReasoningSelectionIndex ? `[${label}]` : label;
-			}).join("  ");
-			add(
-				this.theme.fg(
-					"accent",
-					`Reasoning level: ${choices}  \u2191\u2193 move  Enter save  Esc cancel`,
+					"dim",
+					context.kind === "target"
+						? "digits or inherit  Enter save  Esc cancel"
+						: "digits  Enter save  Esc cancel",
 				),
 			);
 		}
 		const lastBorder = border.at(-1);
 		if (lastBorder) add(lastBorder);
 		return lines.map((line) => padRight(truncateToWidth(line, width, ""), width));
-	}
-
-	private settingValue(model: GeneratedFailoverModel, key: SettingKey): string {
-		switch (key) {
-			case "reasoning":
-				return model.reasoningEffort;
-			case "errorHandlingMode":
-				return ERROR_HANDLING_LABELS[model.errorHandlingMode];
-			case "maxRetries":
-				return String(model.maxRetries);
-			case "noProgressTimeoutSeconds":
-				return model.noProgressTimeoutSeconds === 0
-					? "off"
-					: `${model.noProgressTimeoutSeconds}s`;
-			case "targetParameters":
-				return model.chain.length > 0 ? "\u2192 edit" : "\u2192 none";
-			default:
-				return "";
-		}
 	}
 
 	render(width: number): string[] {
 		const view = this.getView();
-		if (this.settingsMode) {
-			const model = this.detailModel();
-			if (model) return this.renderSettings(model, width);
-			this.settingsMode = false;
+		if (
+			this.settingsTarget !== undefined ||
+			this.settingsScopeModelId !== undefined
+		) {
+			const settings = this.renderSettings(width);
+			if (settings.length > 0) return settings;
 		}
-
-		const { lines, add, border } = this.beginPanel(width);
-
+		const { lines, add, border } = createPanel(width, this.border);
 		if (this.addModelName !== undefined) {
 			add(this.theme.fg("accent", "Add failover model"));
 			add(this.theme.fg("accent", `Name: ${this.addModelName || "_"}`));
@@ -1001,34 +1167,33 @@ export class FailoverEditor implements Component {
 			add(this.theme.fg("accent", `Name: ${this.renameModelName || "_"}`));
 			add(this.theme.fg("dim", "type name  Enter save  Esc cancel"));
 		} else if (this.detailModelId === undefined) {
-			for (const line of this.renderMainHeader()) add(line);
+			add(this.theme.fg("accent", "Pi Model Failover"));
+			add(coordinationLine(view.coordination));
+			add(
+				this.theme.fg(
+					"dim",
+					"Enter edit  a add  d remove  e toggle  r rename  q close",
+				),
+			);
 			add("");
 			for (const line of this.renderModelList(view)) add(line);
 		} else {
 			const model = this.detailModel();
 			if (model) {
+				add(coordinationLine(view.coordination));
 				for (const line of this.renderDetail(view, model)) add(line);
 			} else {
 				this.detailModelId = undefined;
-				for (const line of this.renderMainHeader()) add(line);
+				this.closeSettings();
+				add(this.theme.fg("accent", "Pi Model Failover"));
+				add(coordinationLine(view.coordination));
 				add("");
 				for (const line of this.renderModelList(view)) add(line);
 			}
 		}
-
 		const lastBorder = border.at(-1);
 		if (lastBorder) add(lastBorder);
 		return lines.map((line) => padRight(truncateToWidth(line, width, ""), width));
-	}
-
-	private renderMainHeader(): string[] {
-		return [
-			this.theme.fg("accent", "Pi Model Failover"),
-			this.theme.fg(
-				"dim",
-				"Enter edit  a add  d remove  e toggle  r rename  q close",
-			),
-		];
 	}
 
 	invalidate(): void {
@@ -1038,9 +1203,10 @@ export class FailoverEditor implements Component {
 
 function historyTimestamp(timestamp: number): string {
 	const date = new Date(timestamp);
+	const pad = (value: number): string => String(value).padStart(2, "0");
 	return Number.isNaN(date.getTime())
 		? "---- -- -- --:--:--"
-		: date.toISOString().replace("T", " ").slice(0, 19);
+		: `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
 function historyThinking(entry: FailoverHistoryEntry): string {

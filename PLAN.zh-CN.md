@@ -1,6 +1,8 @@
 # Failover 模型供应商与生成模型——开发计划（草案）
 
-**状态：** 已纳入全部讨论决策的草案。本文档仅是开发计划；未经用户明确批准，不开始任何源代码实现。
+> **已被当前实现取代：** 本文是历史性的供应商迁移计划，不是当前实现契约。当前行为以 [README.md](README.md) 和 [DESIGN.md](DESIGN.md) 为准：v8 `getAgentDir()/model-failover.json` 只包含生成模型的 `id`、`name`、`enabled` 和有序链；v1-v7 迁移采用 shared-first，失败时按字节保留原文；共享目标设置和协调状态使用固定的 `~/.pi/agent/failover-state.json`；`models.json` 只读。
+
+**状态：** 保留作历史设计记录。已实现的 v8 架构取代本文；不要依据下方指令开始源代码实现。
 
 英文原稿：[`PLAN.md`](PLAN.md)
 
@@ -38,7 +40,7 @@
 
 - `src/config.ts` / `src/types.ts`：一条全局有序 `models` 链、全局策略、真实模型级请求参数开关和 reasoning 覆盖。
 - `src/index.ts`：生命周期错误回退状态机；当前会调用 `pi.setModel()`，并使用 `pi.sendMessage()` 发送 continuation。
-- `src/catalog.ts`：只观察 `ModelRegistry`，不注册供应商，也不维护 `models.json`。
+- `src/catalog.ts`：使用独立于扩展自持 `ModelRuntime` 的模型引用辅助逻辑；不注册供应商，也不维护 `models.json`。
 - `src/tui.ts`：编辑一条全局回退链及其策略。
 - 供应商请求 hook 注入 OpenAI 兼容参数，并且当前通过 `pi.setThinkingLevel()` 同步 Pi 原生 thinking。
 

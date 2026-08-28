@@ -73,6 +73,20 @@ export interface GeneratedFailoverConfig {
 	models: GeneratedFailoverModel[];
 }
 
+/** Final chain-only generated model shape; target policy and runtime live elsewhere. */
+export interface GeneratedFailoverModelV8 {
+	id: string;
+	name: string;
+	enabled: boolean;
+	chain: ModelRef[];
+}
+
+/** Version 8 chain-only configuration for the generated failover provider. */
+export interface GeneratedFailoverConfigV8 {
+	version: 8;
+	models: GeneratedFailoverModelV8[];
+}
+
 export interface FailoverConfig {
 	version: 5;
 	enabled: boolean;
@@ -96,7 +110,6 @@ export type FailureKind =
 	| "unknown"
 	| "no-progress"
 	| "cancelled"
-	| "tool-failure"
 	| "none";
 
 export interface FailureInput {
@@ -105,7 +118,6 @@ export interface FailureInput {
 	providerErrorCategory?: string;
 	stopReason?: string;
 	timedOut?: boolean;
-	toolError?: boolean;
 }
 
 export interface FailureClassification {

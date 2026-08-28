@@ -47,6 +47,14 @@ test("failure classification follows native-settled extension policy", () => {
 	assert.equal(classifyFailure({ status: 401 }).kind, "persistent");
 	assert.equal(classifyFailure({ status: 403 }).kind, "persistent");
 	assert.equal(classifyFailure({ status: 404 }).kind, "persistent");
+	assert.deepEqual(
+		classifyFailure({ message: "Target unavailable: provider/model" }),
+		{ kind: "persistent", reason: "model unavailable" },
+	);
+	assert.equal(
+		classifyFailure({ message: "Target unavailable" }).kind,
+		"unknown",
+	);
 	assert.equal(
 		classifyFailure({ message: "quota exceeded" }).kind,
 		"persistent",
@@ -96,19 +104,12 @@ test("failure classification follows native-settled extension policy", () => {
 		}).kind,
 		"unknown",
 	);
+	assert.equal(classifyFailure({ timedOut: true }).kind, "no-progress");
 	assert.equal(
 		classifyFailure({ timedOut: true, stopReason: "aborted" }).kind,
 		"no-progress",
 	);
-	assert.equal(
-		classifyFailure({ timedOut: true, toolError: true }).kind,
-		"tool-failure",
-	);
 	assert.equal(classifyFailure({ stopReason: "aborted" }).kind, "cancelled");
-	assert.equal(
-		classifyFailure({ toolError: true, stopReason: "error" }).kind,
-		"tool-failure",
-	);
 });
 
 test("error behavior modes choose retries before switching", () => {

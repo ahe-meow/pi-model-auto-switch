@@ -6,13 +6,26 @@ import { test } from "node:test";
 import {
 	DEFAULT_GENERATED_MODEL_ID,
 	DEFAULT_GENERATED_MODEL_NAME,
+	copyGeneratedConfigV8,
+	createGeneratedConfigV8,
 	createGeneratedModel,
+	extractLegacyTargetCandidates,
 	loadGeneratedConfig,
+	loadGeneratedConfigV8,
 	migrateGeneratedConfig,
 	saveGeneratedConfig,
+	saveGeneratedConfigV8,
+	stripLegacyToV8,
 	validateGeneratedConfig,
+	validateGeneratedConfigV8,
 } from "../src/generated-config.ts";
-import type { GeneratedFailoverConfig } from "../src/types.ts";
+import type {
+	GeneratedFailoverConfig,
+	GeneratedFailoverConfigV8,
+	GeneratedFailoverModel,
+	GeneratedFailoverModelV8,
+	ModelParameterToggles,
+} from "../src/types.ts";
 
 function legacyConfig(
 	overrides: Record<string, unknown> = {},
@@ -228,6 +241,409 @@ test("generated config persistence uses atomic CAS and strips legacy input field
 			await saveGeneratedConfig(path, loaded.config, loaded.revision),
 			{ kind: "conflict" },
 		);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+const togglesOn: ModelParameterToggles = {
+	promptCacheKey: true,
+	promptCacheRetention: true,
+	reasoningEffort: true,
+	sessionAffinity: true,
+};
+
+const togglesOff: ModelParameterToggles = {
+	promptCacheKey: false,
+	promptCacheRetention: false,
+	reasoningEffort: false,
+	sessionAffinity: false,
+};
+
+function v8Model(
+	overrides: Partial<GeneratedFailoverModelV8> = {},
+): GeneratedFailoverModelV8 {
+	return {
+		id: "primary",
+		name: "Primary",
+		enabled: true,
+		chain: [{ provider: "provider-a", id: "model-a" }],
+		...overrides,
+	};
+}
+
+function legacyGeneratedModel(
+	id: string,
+	name: string,
+	chain: GeneratedFailoverModel["chain"],
+	overrides: Partial<GeneratedFailoverModel> = {},
+): GeneratedFailoverModel {
+	return {
+		...createGeneratedModel(chain),
+		id,
+		name,
+		...overrides,
+	};
+}
+
+test("v8 create, copy, and validation preserve exact chain-only identity", () => {
+	const sourceModels = [
+		v8Model({
+			chain: [
+				{ provider: "provider-a", id: "model-a" },
+				{ provider: "provider-b", id: "model-b" },
+			],
+		}),
+		v8Model({ id: "disabled", name: "Disabled", enabled: false, chain: [] }),
+	];
+	const config = createGeneratedConfigV8(sourceModels);
+	assert.deepEqual(config, {
+		version: 8,
+		models: [
+			{
+				id: "primary",
+				name: "Primary",
+				enabled: true,
+				chain: [
+					{ provider: "provider-a", id: "model-a" },
+					{ provider: "provider-b", id: "model-b" },
+				],
+			},
+			{ id: "disabled", name: "Disabled", enabled: false, chain: [] },
+		],
+	});
+	assert.deepEqual(validateGeneratedConfigV8(config), config);
+
+	sourceModels[0]!.name = "Changed source";
+	sourceModels[0]!.chain[0]!.id = "changed-source";
+	assert.equal(config.models[0]!.name, "Primary");
+	assert.equal(config.models[0]!.chain[0]!.id, "model-a");
+	const copied = copyGeneratedConfigV8(config);
+	copied.models[0]!.name = "Changed copy";
+	copied.models[0]!.chain[0]!.id = "changed-copy";
+	assert.equal(config.models[0]!.name, "Primary");
+	assert.equal(config.models[0]!.chain[0]!.id, "model-a");
+
+	const invalid: unknown[] = [
+		{ ...config, secret: "never" },
+		{ version: 8, models: [{ ...v8Model(), maxRetries: 1 }] },
+		{
+			version: 8,
+			models: [
+				v8Model({
+					chain: [{ provider: "provider-a", id: "model-a", extra: true } as never],
+				}),
+			],
+		},
+		{ version: 8, models: [v8Model({ chain: [] })] },
+		{
+			version: 8,
+			models: [v8Model({ chain: [{ provider: "failover", id: "recursive" }] })],
+		},
+		{
+			version: 8,
+			models: [v8Model(), v8Model({ name: "Duplicate ID" })],
+		},
+		{
+			version: 8,
+			models: [
+				v8Model({
+					chain: [
+						{ provider: "provider-a", id: "model-a" },
+						{ provider: "provider-a", id: "model-a" },
+					],
+				}),
+			],
+		},
+	];
+	for (const value of invalid)
+		assert.equal(validateGeneratedConfigV8(value), undefined);
+});
+
+test("stripLegacyToV8 removes all policy fields and preserves model and chain order", () => {
+	const legacy: GeneratedFailoverConfig = {
+		version: 7,
+		models: [
+			legacyGeneratedModel(
+				"primary",
+				"Primary",
+				[
+					{ provider: "provider-b", id: "model-b" },
+					{ provider: "provider-a", id: "model-a" },
+				],
+				{
+					reasoningEffort: "max",
+					errorHandlingMode: "retry",
+					manualRecovery: { "provider-a/model-a": "HTTP 401" },
+				},
+			),
+			legacyGeneratedModel("disabled", "Disabled", [], { enabled: false }),
+		],
+	};
+	const stripped = stripLegacyToV8(legacy);
+	assert.ok(stripped);
+	assert.deepEqual(stripped, {
+		version: 8,
+		models: [
+			{
+				id: "primary",
+				name: "Primary",
+				enabled: true,
+				chain: [
+					{ provider: "provider-b", id: "model-b" },
+					{ provider: "provider-a", id: "model-a" },
+				],
+			},
+			{ id: "disabled", name: "Disabled", enabled: false, chain: [] },
+		],
+	});
+	assert.equal(JSON.stringify(stripped).includes("reasoningEffort"), false);
+	legacy.models[0]!.chain[0]!.id = "changed";
+	assert.equal(stripped.models[0]!.chain[0]!.id, "model-b");
+});
+
+test("legacy candidates preserve occurrence order, effective settings, and manual data", () => {
+	const targetA = { provider: "provider-a", id: "model-a" };
+	const targetB = { provider: "provider-b", id: "model-b" };
+	const legacy: GeneratedFailoverConfig = {
+		version: 7,
+		models: [
+			legacyGeneratedModel("first", "First", [targetA, targetB], {
+				reasoningEffort: "high",
+				errorHandlingMode: "retry",
+				maxRetries: 2,
+				noProgressTimeoutSeconds: 60,
+				modelParameters: togglesOn,
+				targetOverrides: {
+					"provider-a/model-a": {
+						reasoningEffort: "low",
+						modelParameters: togglesOff,
+					},
+				},
+				manualRecovery: { "provider-b/model-b": "HTTP 429" },
+			}),
+			legacyGeneratedModel("second", "Second", [targetA], {
+				enabled: false,
+				reasoningEffort: "max",
+				errorHandlingMode: "switch",
+				maxRetries: 4,
+				noProgressTimeoutSeconds: 120,
+				modelParameters: togglesOn,
+				manualRecovery: { "provider-a/model-a": "HTTP 401" },
+			}),
+			legacyGeneratedModel("third", "Third", [targetA], {
+				reasoningEffort: "medium",
+				errorHandlingMode: "smart",
+				maxRetries: 1,
+				noProgressTimeoutSeconds: 90,
+				modelParameters: togglesOff,
+				manualRecovery: { "provider-a/model-a": "HTTP 403" },
+			}),
+		],
+	};
+	const candidates = extractLegacyTargetCandidates(legacy);
+	assert.deepEqual(
+		candidates.map((candidate) => ({
+			target: candidate.target,
+			source: candidate.source,
+			manualRecoveryReason: candidate.manualRecoveryReason,
+		})),
+		[
+			{
+				target: targetA,
+				source: 'generated model "First" (first), chain position 1',
+				manualRecoveryReason: undefined,
+			},
+			{
+				target: targetB,
+				source: 'generated model "First" (first), chain position 2',
+				manualRecoveryReason: "HTTP 429",
+			},
+			{
+				target: targetA,
+				source: 'generated model "Second" (second), chain position 1',
+				manualRecoveryReason: "HTTP 401",
+			},
+			{
+				target: targetA,
+				source: 'generated model "Third" (third), chain position 1',
+				manualRecoveryReason: "HTTP 403",
+			},
+		],
+	);
+	assert.deepEqual(candidates[0]!.settings, {
+		enabled: true,
+		errorHandlingMode: "retry",
+		maxRetries: 2,
+		noProgressTimeoutSeconds: 60,
+		reasoningEffort: "low",
+		modelParameters: togglesOff,
+	});
+	assert.deepEqual(candidates[1]!.settings, {
+		enabled: true,
+		errorHandlingMode: "retry",
+		maxRetries: 2,
+		noProgressTimeoutSeconds: 60,
+		reasoningEffort: "high",
+		modelParameters: togglesOn,
+	});
+	assert.deepEqual(candidates[2]!.settings, {
+		enabled: true,
+		errorHandlingMode: "switch",
+		maxRetries: 4,
+		noProgressTimeoutSeconds: 120,
+		reasoningEffort: "max",
+		modelParameters: togglesOn,
+	});
+	assert.equal(Object.hasOwn(candidates[0]!, "manualRecoveryReason"), false);
+});
+
+test("v8 loader classifies supported v1-v7 legacy sources without writing", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-model-v8-legacy-load-"));
+	const path = join(directory, "model-failover.json");
+	try {
+		const missing = await loadGeneratedConfigV8(path);
+		assert.equal(missing.kind, "missing");
+		for (const version of [1, 2, 3, 4, 5] as const) {
+			const bytes = `${JSON.stringify(legacyConfig({ version }), null, 2)}\n`;
+			await writeFile(path, bytes, "utf8");
+			const loaded = await loadGeneratedConfigV8(path);
+			assert.equal(loaded.kind, "legacy", `version ${String(version)}`);
+			if (loaded.kind !== "legacy") continue;
+			assert.equal(loaded.sourceVersion, version);
+			assert.equal(loaded.config.version, 7);
+			assert.equal(loaded.v8.version, 8);
+			assert.equal(loaded.candidates.length, 2);
+			assert.equal(await readFile(path, "utf8"), bytes);
+		}
+
+		const generated = legacyGeneratedModel("primary", "Primary", [
+			{ provider: "provider-a", id: "model-a" },
+		]);
+		for (const [version, value] of [
+			[6, { version: 6, models: [{ ...generated, cooldownMinutes: 30 }] }],
+			[7, { version: 7, models: [generated] }],
+		] as const) {
+			const bytes = JSON.stringify(value);
+			await writeFile(path, bytes, "utf8");
+			const loaded = await loadGeneratedConfigV8(path);
+			assert.equal(loaded.kind, "legacy");
+			if (loaded.kind !== "legacy") continue;
+			assert.equal(loaded.sourceVersion, version);
+			assert.deepEqual(loaded.v8.models, [
+				{
+					id: "primary",
+					name: "Primary",
+					enabled: true,
+					chain: [{ provider: "provider-a", id: "model-a" }],
+				},
+			]);
+			assert.equal(await readFile(path, "utf8"), bytes);
+		}
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("v8 loader blocks recursive legacy targets and preserves v5/v7 bytes", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-model-v8-recursive-load-"));
+	const path = join(directory, "model-failover.json");
+	const recursiveTarget = { provider: "failover", id: "recursive" };
+	const recursiveV7: GeneratedFailoverConfig = {
+		version: 7,
+		models: [legacyGeneratedModel("primary", "Primary", [recursiveTarget])],
+	};
+	try {
+		assert.equal(stripLegacyToV8(recursiveV7), undefined);
+		for (const [version, value] of [
+			[5, legacyConfig({ models: [recursiveTarget] })],
+			[7, recursiveV7],
+		] as const) {
+			assert.ok(
+				validateGeneratedConfig(value),
+				`legacy version ${String(version)}`,
+			);
+			const bytes = `${JSON.stringify(value, null, "\t")}\n`;
+			await writeFile(path, bytes, "utf8");
+			const loaded = await loadGeneratedConfigV8(path);
+			assert.equal(loaded.kind, "blocked", `version ${String(version)}`);
+			if (loaded.kind !== "blocked") continue;
+			assert.equal(loaded.reason, "invalid");
+			assert.equal(Object.hasOwn(loaded, "config"), false);
+			assert.equal(Object.hasOwn(loaded, "v8"), false);
+			assert.equal(Object.hasOwn(loaded, "candidates"), false);
+			assert.equal(await readFile(path, "utf8"), bytes);
+		}
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("v8 loader blocks future, malformed, and invalid bytes without changing them", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-model-v8-blocked-load-"));
+	const path = join(directory, "model-failover.json");
+	try {
+		const cases = [
+			{
+				bytes: '{"version":9,"models":[],"future":"preserve"}\n',
+				reason: "future-version",
+			},
+			{ bytes: '{"version":', reason: "malformed" },
+			{
+				bytes: JSON.stringify({
+					version: 8,
+					models: [{ ...v8Model(), maxRetries: 2 }],
+				}),
+				reason: "invalid",
+			},
+		] as const;
+		for (const entry of cases) {
+			await writeFile(path, entry.bytes, "utf8");
+			const loaded = await loadGeneratedConfigV8(path);
+			assert.equal(loaded.kind, "blocked");
+			if (loaded.kind === "blocked") assert.equal(loaded.reason, entry.reason);
+			assert.equal(await readFile(path, "utf8"), entry.bytes);
+		}
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("v8 save validates, round trips, and detects source conflicts", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "pi-model-v8-save-"));
+	const path = join(directory, "model-failover.json");
+	try {
+		const missing = await loadGeneratedConfigV8(path);
+		assert.equal(missing.kind, "missing");
+		if (missing.kind !== "missing") return;
+		const config: GeneratedFailoverConfigV8 = createGeneratedConfigV8([
+			v8Model(),
+			v8Model({ id: "disabled", name: "Disabled", enabled: false, chain: [] }),
+		]);
+		assert.deepEqual(
+			await saveGeneratedConfigV8(path, config, missing.revision),
+			{ kind: "saved" },
+		);
+		const loaded = await loadGeneratedConfigV8(path);
+		assert.equal(loaded.kind, "loaded-v8");
+		if (loaded.kind !== "loaded-v8") return;
+		assert.deepEqual(loaded.config, config);
+		assert.deepEqual(JSON.parse(await readFile(path, "utf8")) as unknown, config);
+		await assert.rejects(
+			saveGeneratedConfigV8(
+				path,
+				{ ...config, secret: "never" } as GeneratedFailoverConfigV8,
+				loaded.revision,
+			),
+			/invalid version 8 generated config/,
+		);
+
+		const replacement = '{"external":true}\n';
+		await writeFile(path, replacement, "utf8");
+		assert.deepEqual(await saveGeneratedConfigV8(path, config, loaded.revision), {
+			kind: "conflict",
+		});
+		assert.equal(await readFile(path, "utf8"), replacement);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
