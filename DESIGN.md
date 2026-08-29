@@ -228,7 +228,7 @@ Transition history is bounded to 100 entries for the selected session. Persisted
 - [x] Global target enablement, cooldown, failures, `nextEligibleAt`, cumulative cooldown, and manual recovery remain outside chain-scope policy; legacy `lease` input is stripped on write.
 - [x] Historical error tool results remain request context and do not synthesize a provider failure; Pi tool execution stays outside provider classification.
 - [x] Credential material is redacted, provider text is bounded, C0/C1 controls are removed, and unsafe history entries are rejected.
-- [x] Final full custom-loader verification passed 208/208; `git diff --check` passed; primary LSP diagnostics reported 0 findings across the 7 core files.
+- [x] Final full custom-loader verification passed 209/209; `git diff --check` passed; primary LSP diagnostics reported 0 findings across the 7 core files.
 - [x] `node ./node_modules/typescript/lib/tsc.js --noEmit --pretty false` passed. An isolated live `failover/orc-peon` smoke passed through real Pi/provider authentication with exit code 0, exact marker `REAL_FAILOVER_SMOKE_OK`, empty stderr, and no 401, 403, or model-unavailable result; it did not force a first-target failure or verify an automatic switch.
 
 Verification commands:

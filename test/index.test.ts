@@ -1059,6 +1059,64 @@ test("/failover uses Pi autocomplete rows for add-target candidates", async () =
 	);
 });
 
+test("TUI requests a render after an async target action settles", async () => {
+	await writeV8([chainModel("primary", [targetA], { name: "Primary" })]);
+	const base = createFileSharedState({ path: sharedPath });
+	let release: (() => void) | undefined;
+	let resolveStarted: (() => void) | undefined;
+	const started = new Promise<void>((resolve) => {
+		resolveStarted = resolve;
+	});
+	const delayed = new Proxy(base, {
+		get(target, property, receiver) {
+			if (property === "updateSettings") {
+				return async (
+					target: Parameters<SharedStateAdapter["updateSettings"]>[0],
+					patch: Parameters<SharedStateAdapter["updateSettings"]>[1],
+				) => {
+					resolveStarted?.();
+					await new Promise<void>((resolve) => {
+						release = resolve;
+					});
+					return base.updateSettings(target, patch);
+				};
+			}
+			return Reflect.get(target, property, receiver);
+		},
+	}) as SharedStateAdapter;
+	const harness = await createHarness({
+		targetRuntime: makeTargetRuntime([modelA, modelB]),
+		sharedState: delayed,
+	});
+	let renderCount = 0;
+	let editor: TestEditor | undefined;
+	await harness.commands[0]!.handler(
+		"",
+		createContext({
+			custom: async (create) => {
+				editor = create(
+					{ requestRender: () => (renderCount += 1) },
+					{ fg: (_color: string, text: string) => text },
+					{},
+					() => undefined,
+				) as TestEditor;
+			},
+		}),
+	);
+	if (!editor) throw new Error("failover editor was not created");
+
+	editor.handleInput("\r");
+	renderCount = 0;
+	editor.handleInput("e");
+	await started;
+	assert.equal(renderCount, 1);
+	if (!release) throw new Error("target update was not suspended");
+	release();
+	await editor.whenIdle();
+	assert.equal(renderCount, 2);
+	assert.match(editor.render(120).join("\n"), /openai\/gpt-5 \[disabled\]/);
+});
+
 test("second session refreshes the chain after another session adds a target", async () => {
 	await writeV8([chainModel("primary", [targetA], { name: "Primary" })]);
 	const first = await createHarness({

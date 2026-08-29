@@ -1437,8 +1437,12 @@ function registerFailoverCommand(
 					invalidate: () => editor.invalidate(),
 					whenIdle: () => editor.whenIdle(),
 					handleInput: (data: string) => {
+						const idleBeforeInput = editor.whenIdle();
 						editor.handleInput(data);
 						tui.requestRender();
+						const idleAfterInput = editor.whenIdle();
+						if (idleAfterInput !== idleBeforeInput)
+							void idleAfterInput.then(() => tui.requestRender());
 					},
 				};
 			});

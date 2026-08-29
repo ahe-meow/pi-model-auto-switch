@@ -100,7 +100,7 @@ Transitions are exposed through the Footer and `/failover history`, which record
 
 ## Development and testing
 
-Final verification passed the full custom-loader suite: 208/208 tests. `git diff --check` passed. Primary LSP diagnostics reported 0 findings across the 7 core files. `node ./node_modules/typescript/lib/tsc.js --noEmit --pretty false` passed. An isolated live `failover/orc-peon` smoke also passed through real Pi/provider authentication: exit code 0, exact marker `REAL_FAILOVER_SMOKE_OK`, empty stderr, and no 401, 403, or model-unavailable result. The smoke did not force a first-target failure or verify an automatic target switch.
+Final verification passed the full custom-loader suite: 209/209 tests. `git diff --check` passed. Primary LSP diagnostics reported 0 findings across the 7 core files. `node ./node_modules/typescript/lib/tsc.js --noEmit --pretty false` passed. An isolated live `failover/orc-peon` smoke also passed through real Pi/provider authentication: exit code 0, exact marker `REAL_FAILOVER_SMOKE_OK`, empty stderr, and no 401, 403, or model-unavailable result. The smoke did not force a first-target failure or verify an automatic target switch.
 
 With the local TypeScript dependency present, the standard commands are:
 
