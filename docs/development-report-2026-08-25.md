@@ -6,7 +6,7 @@
 
 ## 1. 结论
 
-本轮实现已完成并通过最终完整的自定义 TypeScript loader 测试套件：`202/202`。`git diff --check` 通过；primary LSP diagnostics 在 7 个核心文件中报告 0 findings。`node ./node_modules/typescript/lib/tsc.js --noEmit --pretty false` 通过。本次 isolated `failover/orc-peon` live smoke 也通过了真实 Pi/provider authentication：exit code 为 0，stdout 包含精确 marker `REAL_FAILOVER_SMOKE_OK`，stderr 为空，且没有出现 401、403 或 model unavailable。该 smoke 没有强制 first target 失败，也没有验证自动 target switch。v8 的核心边界已经稳定：生成配置只保存链身份、顺序和启用状态；固定共享状态保存精确真实目标的运行协调信息，以及按生成链隔离的策略 scope 和 target override。
+本轮实现已完成并通过最终完整的自定义 TypeScript loader 测试套件：`208/208`。`git diff --check` 通过；primary LSP diagnostics 在 7 个核心文件中报告 0 findings。`node ./node_modules/typescript/lib/tsc.js --noEmit --pretty false` 通过。本次 isolated `failover/orc-peon` live smoke 也通过了真实 Pi/provider authentication：exit code 为 0，stdout 包含精确 marker `REAL_FAILOVER_SMOKE_OK`，stderr 为空，且没有出现 401、403 或 model unavailable。该 smoke 没有强制 first target 失败，也没有验证自动 target switch。v8 的核心边界已经稳定：生成配置只保存链身份、顺序和启用状态；固定共享状态保存精确真实目标的运行协调信息，以及按生成链隔离的策略 scope 和 target override。
 
 首轮启动写入的是空 v8 配置。系统不会自动把当前模型写入授权链，用户必须先创建生成链，再显式添加真实目标。配置、迁移、共享状态或协调写入无法验证时，系统采取 fail-closed 行为：保留原始字节，阻止路由和写操作，不使用未经持久化确认的本地降级状态继续运行。
 
@@ -272,7 +272,7 @@ provider error、transition reason、manual recovery reason 和 history field �
 
 ## 9. TUI 与 session history
 
-TUI 主列表、detail target chain 和 add-target candidate list 都使用 20 行 viewport 和可见范围。快速按键通过 action queue 串行化，覆盖 reorder、target enabled 和 parameter override。
+TUI 主列表和 detail target chain 保持 20 行 viewport 和可见范围；Add-target candidate 行数读取 Pi 的 `autocompleteMaxVisible`，扣除固定 UI 预留行后安全显示。所有渲染行仍按可用宽度裁剪。快速按键通过 action queue 串行化，覆盖 reorder、target enabled 和 parameter override。
 
 `/failover history` 显示当前 Pi session 的最近切换，包含 source、target、reasoning 映射、reason 和本地时间。历史最多 100 条，按最新优先。持久 session 使用 namespaced Pi custom entries 跨 extension reload/session resume 恢复；ephemeral session 只保留内存历史，不 append custom entry。history entry 不进入模型 context。
 
@@ -290,12 +290,14 @@ git diff --check -- README.md DESIGN.md docs/development-report-2026-08-25.md
 
 观察结果：
 
-- 最终完整 custom-loader suite：`202/202` 通过；
+- 最终完整 custom-loader suite：`208/208` 通过；
 - primary LSP diagnostics：7 个核心文件 0 findings；
 - TypeScript：`node ./node_modules/typescript/lib/tsc.js --noEmit --pretty false` 通过；
 - `git diff --check`：通过；
 - Markdown fence/trailing-whitespace 检查：通过；
 - 过时机制 grep：确认目标文档不再把目标使用描述为独占、可释放或可续期；同时确认保留 filesystem lock 与 `releaseOwnedLock` 语义。
+
+本次 Add-target TUI 边界与直接搜索回归观察：主列表和 detail target chain 保持 20 行 viewport；候选行数读取 Pi 的 `autocompleteMaxVisible`，扣除固定 UI 预留行后安全显示，所有渲染行仍按可用宽度裁剪。候选打开后直接输入按 `provider/model` 大小写不敏感过滤，Backspace 删除，Up/Down 滚动，Enter 添加，Esc 先清空搜索再关闭；无匹配时显示提示且禁止添加。
 
 Node 测试运行期间可能出现预期的 experimental loader warning；没有测试失败。
 

@@ -183,6 +183,12 @@ const ERROR_HANDLING_LABELS: Record<ErrorHandlingMode, string> = {
 
 const MAX_VISIBLE_ROWS = 20;
 
+function normalizeVisibleRows(value: number | undefined): number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0
+		? Math.max(1, Math.floor(value))
+		: MAX_VISIBLE_ROWS;
+}
+
 function isParameterKey(value: SettingKey): value is ModelParameterName {
 	return (MODEL_PARAMETER_NAMES as readonly string[]).includes(value);
 }
@@ -248,6 +254,8 @@ export class FailoverEditor implements Component {
 	private detailTargetIndex = 0;
 	private detailScrollOffset = 0;
 	private addTargetCandidates: readonly ModelRef[] | undefined;
+	private addTargetAllCandidates: readonly ModelRef[] | undefined;
+	private addTargetSearch = "";
 	private addTargetSelectionIndex: number | undefined;
 	private addTargetScrollOffset = 0;
 	private addModelName: string | undefined;
@@ -270,9 +278,13 @@ export class FailoverEditor implements Component {
 		private readonly theme: Theme,
 		private readonly getView: () => FailoverTuiView,
 		private readonly actions: FailoverTuiActions,
+		options: { maxVisibleRows?: number } = {},
 	) {
+		this.maxAddTargetRows = normalizeVisibleRows(options.maxVisibleRows);
 		this.border = new DynamicBorder((text: string) => theme.fg("accent", text));
 	}
+
+	private readonly maxAddTargetRows: number;
 
 	private runAction(action: () => Promise<void>): void {
 		const previous = this.actionQueue;
@@ -333,11 +345,29 @@ export class FailoverEditor implements Component {
 			this.addTargetScrollOffset = 0;
 			return;
 		}
-		const maxOffset = Math.max(0, count - MAX_VISIBLE_ROWS);
+		const maxOffset = Math.max(0, count - this.maxAddTargetRows);
 		if (index < this.addTargetScrollOffset) this.addTargetScrollOffset = index;
-		else if (index >= this.addTargetScrollOffset + MAX_VISIBLE_ROWS)
-			this.addTargetScrollOffset = index - MAX_VISIBLE_ROWS + 1;
+		else if (index >= this.addTargetScrollOffset + this.maxAddTargetRows)
+			this.addTargetScrollOffset = index - this.maxAddTargetRows + 1;
 		this.addTargetScrollOffset = Math.min(this.addTargetScrollOffset, maxOffset);
+	}
+
+	private closeAddTarget(): void {
+		this.addTargetCandidates = undefined;
+		this.addTargetAllCandidates = undefined;
+		this.addTargetSearch = "";
+		this.addTargetSelectionIndex = undefined;
+		this.addTargetScrollOffset = 0;
+	}
+
+	private updateAddTargetSearch(search: string): void {
+		this.addTargetSearch = search;
+		const normalized = search.toLowerCase();
+		this.addTargetCandidates = this.addTargetAllCandidates?.filter((target) =>
+			modelKey(target).toLowerCase().includes(normalized),
+		);
+		this.addTargetSelectionIndex = 0;
+		this.addTargetScrollOffset = 0;
 	}
 
 	private isCancelInput(data: string): boolean {
@@ -689,37 +719,46 @@ export class FailoverEditor implements Component {
 			(target) => !configured.has(modelKey(target)),
 		);
 		if (candidates.length === 0) return;
-		this.addTargetCandidates = candidates;
-		this.addTargetSelectionIndex = 0;
-		this.addTargetScrollOffset = 0;
+		this.addTargetAllCandidates = candidates;
+		this.updateAddTargetSearch("");
 	}
 
 	private handleAddTargetInput(data: string, modelId: string): void {
 		const candidates = this.addTargetCandidates;
 		const index = this.addTargetSelectionIndex;
 		if (!candidates || index === undefined) return;
-		if (this.isCancelInput(data)) {
-			this.addTargetCandidates = undefined;
-			this.addTargetSelectionIndex = undefined;
-			this.addTargetScrollOffset = 0;
+		if (matchesKey(data, Key.escape)) {
+			if (this.addTargetSearch.length > 0) this.updateAddTargetSearch("");
+			else this.closeAddTarget();
 			return;
 		}
-		if (matchesKey(data, Key.up)) {
+		if (matchesKey(data, Key.ctrl("c"))) {
+			this.closeAddTarget();
+			return;
+		}
+		if (matchesKey(data, Key.backspace)) {
+			if (this.addTargetSearch.length > 0)
+				this.updateAddTargetSearch(this.addTargetSearch.slice(0, -1));
+			return;
+		}
+		if (matchesKey(data, Key.up) && candidates.length > 0) {
 			this.addTargetSelectionIndex = Math.max(0, index - 1);
 			this.clampAddTarget();
 			return;
 		}
-		if (matchesKey(data, Key.down)) {
+		if (matchesKey(data, Key.down) && candidates.length > 0) {
 			this.addTargetSelectionIndex = Math.min(candidates.length - 1, index + 1);
 			this.clampAddTarget();
 			return;
 		}
-		if (!matchesKey(data, Key.enter)) return;
-		const target = candidates[index];
-		this.addTargetCandidates = undefined;
-		this.addTargetSelectionIndex = undefined;
-		this.addTargetScrollOffset = 0;
-		if (target) this.runAction(() => this.actions.onAddTarget(modelId, target));
+		if (matchesKey(data, Key.enter)) {
+			const target = candidates[index];
+			if (!target) return;
+			this.closeAddTarget();
+			this.runAction(() => this.actions.onAddTarget(modelId, target));
+			return;
+		}
+		if (data.length === 1) this.updateAddTargetSearch(this.addTargetSearch + data);
 	}
 
 	private handleTextInput(
@@ -1020,22 +1059,22 @@ export class FailoverEditor implements Component {
 		if (!candidates || selectedIndex === undefined) return [];
 		this.clampAddTarget();
 		const start = this.addTargetScrollOffset;
-		const end = Math.min(start + MAX_VISIBLE_ROWS, candidates.length);
-		const selected = candidates[selectedIndex];
+		const end = Math.min(start + this.maxAddTargetRows, candidates.length);
+		const showing = candidates.length === 0 ? "0-0" : `${start + 1}-${end}`;
 		const lines = [
 			this.theme.fg(
 				"dim",
-				`Candidates: ${candidates.length}  Showing ${start + 1}-${end}`,
+				`Candidates: ${candidates.length}  Showing ${showing}`,
 			),
-			...(selected
-				? [
-						this.theme.fg(
-							"accent",
-							`Add target ${selectedIndex + 1}/${candidates.length}: ${modelKey(selected)}  Up/Down move  Enter add  Esc cancel`,
-						),
-					]
-				: []),
+			this.theme.fg(
+				"dim",
+				`Search: ${this.addTargetSearch || "(type to filter)"}  Type to filter  Up/Down move  Enter add  Esc clear/cancel`,
+			),
 		];
+		if (candidates.length === 0) {
+			lines.push(this.theme.fg("warning", "No matching targets"));
+			return lines;
+		}
 		for (let index = start; index < end; index++) {
 			const target = candidates[index];
 			if (!target) continue;
@@ -1060,6 +1099,14 @@ export class FailoverEditor implements Component {
 		view: FailoverTuiView,
 		model: GeneratedFailoverModelV8,
 	): string[] {
+		if (this.addTargetSelectionIndex !== undefined) {
+			return [
+				this.theme.fg("accent", `Add target to: ${model.id}`),
+				`Name: ${model.name}`,
+				"",
+				...this.renderAddTargetCandidates(),
+			];
+		}
 		return [
 			this.theme.fg("accent", `Failover Model: ${model.id}`),
 			`Name: ${model.name}  Enabled: ${model.enabled ? "yes" : "no"}`,
@@ -1069,9 +1116,6 @@ export class FailoverEditor implements Component {
 			),
 			"",
 			...this.renderChain(view, model),
-			...(this.addTargetSelectionIndex === undefined
-				? []
-				: this.renderAddTargetCandidates()),
 		];
 	}
 

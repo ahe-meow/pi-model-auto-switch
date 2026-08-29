@@ -3,7 +3,11 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { getAgentDir, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import {
+	getAgentDir,
+	ModelRuntime,
+	SettingsManager,
+} from "@earendil-works/pi-coding-agent";
 import { uniqueModels } from "./catalog.ts";
 import { isValidMaxRetries, isValidTimeoutSeconds } from "./config.ts";
 import {
@@ -70,6 +74,20 @@ const MAX_HISTORY_MAPPED_EFFORT_LENGTH = 256;
 const MAX_HISTORY_TIMESTAMP = 8_640_000_000_000_000;
 const MAX_GENERATED_ID_LENGTH = 64;
 const MAX_GENERATED_NAME_LENGTH = 120;
+const ADD_TARGET_RESERVED_ROWS = 3;
+
+function addTargetVisibleRows(ctx: ExtensionContext): number | undefined {
+	try {
+		const maxVisible = SettingsManager.create(
+			ctx.cwd,
+			getAgentDir(),
+		).getAutocompleteMaxVisible();
+		if (!Number.isFinite(maxVisible) || maxVisible <= 0) return undefined;
+		return Math.max(1, Math.floor(maxVisible) - ADD_TARGET_RESERVED_ROWS);
+	} catch {
+		return undefined;
+	}
+}
 
 type FailoverTargetStatus =
 	NonNullable<FailoverProviderState["onTarget"]> extends (
@@ -1406,9 +1424,15 @@ function registerFailoverCommand(
 					"Failover target availability refresh failed; using the last known target snapshot.",
 					"warning",
 				);
+			const maxAddTargetRows = addTargetVisibleRows(ctx);
 			await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
 				const actions = createFailoverActions(ctx, runtime, () => done());
-				const editor = new FailoverEditor(theme, () => viewFor(runtime), actions);
+				const editor = new FailoverEditor(
+					theme,
+					() => viewFor(runtime),
+					actions,
+					{ maxVisibleRows: maxAddTargetRows },
+				);
 				return {
 					render: (width: number) => editor.render(width),
 					invalidate: () => editor.invalidate(),

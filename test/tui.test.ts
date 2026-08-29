@@ -714,6 +714,165 @@ test("settings closes safely when its target disappears", () => {
 	assert.match(editor.render(120).join("\n"), /No targets configured/);
 });
 
+test("add-target candidates hide long detail chains in an independent bounded view", () => {
+	const chain = Array.from({ length: 100 }, (_, index) => ({
+		provider: "p",
+		id: `chain-target-${index}`,
+	}));
+	const targets = new Map(
+		chain.map((target) => [`${target.provider}/${target.id}`, record()]),
+	);
+	const available = Array.from({ length: 6 }, (_, index) => ({
+		provider: "p",
+		id: `candidate-${index}`,
+	}));
+	const view = makeView([model({ chain })], targets, available);
+	const editor = new FailoverEditor(
+		theme,
+		() => view,
+		makeActions(),
+		{ maxVisibleRows: 3 },
+	);
+
+	openDetail(editor);
+	editor.handleInput("a");
+	let rendered = editor.render(120).join("\n");
+	assert.match(rendered, /Candidates: 6/);
+	assert.ok(rendered.includes("> 1. p/candidate-0"));
+	assert.doesNotMatch(rendered, /Targets: 100/);
+	assert.doesNotMatch(rendered, /p\/chain-target-99/);
+
+	for (let index = 0; index < 3; index++) editor.handleInput("\x1b[B");
+	rendered = editor.render(120).join("\n");
+	assert.match(rendered, /Showing 2-4/);
+	assert.ok(rendered.includes("> 4. p/candidate-3"));
+});
+
+test("add-target candidates respect max visible rows and scroll selection into view", () => {
+	const available = Array.from({ length: 6 }, (_, index) => ({
+		provider: "p",
+		id: `candidate-${index}`,
+	}));
+	const view = makeView([model({ chain: [] })], new Map(), available);
+	const editor = new FailoverEditor(
+		theme,
+		() => view,
+		makeActions(),
+		{ maxVisibleRows: 3 },
+	);
+	openDetail(editor);
+	editor.handleInput("a");
+	let rendered = editor.render(120).join("\n");
+	assert.match(rendered, /Candidates: 6 {2}Showing 1-3/);
+	assert.equal(
+		rendered
+			.split("\n")
+			.filter((line) => line.includes("candidate-"))
+			.length,
+		3,
+	);
+	assert.equal(rendered.includes("p/candidate-3"), false);
+
+	for (let index = 0; index < 3; index++) editor.handleInput("\x1b[B");
+	rendered = editor.render(120).join("\n");
+	assert.match(rendered, /Candidates: 6 {2}Showing 2-4/);
+	assert.ok(rendered.includes("> 4. p/candidate-3"));
+});
+
+test("add-target search filters directly and backspace broadens matches", () => {
+	const available = [
+		{ provider: "openai", id: "gpt-5" },
+		{ provider: "openai", id: "gpt-4" },
+		{ provider: "openai", id: "gpt-4o" },
+		{ provider: "anthropic", id: "claude" },
+	];
+	const view = makeView([model({ chain: [] })], new Map(), available);
+	const editor = new FailoverEditor(
+		theme,
+		() => view,
+		makeActions(),
+		{ maxVisibleRows: 5 },
+	);
+	openDetail(editor);
+	editor.handleInput("a");
+	editor.handleInput("4");
+	editor.handleInput("O");
+	let rendered = editor.render(120).join("\n");
+	assert.ok(rendered.includes("Search: 4O"));
+	assert.ok(rendered.includes("Candidates: 1"));
+	assert.ok(rendered.includes("openai/gpt-4o"));
+	assert.equal(rendered.includes("openai/gpt-5"), false);
+	assert.equal(
+		rendered
+			.split("\n")
+			.some((line) => /(?:^| )openai\/gpt-4\s*$/.test(line)),
+		false,
+	);
+	assert.equal(rendered.includes("anthropic/claude"), false);
+
+	editor.handleInput("\x7f");
+	rendered = editor.render(120).join("\n");
+	assert.ok(rendered.includes("Search: 4"));
+	assert.ok(rendered.includes("Candidates: 2"));
+	assert.equal(
+		rendered.split("\n").some((line) => line.trim().endsWith("openai/gpt-4")),
+		true,
+	);
+	assert.ok(rendered.includes("openai/gpt-4o"));
+
+	editor.handleInput("q");
+	rendered = editor.render(120).join("\n");
+	assert.ok(rendered.includes("Search: 4q"));
+	assert.ok(rendered.includes("Candidates: 0"));
+});
+
+test("add-target search does not add when there are no matches", async () => {
+	const available = [{ provider: "openai", id: "gpt-5" }];
+	const view = makeView([model({ chain: [] })], new Map(), available);
+	const calls: ModelRef[] = [];
+	const editor = new FailoverEditor(
+		theme,
+		() => view,
+		makeActions({
+			onAddTarget: async (_id, target) => {
+				calls.push(target);
+			},
+		}),
+		{ maxVisibleRows: 3 },
+	);
+	openDetail(editor);
+	editor.handleInput("a");
+	for (const character of "zzz") editor.handleInput(character);
+	assert.ok(editor.render(120).join("\n").includes("No matching targets"));
+	editor.handleInput("\r");
+	await editor.whenIdle();
+	assert.deepEqual(calls, []);
+});
+
+test("add-target search uses the first Escape to clear and the second to close", () => {
+	const available = [{ provider: "openai", id: "gpt-5" }];
+	const view = makeView([model({ chain: [] })], new Map(), available);
+	const editor = new FailoverEditor(
+		theme,
+		() => view,
+		makeActions(),
+		{ maxVisibleRows: 3 },
+	);
+	openDetail(editor);
+	editor.handleInput("a");
+	editor.handleInput("g");
+	assert.ok(editor.render(120).join("\n").includes("Search: g"));
+
+	editor.handleInput("\x1b");
+	let rendered = editor.render(120).join("\n");
+	assert.equal(rendered.includes("Search: g"), false);
+	assert.ok(rendered.includes("Candidates:"));
+
+	editor.handleInput("\x1b");
+	rendered = editor.render(120).join("\n");
+	assert.equal(rendered.includes("Candidates:"), false);
+});
+
 test("add-target candidates remain bounded and Enter dispatches selected item", async () => {
 	const available = Array.from({ length: 100 }, (_, index) => ({
 		provider: "p",

@@ -24,6 +24,7 @@ const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 process.env.PI_CODING_AGENT_DIR = agentDir;
 
 const configPath = join(agentDir, "model-failover.json");
+const settingsPath = join(agentDir, "settings.json");
 const modelsPath = join(agentDir, "models.json");
 const sharedPath = join(agentDir, "shared-state.json");
 const sessionPath = join(agentDir, "session.jsonl");
@@ -230,6 +231,7 @@ async function resetFiles(): Promise<void> {
 	for (const path of [
 		configPath,
 		`${configPath}.lock`,
+		settingsPath,
 		sharedPath,
 		`${sharedPath}.lock`,
 	])
@@ -239,6 +241,7 @@ async function resetFiles(): Promise<void> {
 
 function createContext(
 	options: {
+		cwd?: string;
 		notifications?: string[];
 		statuses?: string[];
 		custom?: (create: Function) => Promise<void>;
@@ -255,6 +258,7 @@ function createContext(
 			: (options.sessionFile ?? sessionPath);
 	return {
 		mode: "tui",
+		cwd: options.cwd ?? agentDir,
 		sessionManager: {
 			getEntries: () => [...sessionEntries],
 			getSessionFile: () => sessionFile,
@@ -993,6 +997,52 @@ test("TUI CRUD persists the v8 chain and reconciles shared registration", async 
 		["openai/gpt-4o"],
 	);
 	assert.equal(await readFile(modelsPath, "utf8"), modelsBytes);
+});
+
+test("/failover uses Pi autocomplete rows for add-target candidates", async () => {
+	await writeV8([chainModel("primary", [targetA], { name: "Primary" })]);
+	await writeFile(
+		settingsPath,
+		JSON.stringify({ autocompleteMaxVisible: 5 }),
+		"utf8",
+	);
+	const harness = await createHarness({
+		targetRuntime: makeTargetRuntime([modelA, modelB, modelC, modelD]),
+	});
+	const notifications: string[] = [];
+	let editor:
+		| {
+				handleInput(data: string): void;
+				render(width: number): string[];
+			}
+		| undefined;
+	await harness.commands[0]!.handler(
+		"",
+		createContext({
+			cwd: agentDir,
+			notifications,
+			custom: async (create) => {
+				editor = create(
+					{ requestRender: () => undefined },
+					{ fg: (_color: string, text: string) => text },
+					{},
+					() => undefined,
+				) as {
+					handleInput(data: string): void;
+					render(width: number): string[];
+				};
+			},
+		}),
+	);
+	assert.ok(editor, notifications.join("\n"));
+	editor.handleInput("\r");
+	editor.handleInput("a");
+	const rendered = editor.render(120).join("\n");
+	assert.match(rendered, /Candidates: 3 {2}Showing 1-2/);
+	assert.equal(
+		rendered.split("\n").some((line) => /(?:^| )3\. anthropic\/claude\s*$/.test(line)),
+		false,
+	);
 });
 
 test("second session refreshes the chain after another session adds a target", async () => {

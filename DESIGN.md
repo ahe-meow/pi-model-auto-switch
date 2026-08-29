@@ -166,7 +166,7 @@ The TUI shows:
 - `nextEligibleAt`, consecutive failures, retry, cooldown, manual-recovery, and cumulative-cooldown state; and
 - the latest source, target, reason, and effective reasoning value.
 
-All lists use a 20-row viewport: the main chain list, each detail target chain, and each add-target candidate list. Arrow navigation changes the selection and shows the visible range.
+The main chain list and each detail target chain keep a 20-row viewport with a visible range. The add-target candidate viewport reads Pi's `autocompleteMaxVisible`, reserves fixed UI rows, and safely displays the remaining candidate rows. Once candidates are open, direct text input filters case-insensitively by `provider/model`; Backspace deletes search text, Up/Down scrolls, Enter adds, and Esc clears the search before closing. No-match results show a prompt and cannot be added. All rendered rows remain clipped to the available width.
 
 The TUI allows the user to select, reorder, add, and remove chain targets. From chain detail, `Enter` opens target override settings for the selected target; `t` opens separate `Chain Settings: generated-model-id`; `p` is inert. Target override fields are error behavior, max retries, no-progress timeout, reasoning effort, and four independent model-parameter toggles, each of which can be `inherit`. In chain detail, `e` toggles global enablement for the selected real target; in the main list, `e` toggles generated-chain enablement. TUI write actions execute serially so rapid keypresses operate on the latest ordered list. Chain changes auto-save to `getAgentDir()/model-failover.json`; scope and override changes auto-save to the fixed shared state file.
 
@@ -228,7 +228,7 @@ Transition history is bounded to 100 entries for the selected session. Persisted
 - [x] Global target enablement, cooldown, failures, `nextEligibleAt`, cumulative cooldown, and manual recovery remain outside chain-scope policy; legacy `lease` input is stripped on write.
 - [x] Historical error tool results remain request context and do not synthesize a provider failure; Pi tool execution stays outside provider classification.
 - [x] Credential material is redacted, provider text is bounded, C0/C1 controls are removed, and unsafe history entries are rejected.
-- [x] Final full custom-loader verification passed 202/202; `git diff --check` passed; primary LSP diagnostics reported 0 findings across the 7 core files.
+- [x] Final full custom-loader verification passed 208/208; `git diff --check` passed; primary LSP diagnostics reported 0 findings across the 7 core files.
 - [x] `node ./node_modules/typescript/lib/tsc.js --noEmit --pretty false` passed. An isolated live `failover/orc-peon` smoke passed through real Pi/provider authentication with exit code 0, exact marker `REAL_FAILOVER_SMOKE_OK`, empty stderr, and no 401, 403, or model-unavailable result; it did not force a first-target failure or verify an automatic switch.
 
 Verification commands:
