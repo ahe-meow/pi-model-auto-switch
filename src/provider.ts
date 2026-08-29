@@ -624,6 +624,7 @@ function resolveSharedTargetSelection(
 	target: ModelRef,
 	state: FailoverProviderState,
 	settings: SharedTargetSettings,
+	reasoningInherited: boolean,
 ): TargetSelection | undefined {
 	const targetModel = state.delegate.resolveModel(target);
 	if (!targetModel) return undefined;
@@ -634,10 +635,11 @@ function resolveSharedTargetSelection(
 		modelId: generated.id,
 		target,
 		effort,
-		mappedEffort: toggles.reasoningEffort
-			? mappedReasoning(targetModel, effort)
-			: undefined,
-		reasoningControlled: toggles.reasoningEffort,
+		mappedEffort:
+			toggles.reasoningEffort && !reasoningInherited
+				? mappedReasoning(targetModel, effort)
+				: undefined,
+		reasoningControlled: toggles.reasoningEffort && !reasoningInherited,
 		targetModel,
 		targetKey,
 		capabilityKey: `${targetKey}:${targetModel.api}`,
@@ -1113,6 +1115,7 @@ async function runSharedFailoverLoop(
 					target,
 					state,
 					claim.settings,
+					claim.reasoningInherited,
 				);
 			} catch (error) {
 				await emitUnexpectedSharedTerminal(error, emit, end);

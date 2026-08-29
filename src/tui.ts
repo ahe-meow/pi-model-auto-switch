@@ -92,7 +92,7 @@ export interface FailoverTuiActions {
 	) => Promise<void>;
 	onSetScopeReasoning: (
 		modelId: string,
-		effort: ReasoningEffort,
+		effort: Inheritable<ReasoningEffort>,
 	) => Promise<void>;
 	onSetScopeErrorHandling: (
 		modelId: string,
@@ -172,6 +172,10 @@ const TARGET_ERROR_HANDLING_MODES: readonly Inheritable<ErrorHandlingMode>[] = [
 	...ERROR_HANDLING_MODES,
 ];
 const TARGET_REASONING_EFFORTS: readonly Inheritable<ReasoningEffort>[] = [
+	"inherit",
+	...REASONING_EFFORTS,
+];
+const SCOPE_REASONING_EFFORTS: readonly Inheritable<ReasoningEffort>[] = [
 	"inherit",
 	...REASONING_EFFORTS,
 ];
@@ -522,7 +526,9 @@ export class FailoverEditor implements Component {
 		}
 		if (key === "reasoning") {
 			const choices: readonly string[] =
-				context.kind === "target" ? TARGET_REASONING_EFFORTS : REASONING_EFFORTS;
+				context.kind === "target"
+					? TARGET_REASONING_EFFORTS
+					: SCOPE_REASONING_EFFORTS;
 			const current =
 				context.kind === "target"
 					? context.override.reasoningEffort
@@ -641,7 +647,9 @@ export class FailoverEditor implements Component {
 		const index = this.reasoningSelectionIndex;
 		if (index === undefined) return;
 		const choices: readonly string[] =
-			context.kind === "target" ? TARGET_REASONING_EFFORTS : REASONING_EFFORTS;
+			context.kind === "target"
+				? TARGET_REASONING_EFFORTS
+				: SCOPE_REASONING_EFFORTS;
 		if (this.isCancelInput(data)) {
 			this.reasoningSelectionIndex = undefined;
 			return;
@@ -1163,7 +1171,9 @@ export class FailoverEditor implements Component {
 			add(this.theme.fg("dim", "Up/Down move  Enter save  Esc cancel"));
 		} else if (this.reasoningSelectionIndex !== undefined) {
 			const efforts: readonly string[] =
-				context.kind === "target" ? TARGET_REASONING_EFFORTS : REASONING_EFFORTS;
+				context.kind === "target"
+					? TARGET_REASONING_EFFORTS
+					: SCOPE_REASONING_EFFORTS;
 			const choices = efforts
 				.map((effort, index) =>
 					index === this.reasoningSelectionIndex ? `[${effort}]` : effort,

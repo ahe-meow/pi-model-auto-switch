@@ -63,7 +63,7 @@ For each exact real `provider/model` target, the global record is authoritative 
 - next eligibility (`nextEligibleAt`), cooldown rung, and cumulative cooldown;
 - consecutive automatic failures and persistent manual recovery. Legacy persisted runtime `lease` fields are compatibility input only and are removed on the next write; they do not represent current coordination.
 
-Each generated model also has a chain scope keyed by `encodeURIComponent(absolute agent directory):generated model id`. The scope contains chain policy for error behavior, `maxRetries`, no-progress timeout, reasoning effort, and model-parameter toggles, plus one target override for each chain member. On first registration, scope policy is initialized from the first real target's policy. Every target override is created with all fields set to `inherit`. A target attempt reads the target's global `enabled` value and resolves effective policy by merging scope settings with the selected target override; an explicit override replaces `inherit`.
+Each generated model also has a chain scope keyed by `encodeURIComponent(absolute agent directory):generated model id`. The scope contains chain policy for error behavior, `maxRetries`, no-progress timeout, reasoning effort, and model-parameter toggles, plus one target override for each chain member. Chain reasoning can be an explicit level or `inherit`; when the selected target override is also `inherit`, each request keeps the current Pi session's outer reasoning value, while an explicit target override takes precedence. On first registration, scope policy is initialized from the first real target's policy. Every target override is created with all fields set to `inherit`. A target attempt reads the target's global `enabled` value and resolves effective policy by merging scope settings with the selected target override; an explicit override replaces `inherit`.
 
 Before a target request, an active `nextEligibleAt` deadline causes an immediate skip to the next chain target. Multiple Pi sessions and adapters may concurrently use the same real target. CAS and file locks coordinate cross-process writes to shared state; they do not reserve a target. Success or reset clears consecutive-failure and cooldown state. Persistent failure manual recovery is global for the exact real target. Policy edits are scope-local; global enablement, reset, and runtime coordination are target-global.
 
@@ -81,7 +81,7 @@ First setup leaves the authorized list empty. The user creates a generated model
 
 Pi adapters build their native payload and await async `onPayload`; failover awaits the outer callback and then applies its cache digest. Responses, Chat Completions, and Azure Responses use their API-specific reasoning fields and headers. OpenRouter is detected by provider or base URL.
 
-For these APIs, the extension uses `reasoning.effort` for Responses (`off` maps to `none`) and `reasoning_effort` for Chat Completions. This mapping changes only the selected real-provider request; it does not update Pi's own thinking setting. It derives `prompt_cache_key` as SHA-256 of `pi-model-failover/prompt-cache-key/v1:` plus the Pi Session ID, represented as 64 lower-case hexadecimal characters. It never transmits a raw Session ID through failover headers.
+For these APIs, the extension uses `reasoning.effort` for Responses (`off` maps to `none`) and `reasoning_effort` for Chat Completions. Explicit reasoning values are mapped only for the selected real-provider request; `inherit` leaves Pi's outer reasoning unchanged and is shown as `inherited` in the Footer/history. Neither path updates Pi's own thinking setting. It derives `prompt_cache_key` as SHA-256 of `pi-model-failover/prompt-cache-key/v1:` plus the Pi Session ID, represented as 64 lower-case hexadecimal characters. It never transmits a raw Session ID through failover headers.
 
 The outer virtual request's `apiKey`, `env`, `headers`, and header transform are intentionally dropped before delegation. The selected target's extension-owned `ModelRuntime` supplies target authentication and native headers, preventing virtual-provider credentials from overriding real-target credentials.
 
@@ -193,7 +193,7 @@ Pi controls the retry count and backoff inside its real-provider adapters. The e
 
 Routing stays inside one virtual provider request and reuses the request context supplied by Pi; no message-injection API is involved. Tool execution occurs after a successful provider result and is therefore not visible to this provider classifier. Historical tool results remain context, not control signals.
 
-Reasoning effort is mapped into supported real-provider request fields and reported by the extension Footer/history. The extension does not alter Pi's own thinking setting.
+Explicit reasoning effort is mapped into supported real-provider request fields; chain-level `inherit` keeps Pi's current session reasoning value and is reported as `inherited` by the Footer/history. The extension does not alter Pi's own thinking setting.
 
 Transition history is bounded to 100 entries for the selected session. Persisted sessions restore validated namespaced custom entries; ephemeral sessions keep history only in memory. Live provider/network behavior and visual terminal interaction still require verification in a Pi session.
 

@@ -51,7 +51,12 @@ export interface SharedTargetSettings {
 
 export type Inheritable<T> = T | "inherit";
 
-export type SharedChainSettings = Omit<SharedTargetSettings, "enabled">;
+export type SharedChainSettings = Omit<
+	SharedTargetSettings,
+	"enabled" | "reasoningEffort"
+> & {
+	reasoningEffort: Inheritable<ReasoningEffort>;
+};
 
 export interface SharedTargetOverride {
 	errorHandlingMode: Inheritable<ErrorHandlingMode>;
@@ -187,6 +192,7 @@ type ClaimCoreResult =
 			kind: "claimed";
 			targetKey: string;
 			settings: SharedTargetSettings;
+			reasoningInherited: boolean;
 			runtime: SharedTargetRuntime;
 	  }
 	| {
@@ -639,11 +645,14 @@ function parseChainSettings(value: unknown): SharedChainSettings | undefined {
 	)
 		return undefined;
 	const errorHandlingMode = parseErrorHandlingMode(value.errorHandlingMode);
-	const reasoningEffort = parseReasoningEffort(value.reasoningEffort);
+	const reasoningEffort = parseInheritable(
+		value.reasoningEffort,
+		parseReasoningEffort,
+	);
 	const modelParameters = parseModelParameters(value.modelParameters);
 	if (
 		!errorHandlingMode ||
-		!reasoningEffort ||
+		reasoningEffort === undefined ||
 		!modelParameters ||
 		!isValidMaxRetries(value.maxRetries) ||
 		!isValidTimeoutSeconds(value.noProgressTimeoutSeconds)
@@ -942,14 +951,20 @@ function inherited<T>(value: Inheritable<T>, fallback: T): T {
 	return value === "inherit" ? fallback : value;
 }
 
+interface ResolvedEffectiveSettings {
+	settings: SharedTargetSettings;
+	reasoningInherited: boolean;
+}
+
 function resolveEffectiveSettings(
 	document: SharedStateDocument,
 	targetKey: string,
 	scopeKey: string | undefined,
-): SharedTargetSettings | InvalidResult | undefined {
+): ResolvedEffectiveSettings | InvalidResult | undefined {
 	const record = document.targets[targetKey];
 	if (!record) return undefined;
-	if (scopeKey === undefined) return copySettings(record.settings);
+	if (scopeKey === undefined)
+		return { settings: copySettings(record.settings), reasoningInherited: false };
 	const scope = document.scopes[scopeKey];
 	if (!scope || !scope.targets.includes(targetKey)) {
 		return {
@@ -958,6 +973,10 @@ function resolveEffectiveSettings(
 		};
 	}
 	const override = scope.overrides[targetKey] ?? createInheritOverride();
+	const scopeReasoningEffort = inherited(
+		scope.settings.reasoningEffort,
+		DEFAULT_REASONING_EFFORT,
+	);
 	const modelParameters = {} as ModelParameterToggles;
 	for (const name of MODEL_PARAMETER_NAMES) {
 		modelParameters[name] = inherited(
@@ -966,21 +985,26 @@ function resolveEffectiveSettings(
 		);
 	}
 	return {
-		enabled: record.settings.enabled,
-		errorHandlingMode: inherited(
-			override.errorHandlingMode,
-			scope.settings.errorHandlingMode,
-		),
-		maxRetries: inherited(override.maxRetries, scope.settings.maxRetries),
-		noProgressTimeoutSeconds: inherited(
-			override.noProgressTimeoutSeconds,
-			scope.settings.noProgressTimeoutSeconds,
-		),
-		reasoningEffort: inherited(
-			override.reasoningEffort,
-			scope.settings.reasoningEffort,
-		),
-		modelParameters,
+		settings: {
+			enabled: record.settings.enabled,
+			errorHandlingMode: inherited(
+				override.errorHandlingMode,
+				scope.settings.errorHandlingMode,
+			),
+			maxRetries: inherited(override.maxRetries, scope.settings.maxRetries),
+			noProgressTimeoutSeconds: inherited(
+				override.noProgressTimeoutSeconds,
+				scope.settings.noProgressTimeoutSeconds,
+			),
+			reasoningEffort: inherited(
+				override.reasoningEffort,
+				scopeReasoningEffort,
+			),
+			modelParameters,
+		},
+		reasoningInherited:
+			scope.settings.reasoningEffort === "inherit" &&
+			override.reasoningEffort === "inherit",
 	};
 }
 
@@ -1066,12 +1090,32 @@ function normalizeChainSettingsPatch(
 ): SharedChainSettings | InvalidResult {
 	if (isRecord(patch) && Object.hasOwn(patch, "enabled"))
 		return { kind: "invalid", detail: "Chain settings cannot set enabled" };
+	if (!isRecord(patch))
+		return { kind: "invalid", detail: "Settings patch must be an object" };
+	const nextReasoningEffort =
+		patch.reasoningEffort === undefined
+			? current.reasoningEffort
+			: parseInheritable(patch.reasoningEffort, parseReasoningEffort);
+	if (nextReasoningEffort === undefined)
+		return { kind: "invalid", detail: "Invalid reasoningEffort" };
+	const withoutReasoning = { ...patch };
+	Reflect.deleteProperty(withoutReasoning, "reasoningEffort");
 	const normalized = normalizeSettingsPatch(
-		{ enabled: true, ...current },
-		patch,
+		{
+			enabled: true,
+			...current,
+			reasoningEffort:
+				current.reasoningEffort === "inherit"
+					? DEFAULT_REASONING_EFFORT
+					: current.reasoningEffort,
+		},
+		withoutReasoning,
 	);
 	if ("kind" in normalized) return normalized;
-	return chainSettingsFrom(normalized);
+	return {
+		...chainSettingsFrom(normalized),
+		reasoningEffort: nextReasoningEffort,
+	};
 }
 
 function normalizeTargetOverridePatch(
@@ -1403,7 +1447,8 @@ function claimTransition(
 	return committed(input, document, {
 		kind: "claimed",
 		targetKey: operation.targetKey,
-		settings: effectiveSettings,
+		settings: effectiveSettings.settings,
+		reasoningInherited: effectiveSettings.reasoningInherited,
 		runtime: copyRuntime(existing.runtime),
 	});
 }
@@ -1466,17 +1511,22 @@ function settleTransition(
 			runtime: null,
 		});
 	}
-	const effectiveSettings =
-		operation.effectiveSettings ??
-		resolveEffectiveSettings(document, operation.targetKey, operation.scopeKey);
-	if (effectiveSettings === undefined) {
+	const resolvedSettings =
+		operation.effectiveSettings === undefined
+			? resolveEffectiveSettings(document, operation.targetKey, operation.scopeKey)
+			: {
+					settings: operation.effectiveSettings,
+					reasoningInherited: false,
+				};
+	if (resolvedSettings === undefined) {
 		return unchanged(document, {
 			kind: "stale",
 			targetKey: operation.targetKey,
 			runtime: null,
 		});
 	}
-	if ("kind" in effectiveSettings) return unchanged(document, effectiveSettings);
+	if ("kind" in resolvedSettings) return unchanged(document, resolvedSettings);
+	const effectiveSettings = resolvedSettings.settings;
 	if (operation.outcome.kind === "success") {
 		record.runtime = createDefaultRuntime(context.now);
 		return committed(input, document, {

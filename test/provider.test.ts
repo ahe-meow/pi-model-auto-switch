@@ -1890,6 +1890,65 @@ test("shared settings drive selection, parameters, timeout, and retry budget", a
 	});
 });
 
+test("chain reasoning inherit forwards the current Pi thinking level", async () => {
+	const target = { provider: "a", id: "m1" };
+	const scopeKey = "chain-reasoning-inherit";
+	const generatedBase = createGeneratedModel([target]);
+	generatedBase.id = "chain-reasoning-inherit";
+	generatedBase.name = "Chain Reasoning Inherit";
+	const generated = { ...generatedBase, scopeKey };
+	const shared = await makeSharedState([target]);
+	const registration = await shared.reconcileRegistration({
+		agentDirectory: "/tmp/provider-reasoning-inherit",
+		targets: [target],
+		scopes: [{ key: scopeKey, targets: [target] }],
+	});
+	assert.equal(registration.kind, "reconciled");
+	if (!shared.updateScopeSettings) throw new Error("expected scope settings");
+	const update = await shared.updateScopeSettings(
+		scopeKey,
+		{ reasoningEffort: "inherit" },
+	);
+	assert.equal(update.kind, "updated");
+	const persisted = (await shared.snapshot()).document;
+	assert.equal(
+		persisted.scopes[scopeKey]?.settings.reasoningEffort,
+		"inherit",
+	);
+	assert.equal(
+		persisted.targets["a/m1"]?.settings.reasoningEffort,
+		"medium",
+	);
+
+	const observed: string[] = [];
+	const delegate: Delegate = {
+		resolveModel: (ref) => targetModel(ref),
+		complete: async (model, _context, options) => {
+			observed.push(options.reasoning ?? "undefined");
+			return okMessage({ provider: model.provider, id: model.id });
+		},
+	};
+	const state = makeState([generated], delegate, shared);
+	for (const reasoning of ["minimal", "high"]) {
+		const { result } = await consume(
+			runFailoverRequest(generated, {}, { reasoning }, state),
+		);
+		assert.equal(result.stopReason, "stop");
+	}
+	assert.deepEqual(observed, ["minimal", "high"]);
+	if (!shared.updateTargetOverride)
+		throw new Error("expected target override settings");
+	const override = await shared.updateTargetOverride(scopeKey, target, {
+		reasoningEffort: "high",
+	});
+	assert.equal(override.kind, "updated");
+	const overridden = await consume(
+		runFailoverRequest(generated, {}, { reasoning: "low" }, state),
+	);
+	assert.equal(overridden.result.stopReason, "stop");
+	assert.deepEqual(observed, ["minimal", "high", "high"]);
+});
+
 test("shared settlement keeps the V8 chain scope retry override", async () => {
 	const target = { provider: "a", id: "m1" };
 	const scopeKey = "chain-scope-override";

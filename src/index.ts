@@ -1284,7 +1284,10 @@ function createFailoverActions(
 				modelParameters: { [parameter]: enabled },
 			});
 		},
-		onSetScopeReasoning: async (modelId: string, effort: ReasoningEffort) => {
+		onSetScopeReasoning: async (
+			modelId: string,
+			effort: Inheritable<ReasoningEffort>,
+		) => {
 			await updateScopePolicy(ctx, runtime, modelId, { reasoningEffort: effort });
 		},
 		onSetScopeErrorHandling: async (modelId: string, mode: ErrorHandlingMode) => {

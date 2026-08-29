@@ -352,6 +352,28 @@ test("detail commands open chain settings, ignore p, and open target overrides",
 	assert.match(targetRendered, /prompt_cache_key: inherit/);
 });
 
+test("chain reasoning setting can inherit the current Pi thinking level", async () => {
+	const view = makeView([model()], new Map([["openai/gpt-5", record()]]));
+	const calls: Array<[string, Inheritable<ReasoningEffort>]> = [];
+	const editor = new FailoverEditor(
+		theme,
+		() => view,
+		makeActions({
+			onSetScopeReasoning: async (modelId, effort) => {
+				calls.push([modelId, effort]);
+			},
+		}),
+	);
+	openDetail(editor);
+	editor.handleInput("t");
+	editor.handleInput("\r");
+	assert.match(editor.render(120).join("\n"), /Reasoning: .*inherit/);
+	for (let index = 0; index < 3; index++) editor.handleInput("\x1b[A");
+	editor.handleInput("\r");
+	await editor.whenIdle();
+	assert.deepEqual(calls, [["default", "inherit"]]);
+});
+
 test("target e toggles enabled state and renders disabled marker", async () => {
 	const view = makeView([model()], new Map([["openai/gpt-5", record()]]));
 	const calls: Array<[ModelRef, boolean]> = [];
