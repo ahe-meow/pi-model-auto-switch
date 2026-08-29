@@ -1591,6 +1591,57 @@ test("R1-002 shared attempts use caller timeout claims and bound disabled no-pro
 	assert.match(result.errorMessage ?? "", /no-progress timeout/);
 });
 
+test("transient shared claim coordination failures are retried", async () => {
+	for (const reason of ["cas-exhausted", "write-failed"] as const) {
+		const target = { provider: "a", id: "m1" };
+		const generated = createGeneratedModel([target]);
+		generated.id = `shared-claim-retry-${reason}`;
+		const shared = await makeSharedState([target]);
+		let claimCalls = 0;
+		const adapter: SharedStateAdapter = {
+			status: () => shared.status(),
+			snapshot: () => shared.snapshot(),
+			reconcileRegistration: (input) => shared.reconcileRegistration(input),
+			claim: async (input) => {
+				claimCalls += 1;
+				if (claimCalls === 1) {
+					return {
+						kind: "invalid",
+						detail:
+							"Shared failover coordination is unavailable; repair shared state and retry",
+						coordination: "degraded",
+						reason,
+					};
+				}
+				return shared.claim(input);
+			},
+			settle: (input) => shared.settle(input),
+			updateSettings: (targetRef, patch) =>
+				shared.updateSettings(targetRef, patch),
+			resetTargets: (targets) => shared.resetTargets(targets),
+		};
+		let delegateCalls = 0;
+		const delegate: Delegate = {
+			resolveModel: (ref) => targetModel(ref),
+			complete: async () => {
+				delegateCalls += 1;
+				return okMessage(target);
+			},
+		};
+		const { result } = await consume(
+			runFailoverRequest(
+				generated,
+				{},
+				{},
+				makeState([generated], delegate, adapter),
+			),
+		);
+		assert.equal(result.stopReason, "stop");
+		assert.equal(claimCalls, 2);
+		assert.equal(delegateCalls, 1);
+	}
+});
+
 test("R1-004 redacts provider secrets from results, callbacks, transitions, and shared state", async () => {
 	const a = { provider: "a", id: "m1" };
 	const b = { provider: "b", id: "m2" };

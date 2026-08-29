@@ -236,6 +236,7 @@ const MAX_EXTERNAL_ERROR_MESSAGE_LENGTH = 4096;
 const MAX_PROVIDER_STATUS_REASON_LENGTH = 256;
 const REDACTED_PROVIDER_TEXT = "[REDACTED]";
 const SHARED_ATTEMPT_TIMEOUT_FLOOR_MS = 30_000;
+const MAX_TRANSIENT_SHARED_CLAIM_RETRIES = 1;
 
 interface NormalizedProviderError {
 	message: string;
@@ -904,6 +905,14 @@ function sharedAttemptTimeouts(
 	};
 }
 
+function isTransientSharedClaimFailure(result: ClaimResult): boolean {
+	return (
+		result.kind === "invalid" &&
+		result.coordination === "degraded" &&
+		(result.reason === "cas-exhausted" || result.reason === "write-failed")
+	);
+}
+
 function sharedClaimFailure(
 	result: Extract<ClaimResult, { kind: "invalid" }>,
 ): string {
@@ -1057,18 +1066,29 @@ async function runSharedFailoverLoop(
 			}
 
 			let claim: ClaimResult;
-			try {
-				claim = await sharedState.claim({
-					target,
-					effectiveRequestTimeoutMs: sharedRequestTimeoutMs(options.timeoutMs),
-					...(generated.scopeKey === undefined
-						? {}
-						: { scopeKey: generated.scopeKey }),
-				});
-			} catch {
-				markAttempt(request, target, "claim failure");
-				emitSharedTerminal(emit, end, "Shared claim failed.");
-				return;
+			for (let retry = 0; ; retry += 1) {
+				try {
+					claim = await sharedState.claim({
+						target,
+						effectiveRequestTimeoutMs: sharedRequestTimeoutMs(options.timeoutMs),
+						...(generated.scopeKey === undefined
+							? {}
+							: { scopeKey: generated.scopeKey }),
+					});
+				} catch {
+					markAttempt(request, target, "claim failure");
+					emitSharedTerminal(emit, end, "Shared claim failed.");
+					return;
+				}
+				if (
+					!isTransientSharedClaimFailure(claim) ||
+					retry >= MAX_TRANSIENT_SHARED_CLAIM_RETRIES
+				)
+					break;
+				if (signal?.aborted) {
+					emitSharedTerminal(emit, end, "Request cancelled", "aborted");
+					return;
+				}
 			}
 			if (claim.kind === "skipped") {
 				markAttempt(request, target, claim.skipReason);
