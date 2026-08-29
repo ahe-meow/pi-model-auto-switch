@@ -1003,11 +1003,22 @@ test("/failover uses Pi autocomplete rows for add-target candidates", async () =
 	await writeV8([chainModel("primary", [targetA], { name: "Primary" })]);
 	await writeFile(
 		settingsPath,
-		JSON.stringify({ autocompleteMaxVisible: 5 }),
+		JSON.stringify({ autocompleteMaxVisible: 7 }),
 		"utf8",
 	);
+	const extraModels = Array.from({ length: 5 }, (_, index) => ({
+		...modelA,
+		id: `candidate-${index + 1}`,
+		name: `candidate-${index + 1}`,
+	}));
 	const harness = await createHarness({
-		targetRuntime: makeTargetRuntime([modelA, modelB, modelC, modelD]),
+		targetRuntime: makeTargetRuntime([
+			modelA,
+			modelB,
+			modelC,
+			modelD,
+			...extraModels,
+		]),
 	});
 	const notifications: string[] = [];
 	let editor:
@@ -1038,9 +1049,12 @@ test("/failover uses Pi autocomplete rows for add-target candidates", async () =
 	editor.handleInput("\r");
 	editor.handleInput("a");
 	const rendered = editor.render(120).join("\n");
-	assert.match(rendered, /Candidates: 3 {2}Showing 1-2/);
+	assert.match(rendered, /Candidates: 8 {2}Showing 1-7/);
+	assert.match(rendered, /(?:^| )7\. openai\/candidate-4\s*$/m);
 	assert.equal(
-		rendered.split("\n").some((line) => /(?:^| )3\. anthropic\/claude\s*$/.test(line)),
+		rendered
+			.split("\n")
+			.some((line) => /(?:^| )8\. openai\/candidate-5\s*$/.test(line)),
 		false,
 	);
 });

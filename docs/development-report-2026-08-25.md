@@ -272,7 +272,7 @@ provider error、transition reason、manual recovery reason 和 history field �
 
 ## 9. TUI 与 session history
 
-TUI 主列表和 detail target chain 保持 20 行 viewport 和可见范围；Add-target candidate 行数读取 Pi 的 `autocompleteMaxVisible`，扣除固定 UI 预留行后安全显示。所有渲染行仍按可用宽度裁剪。快速按键通过 action queue 串行化，覆盖 reorder、target enabled 和 parameter override。
+TUI 主列表和 detail target chain 保持 20 行 viewport 和可见范围；Add-target candidate 模型行数直接读取 Pi 的 `autocompleteMaxVisible`，说明文字不占用这部分模型行数。所有渲染行仍按可用宽度裁剪。快速按键通过 action queue 串行化，覆盖 reorder、target enabled 和 parameter override。
 
 `/failover history` 显示当前 Pi session 的最近切换，包含 source、target、reasoning 映射、reason 和本地时间。历史最多 100 条，按最新优先。持久 session 使用 namespaced Pi custom entries 跨 extension reload/session resume 恢复；ephemeral session 只保留内存历史，不 append custom entry。history entry 不进入模型 context。
 
@@ -297,7 +297,7 @@ git diff --check -- README.md DESIGN.md docs/development-report-2026-08-25.md
 - Markdown fence/trailing-whitespace 检查：通过；
 - 过时机制 grep：确认目标文档不再把目标使用描述为独占、可释放或可续期；同时确认保留 filesystem lock 与 `releaseOwnedLock` 语义。
 
-本次 Add-target TUI 边界与直接搜索回归观察：主列表和 detail target chain 保持 20 行 viewport；候选行数读取 Pi 的 `autocompleteMaxVisible`，扣除固定 UI 预留行后安全显示，所有渲染行仍按可用宽度裁剪。候选打开后直接输入按 `provider/model` 大小写不敏感过滤，Backspace 删除，Up/Down 滚动，Enter 添加，Esc 先清空搜索再关闭；无匹配时显示提示且禁止添加。
+本次 Add-target TUI 边界与直接搜索回归观察：主列表和 detail target chain 保持 20 行 viewport；候选模型行数直接读取 Pi 的 `autocompleteMaxVisible`，说明文字不占用这部分模型行数，所有渲染行仍按可用宽度裁剪。候选打开后直接输入按 `provider/model` 大小写不敏感过滤，Backspace 删除，Up/Down 滚动，Enter 添加，Esc 先清空搜索再关闭；无匹配时显示提示且禁止添加。
 
 Node 测试运行期间可能出现预期的 experimental loader warning；没有测试失败。
 

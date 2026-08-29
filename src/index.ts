@@ -74,7 +74,6 @@ const MAX_HISTORY_MAPPED_EFFORT_LENGTH = 256;
 const MAX_HISTORY_TIMESTAMP = 8_640_000_000_000_000;
 const MAX_GENERATED_ID_LENGTH = 64;
 const MAX_GENERATED_NAME_LENGTH = 120;
-const ADD_TARGET_RESERVED_ROWS = 3;
 
 function addTargetVisibleRows(ctx: ExtensionContext): number | undefined {
 	try {
@@ -83,7 +82,7 @@ function addTargetVisibleRows(ctx: ExtensionContext): number | undefined {
 			getAgentDir(),
 		).getAutocompleteMaxVisible();
 		if (!Number.isFinite(maxVisible) || maxVisible <= 0) return undefined;
-		return Math.max(1, Math.floor(maxVisible) - ADD_TARGET_RESERVED_ROWS);
+		return Math.max(1, Math.floor(maxVisible));
 	} catch {
 		return undefined;
 	}
