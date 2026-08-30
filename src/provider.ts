@@ -152,6 +152,8 @@ export interface FailoverProviderState {
 	unsupportedCacheFields: Map<string, Set<CacheField>>;
 	/** Optional shared coordinator; absent means the legacy v7 policy owns runtime state. */
 	sharedState?: SharedStateAdapter;
+	/** Refresh the source config before model discovery or routing. */
+	refreshConfig?: () => Promise<boolean>;
 	/** Optional callback invoked when the router starts using a real target. */
 	onTarget?: (target: FailoverTargetStatus) => void;
 	/** Optional callback invoked when the router switches chain targets. */
@@ -1684,6 +1686,7 @@ export interface FailoverProvider {
 		};
 	};
 	getModels(): Record<string, unknown>[];
+	refreshModels?(): Promise<void>;
 	filterModels(models: Array<{ id: string }>): Array<{ id: string }>;
 	stream(
 		model: { id: string },
@@ -1709,17 +1712,25 @@ export function createFailoverProvider(
 		model: { id: string },
 		context: RequestContext,
 		options: RequestOptions,
-	): AssistantMessageEventStreamLike => {
-		const generated = state.config.models.find((entry) => entry.id === model.id);
-		if (!generated) {
-			return createBufferedStream((emit, end) => {
+	): AssistantMessageEventStreamLike =>
+		createBufferedStream(async (emit, end) => {
+			await state.refreshConfig?.();
+			const generated = state.config.models.find((entry) => entry.id === model.id);
+			if (!generated) {
 				const message = errorMessage(`Unknown failover model: ${model.id}`);
 				emit({ type: "error", reason: "error", error: message });
 				end(message);
-			});
-		}
-		return runFailoverRequestInternal(generated, context, options, state);
-	};
+				return;
+			}
+			const stream = runFailoverRequestInternal(
+				generated,
+				context,
+				options,
+				state,
+			);
+			for await (const event of stream) emit(event as StreamEvent);
+			end(await stream.result());
+		});
 
 	return {
 		id: FAILOVER_PROVIDER_ID,
@@ -1732,6 +1743,9 @@ export function createFailoverProvider(
 			},
 		},
 		getModels,
+		refreshModels: async () => {
+			await state.refreshConfig?.();
+		},
 		filterModels: (models: Array<{ id: string }>) => {
 			if (!state.availabilityKnown) return [...models];
 			return models.filter((model) => {

@@ -3,7 +3,10 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	ModelRuntime,
+	type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import { createDefaultConfig } from "../src/config.ts";
 import {
 	createGeneratedConfigV8,
@@ -180,12 +183,12 @@ async function createHarness(
 	options: {
 		targetRuntime?: TargetRuntimeHarness;
 		sharedState?: SharedStateAdapter;
+		onRegisterProvider?: (provider: unknown) => void;
 	} = {},
 ): Promise<Harness> {
 	const targetRuntime = options.targetRuntime ?? makeTargetRuntime();
 	const sharedState =
-		options.sharedState ??
-		createFileSharedState({ path: sharedPath });
+		options.sharedState ?? createFileSharedState({ path: sharedPath });
 	const providers: unknown[] = [];
 	const commands: Harness["commands"] = [];
 	const handlers = new Map<string, Handler>();
@@ -196,7 +199,10 @@ async function createHarness(
 			name: string,
 			options: { handler: Harness["commands"][number]["handler"] },
 		) => commands.push({ name, handler: options.handler }),
-		registerProvider: (provider: unknown) => providers.push(provider),
+		registerProvider: (provider: unknown) => {
+			providers.push(provider);
+			options.onRegisterProvider?.(provider);
+		},
 		appendEntry: (customType: string, data: unknown) =>
 			appendedEntries.push({ customType, data }),
 	} as unknown as ExtensionAPI;
@@ -566,9 +572,7 @@ function switchableRegistrationFailure(base: SharedStateAdapter): {
 						kind: "reconciled" as const,
 						registrationKey: resolve(agentDir),
 						targets: input.targets.map((target) =>
-							typeof target === "string"
-								? target
-								: `${target.provider}/${target.id}`,
+							typeof target === "string" ? target : `${target.provider}/${target.id}`,
 						),
 						...degradedStatus,
 					};
@@ -999,6 +1003,85 @@ test("TUI CRUD persists the v8 chain and reconciles shared registration", async 
 	assert.equal(await readFile(modelsPath, "utf8"), modelsBytes);
 });
 
+test("editing a chain refreshes Pi available failover models without reload", async () => {
+	await writeV8([chainModel("primary", [targetA, targetB])]);
+	const refreshedModelB = {
+		...modelB,
+		contextWindow: 64_000,
+		maxTokens: 8_192,
+	};
+	const modelRuntime = await ModelRuntime.create({
+		modelsPath: null,
+		refreshOnCreate: false,
+	});
+	const harness = await createHarness({
+		targetRuntime: makeTargetRuntime([modelA, refreshedModelB]),
+		onRegisterProvider: (provider) =>
+			modelRuntime.registerNativeProvider(provider as never),
+	});
+	await modelRuntime.refresh({ allowNetwork: false });
+	const initial = modelRuntime
+		.getAvailableSnapshot()
+		.find((model) => model.provider === "failover" && model.id === "primary");
+	assert.ok(initial);
+	assert.equal(initial.contextWindow, 64_000);
+	assert.equal(initial.maxTokens, 8_192);
+
+	await driveEditor(harness, ["\r", "\x1b[B", "d"]);
+
+	const updated = modelRuntime
+		.getAvailableSnapshot()
+		.find((model) => model.provider === "failover" && model.id === "primary");
+	assert.ok(updated);
+	assert.equal(updated.contextWindow, 128_000);
+	assert.equal(updated.maxTokens, 16_384);
+});
+
+test("a separate model runtime refreshes its failover snapshot from the latest chain", async () => {
+	await writeV8([chainModel("primary", [targetA, targetB])]);
+	const reorderedModelB = {
+		...modelB,
+		thinkingLevelMap: {
+			off: "b-off",
+			low: "b-low",
+			medium: "b-medium",
+			high: "b-high",
+			xhigh: "b-xhigh",
+			max: "b-max",
+		},
+	};
+	const modelRuntime = await ModelRuntime.create({
+		modelsPath: null,
+		refreshOnCreate: false,
+	});
+	const first = await createHarness({
+		targetRuntime: makeTargetRuntime([modelA, modelB]),
+		sharedState: createFileSharedState({ path: sharedPath }),
+	});
+	await createHarness({
+		targetRuntime: makeTargetRuntime([modelA, reorderedModelB]),
+		sharedState: createFileSharedState({ path: sharedPath }),
+		onRegisterProvider: (provider) =>
+			modelRuntime.registerNativeProvider(provider as never),
+	});
+
+	await modelRuntime.refresh({ allowNetwork: false });
+	const initial = modelRuntime
+		.getAvailableSnapshot()
+		.find((model) => model.provider === "failover" && model.id === "primary");
+	assert.ok(initial);
+	assert.equal(initial.thinkingLevelMap?.low, "low");
+
+	await driveEditor(first, ["\r", "]"]);
+	await modelRuntime.refresh({ allowNetwork: false });
+
+	const updated = modelRuntime
+		.getAvailableSnapshot()
+		.find((model) => model.provider === "failover" && model.id === "primary");
+	assert.ok(updated);
+	assert.equal(updated.thinkingLevelMap?.low, "b-low");
+});
+
 test("/failover uses Pi autocomplete rows for add-target candidates", async () => {
 	await writeV8([chainModel("primary", [targetA], { name: "Primary" })]);
 	await writeFile(
@@ -1025,7 +1108,7 @@ test("/failover uses Pi autocomplete rows for add-target candidates", async () =
 		| {
 				handleInput(data: string): void;
 				render(width: number): string[];
-			}
+		  }
 		| undefined;
 	await harness.commands[0]!.handler(
 		"",
@@ -1189,6 +1272,35 @@ test("second session refreshes the chain after another session adds a target", a
 	assert.deepEqual(afterSecond.models[0]!.chain, [targetA, targetB]);
 });
 
+test("second session routes through a reordered chain without a refresh", async () => {
+	await writeV8([chainModel("primary", [targetA, targetB])]);
+	const first = await createHarness({
+		targetRuntime: makeTargetRuntime([modelA, modelB]),
+		sharedState: createFileSharedState({ path: sharedPath }),
+	});
+	const secondCalls: string[] = [];
+	const second = await createHarness({
+		targetRuntime: makeTargetRuntime([modelA, modelB], async (model) => {
+			secondCalls.push(model.id);
+			return providerMessage(model, "stop");
+		}),
+		sharedState: createFileSharedState({ path: sharedPath }),
+	});
+
+	await startSession(second);
+	await driveEditor(first, ["\r", "]"]);
+	const afterFirst = JSON.parse(await readFile(configPath, "utf8")) as {
+		models: Array<{ chain: ModelRef[] }>;
+	};
+	assert.deepEqual(afterFirst.models[0]!.chain, [targetB, targetA]);
+
+	const result = await failoverProvider(second)
+		.stream({ id: "primary" }, {}, {})
+		.result();
+	assert.equal(result.stopReason, "stop");
+	assert.equal(secondCalls[0], targetB.id);
+});
+
 test("session_start refreshes the chain without a reload", async () => {
 	await writeV8([chainModel("primary", [targetA], { name: "Primary" })]);
 	const refreshedModelB = { ...modelB, contextWindow: 64_000, maxTokens: 8_192 };
@@ -1210,7 +1322,10 @@ test("session_start refreshes the chain without a reload", async () => {
 		id: string;
 		contextWindow: number;
 	}>;
-	assert.deepEqual(models.map((model) => model.id), ["primary"]);
+	assert.deepEqual(
+		models.map((model) => model.id),
+		["primary"],
+	);
 	assert.equal(models[0]!.contextWindow, 64_000);
 	assert.equal(
 		notifications.some(
@@ -1259,11 +1374,12 @@ test("malformed config blocks routing and recovers on session_start", async () =
 			"Failover config unavailable: the configuration file is malformed",
 		),
 	);
-	assert.equal(notifications.some((message) => message.includes(configPath)), false);
+	assert.equal(
+		notifications.some((message) => message.includes(configPath)),
+		false,
+	);
 
-	await writeV8([
-		chainModel("recovered", [targetB], { name: "Recovered" }),
-	]);
+	await writeV8([chainModel("recovered", [targetB], { name: "Recovered" })]);
 	notifications.length = 0;
 	await startSession(harness, notifications);
 	const recovered = failoverProvider(harness).getModels();
@@ -1280,7 +1396,7 @@ test("malformed config blocks routing and recovers on session_start", async () =
 		| {
 				handleInput(data: string): void;
 				render(width: number): string[];
-			}
+		  }
 		| undefined;
 	await harness.commands[0]!.handler(
 		"",
@@ -1326,7 +1442,10 @@ test("CAS conflict requires closing and reopening the editor", async () => {
 	await editor.whenIdle();
 	const staleWarning =
 		"Failover chain changed on disk; reload and review before editing again.";
-	assert.equal(notifications.filter((message) => message === staleWarning).length, 1);
+	assert.equal(
+		notifications.filter((message) => message === staleWarning).length,
+		1,
+	);
 
 	editor.handleInput("q");
 	assert.equal(closed, true);
@@ -1340,12 +1459,39 @@ test("CAS conflict requires closing and reopening the editor", async () => {
 	reopened.handleInput("!");
 	reopened.handleInput("\r");
 	await reopened.whenIdle();
-	assert.equal(notifications.filter((message) => message === staleWarning).length, 1);
+	assert.equal(
+		notifications.filter((message) => message === staleWarning).length,
+		1,
+	);
 	const saved = JSON.parse(await readFile(configPath, "utf8")) as {
 		models: Array<{ name: string; chain: ModelRef[] }>;
 	};
 	assert.equal(saved.models[0]!.name, "External!");
 	assert.deepEqual(saved.models[0]!.chain, [targetB]);
+});
+
+test("blocked session retries unchanged config after shared state recovery", async () => {
+	await writeV8([chainModel("primary", [targetA], { name: "Primary" })]);
+	const source = await readFile(configPath, "utf8");
+	const registration = switchableRegistrationFailure(
+		createFileSharedState({ path: sharedPath }),
+	);
+	registration.failNext();
+	const harness = await createHarness({
+		targetRuntime: makeTargetRuntime([modelA]),
+		sharedState: registration.adapter,
+	});
+	assert.deepEqual(failoverProvider(harness).getModels(), []);
+
+	registration.recover();
+	await startSession(harness);
+	assert.deepEqual(
+		failoverProvider(harness)
+			.getModels()
+			.map((model) => model.id),
+		["primary"],
+	);
+	assert.equal(await readFile(configPath, "utf8"), source);
 });
 
 test("recovered /failover does not leak a stale registration warning", async () => {
@@ -1656,8 +1802,14 @@ test("reset targets only the selected exact target during active use", async () 
 	const harness = await createHarness();
 	const first = await driveEditor(harness, ["\r", "r"]);
 	let snapshot = await harness.sharedState.snapshot();
-	assert.equal(first.notifications.some((message) => /active lease/i.test(message)), false);
-	assert.equal("lease" in snapshot.document.targets["openai/gpt-5"].runtime, false);
+	assert.equal(
+		first.notifications.some((message) => /active lease/i.test(message)),
+		false,
+	);
+	assert.equal(
+		"lease" in snapshot.document.targets["openai/gpt-5"].runtime,
+		false,
+	);
 	assert.ok(snapshot.document.targets["openai/gpt-4o"].runtime.cooldownUntil);
 	assert.equal(
 		snapshot.document.targets["anthropic/claude"].runtime.manualRecovery?.reason,
@@ -1671,20 +1823,32 @@ test("reset targets only the selected exact target during active use", async () 
 
 	const second = await driveEditor(harness, ["\r", "\x1b[B", "r"]);
 	snapshot = await harness.sharedState.snapshot();
-	assert.equal("lease" in snapshot.document.targets["openai/gpt-5"].runtime, false);
+	assert.equal(
+		"lease" in snapshot.document.targets["openai/gpt-5"].runtime,
+		false,
+	);
 	assert.equal(
 		snapshot.document.targets["openai/gpt-4o"].runtime.cooldownUntil,
 		null,
 	);
-	assert.deepEqual(snapshot.document.targets["anthropic/claude"].runtime.manualRecovery, {
-		reason: "HTTP 401",
-		updatedAt: snapshot.document.targets["anthropic/claude"].runtime.manualRecovery?.updatedAt,
-	});
+	assert.deepEqual(
+		snapshot.document.targets["anthropic/claude"].runtime.manualRecovery,
+		{
+			reason: "HTTP 401",
+			updatedAt:
+				snapshot.document.targets["anthropic/claude"].runtime.manualRecovery
+					?.updatedAt,
+		},
+	);
 	assert.equal(
-		typeof snapshot.document.targets["anthropic/claude"].runtime.manualRecovery?.updatedAt,
+		typeof snapshot.document.targets["anthropic/claude"].runtime.manualRecovery
+			?.updatedAt,
 		"number",
 	);
-	assert.equal(second.notifications.some((message) => /active lease/i.test(message)), false);
+	assert.equal(
+		second.notifications.some((message) => /active lease/i.test(message)),
+		false,
+	);
 	assert.equal(await readFile(modelsPath, "utf8"), modelsBytes);
 });
 

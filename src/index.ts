@@ -147,6 +147,9 @@ interface RuntimeState {
 	lastTransition: FailoverTransition | undefined;
 	sessionContext: ExtensionContext | undefined;
 	sessionPersistable: boolean;
+	chainOperation: Promise<void>;
+	refreshConfig: () => Promise<boolean>;
+	refreshProvider: () => void;
 }
 
 function scopeKeyForModel(id: string): string {
@@ -436,9 +439,7 @@ const STALE_CONFIG_WARNING_PREFIXES = [
 function clearStaleConfigWarnings(runtime: RuntimeState): void {
 	runtime.warnings = runtime.warnings.filter(
 		(warning) =>
-			!STALE_CONFIG_WARNING_PREFIXES.some((prefix) =>
-				warning.startsWith(prefix),
-			),
+			!STALE_CONFIG_WARNING_PREFIXES.some((prefix) => warning.startsWith(prefix)),
 	);
 }
 
@@ -536,10 +537,40 @@ async function reconcileRegistration(
 	return result;
 }
 
-async function reconcileApplyAndRefresh(
+function sameConfigSourceRevision(
+	a: ConfigSourceRevision,
+	b: ConfigSourceRevision,
+): boolean {
+	if (a.kind !== b.kind) return false;
+	if (a.kind === "absent") return true;
+	return (
+		b.kind === "present" &&
+		a.device === b.device &&
+		a.inode === b.inode &&
+		a.size === b.size &&
+		a.mtimeNanoseconds === b.mtimeNanoseconds &&
+		a.digest === b.digest
+	);
+}
+
+function serializeChainOperation<T>(
+	runtime: RuntimeState,
+	operation: () => Promise<T>,
+): Promise<T> {
+	const previous = runtime.chainOperation;
+	const current = previous.catch(() => undefined).then(operation);
+	runtime.chainOperation = current.then(
+		() => undefined,
+		() => undefined,
+	);
+	return current;
+}
+
+async function reconcileApplyAndRefreshInternal(
 	runtime: RuntimeState,
 	config: GeneratedFailoverConfigV8,
 	revision: ConfigSourceRevision,
+	refreshProvider = true,
 ): Promise<boolean> {
 	const registration = await reconcileRegistration(runtime, config);
 	if (
@@ -554,7 +585,19 @@ async function reconcileApplyAndRefresh(
 	}
 	applyConfig(runtime, config, revision);
 	await refreshOwnedTargetRuntime(runtime);
+	if (refreshProvider) runtime.refreshProvider();
 	return true;
+}
+
+async function reconcileApplyAndRefresh(
+	runtime: RuntimeState,
+	config: GeneratedFailoverConfigV8,
+	revision: ConfigSourceRevision,
+	refreshProvider = true,
+): Promise<boolean> {
+	return serializeChainOperation(runtime, () =>
+		reconcileApplyAndRefreshInternal(runtime, config, revision, refreshProvider),
+	);
 }
 
 function initialRuntime(
@@ -594,6 +637,9 @@ function initialRuntime(
 		lastTransition: undefined,
 		sessionContext: undefined,
 		sessionPersistable: false,
+		chainOperation: Promise.resolve(),
+		refreshConfig: async () => true,
+		refreshProvider: () => undefined,
 	};
 }
 
@@ -662,16 +708,29 @@ async function applyLegacyConfig(
 	}
 }
 
-async function applyLoadedV8Config(
+async function applyLoadedV8ConfigInternal(
 	runtime: RuntimeState,
 	loaded: Extract<GeneratedConfigV8LoadResult, { kind: "loaded-v8" }>,
+	refreshProvider = true,
 ): Promise<boolean> {
-	if (await reconcileApplyAndRefresh(runtime, loaded.config, loaded.revision))
+	if (
+		await reconcileApplyAndRefreshInternal(
+			runtime,
+			loaded.config,
+			loaded.revision,
+			refreshProvider,
+		)
+	)
 		return true;
-	blockChain(runtime, "target registration could not be verified", {
-		config: loaded.config,
-		revision: loaded.revision,
-	});
+	blockChain(
+		runtime,
+		"target registration could not be verified",
+		{
+			config: loaded.config,
+			revision: loaded.revision,
+		},
+		refreshProvider,
+	);
 	queueWarning(
 		runtime,
 		"Failover target registration failed; the loaded chain was not applied and editing is disabled until shared state is repaired.",
@@ -679,16 +738,43 @@ async function applyLoadedV8Config(
 	return false;
 }
 
-async function refreshSessionConfig(runtime: RuntimeState): Promise<boolean> {
+async function applyLoadedV8Config(
+	runtime: RuntimeState,
+	loaded: Extract<GeneratedConfigV8LoadResult, { kind: "loaded-v8" }>,
+	refreshProvider = true,
+): Promise<boolean> {
+	return serializeChainOperation(runtime, () =>
+		applyLoadedV8ConfigInternal(runtime, loaded, refreshProvider),
+	);
+}
+
+async function refreshSessionConfigInternal(
+	runtime: RuntimeState,
+	refreshProvider = true,
+): Promise<boolean> {
 	const loaded = await loadGeneratedConfigV8(FAILOVER_CONFIG_PATH);
-	if (loaded.kind === "loaded-v8") return applyLoadedV8Config(runtime, loaded);
+	if (loaded.kind === "loaded-v8") {
+		if (
+			sameConfigSourceRevision(loaded.revision, runtime.chainRevision) &&
+			runtime.chainBlocked === undefined
+		) {
+			if (refreshProvider) runtime.refreshProvider();
+			return true;
+		}
+		return applyLoadedV8ConfigInternal(runtime, loaded, refreshProvider);
+	}
 
 	const preserved = {
 		config: runtime.config,
 		revision: runtime.chainRevision,
 	};
 	if (loaded.kind === "legacy") {
-		blockChain(runtime, "legacy configuration requires migration", preserved);
+		blockChain(
+			runtime,
+			"legacy configuration requires migration",
+			preserved,
+			refreshProvider,
+		);
 		queueWarning(
 			runtime,
 			"Legacy failover migration is blocked; model-failover.json was preserved and provider routing and editing remain disabled. Repair shared failover state or resolve file write conflicts, then restart.",
@@ -696,15 +782,34 @@ async function refreshSessionConfig(runtime: RuntimeState): Promise<boolean> {
 		return false;
 	}
 	if (loaded.kind === "missing") {
-		blockChain(runtime, "the configuration file is unavailable", preserved);
+		blockChain(
+			runtime,
+			"the configuration file is unavailable",
+			preserved,
+			refreshProvider,
+		);
 		queueWarning(
 			runtime,
 			"Failover configuration is missing; routing and editing remain disabled until the v8 chain file is restored.",
 		);
 		return false;
 	}
-	blockChain(runtime, blockedConfigDescription(loaded.reason), preserved);
+	blockChain(
+		runtime,
+		blockedConfigDescription(loaded.reason),
+		preserved,
+		refreshProvider,
+	);
 	return false;
+}
+
+async function refreshSessionConfig(
+	runtime: RuntimeState,
+	refreshProvider = true,
+): Promise<boolean> {
+	return serializeChainOperation(runtime, () =>
+		refreshSessionConfigInternal(runtime, refreshProvider),
+	);
 }
 
 async function loadAndApplyInitialConfig(runtime: RuntimeState): Promise<void> {
@@ -788,6 +893,7 @@ function blockChain(
 		config: GeneratedFailoverConfigV8;
 		revision: ConfigSourceRevision;
 	},
+	refreshProvider = true,
 ): void {
 	runtime.chainBlocked = description;
 	if (preserved) {
@@ -800,6 +906,7 @@ function blockChain(
 	runtime.providerState.config = { models: [] };
 	runtime.providerState.metadata = [];
 	runtime.providerState.availableTargetKeys = new Set();
+	if (refreshProvider) runtime.refreshProvider();
 }
 
 function loadBlockedConfig(
@@ -1429,12 +1536,9 @@ function registerFailoverCommand(
 			const maxAddTargetRows = addTargetVisibleRows(ctx);
 			await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
 				const actions = createFailoverActions(ctx, runtime, () => done());
-				const editor = new FailoverEditor(
-					theme,
-					() => viewFor(runtime),
-					actions,
-					{ maxVisibleRows: maxAddTargetRows },
-				);
+				const editor = new FailoverEditor(theme, () => viewFor(runtime), actions, {
+					maxVisibleRows: maxAddTargetRows,
+				});
 				return {
 					render: (width: number) => editor.render(width),
 					invalidate: () => editor.invalidate(),
@@ -1530,11 +1634,15 @@ export async function registerFailoverExtension(
 	runtime.providerState.delegate = createDelegate(runtime);
 	rememberCoordinationWarning(runtime);
 	await loadAndApplyInitialConfig(runtime);
+	runtime.refreshConfig = () => refreshSessionConfig(runtime, false);
+	runtime.providerState.refreshConfig = runtime.refreshConfig;
 
 	// The provider must be complete before registration because child sessions may
 	// issue requests without receiving session_start in this process.
 	runtime.providerState.sharedState = runtime.sharedState;
-	pi.registerProvider(createFailoverProvider(runtime.providerState) as never);
+	const provider = createFailoverProvider(runtime.providerState);
+	pi.registerProvider(provider as never);
+	runtime.refreshProvider = () => pi.registerProvider(provider as never);
 
 	pi.on("session_start", async (_event, ctx) => {
 		runtime.history = restoreHistory(ctx.sessionManager.getEntries());
