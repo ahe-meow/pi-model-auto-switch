@@ -152,6 +152,105 @@ test("withFileLocks removes a lock created before setup failure", async () => {
 	});
 });
 
+test("withFileLocks leaves a replacement lock after setup failure", async () => {
+	await withTempDir(async (dir) => {
+		const path = join(dir, "models.json");
+		const lockPath = `${path}.lock`;
+		const probeHandle = await open(join(dir, "probe"), "w");
+		const prototype = Object.getPrototypeOf(probeHandle) as {
+			writeFile: typeof probeHandle.writeFile;
+		};
+		const originalWriteFile = prototype.writeFile;
+		const setupError = new Error("injected lock setup failure");
+		const replacement = "replacement-lock-owner";
+		prototype.writeFile = (async () => {
+			await rm(lockPath);
+			await writeFile(lockPath, replacement);
+			throw setupError;
+		}) as typeof prototype.writeFile;
+
+		try {
+			await assert.rejects(
+				withFileLocks([path], async () => undefined),
+				(error: Error) => {
+					assert.equal(error.name, "Error");
+					return true;
+				},
+			);
+		} finally {
+			prototype.writeFile = originalWriteFile;
+			await probeHandle.close();
+		}
+
+		assert.equal(await readFile(lockPath, "utf8"), replacement);
+	});
+});
+
+test("commitCatalogTransaction reports lock cleanup proof failure safely", async () => {
+	await withTempDir(async (dir) => {
+		const path = join(dir, "models.json");
+		const lockPath = `${path}.lock`;
+		const probeHandle = await open(join(dir, "probe"), "w");
+		const prototype = Object.getPrototypeOf(probeHandle) as {
+			stat: typeof probeHandle.stat;
+		};
+		const originalStat = prototype.stat;
+		const secret = "provider-api-secret";
+		prototype.stat = (() => Promise.reject(new Error(secret))) as typeof prototype.stat;
+
+		try {
+			const result = await commitCatalogTransaction({
+				writes: [write(path, secret, "missing")],
+			});
+
+			assert.equal(result.ok, false);
+			if (result.ok) return;
+			assert.equal(result.phase, "prepare");
+			assert.match(result.message, /^prepare failed \(Error\)$/);
+			assertNoSecret(result, secret);
+			assert.equal(result.message.includes(path), false);
+			assert.equal(await readFile(lockPath, "utf8"), "");
+		} finally {
+			prototype.stat = originalStat;
+			await probeHandle.close();
+		}
+	});
+});
+
+test("withFileLocks cleans the original lock after close failure", async () => {
+	await withTempDir(async (dir) => {
+		const path = join(dir, "models.json");
+		const probeHandle = await open(join(dir, "probe"), "w");
+		const prototype = Object.getPrototypeOf(probeHandle) as {
+			close: typeof probeHandle.close;
+		};
+		const originalClose = prototype.close;
+		const closeError = new Error("injected lock close failure");
+		prototype.close = (async function (this: typeof probeHandle) {
+			if (this !== probeHandle) {
+				await originalClose.call(this);
+				throw closeError;
+			}
+			return originalClose.call(this);
+		}) as typeof prototype.close;
+
+		try {
+			await assert.rejects(
+				withFileLocks([path], async () => undefined),
+				(error: Error) => {
+					assert.equal(error, closeError);
+					return true;
+				},
+			);
+		} finally {
+			prototype.close = originalClose;
+			await probeHandle.close();
+		}
+
+		const files = await readdir(dir, { recursive: true });
+		assert.deepEqual(files.filter((file) => basename(String(file)).endsWith(".lock")), []);
+	});
+});
 test("commitCatalogTransaction converts lock timeout into a prepare result", async () => {
 	await withTempDir(async (dir) => {
 		const path = join(dir, "models.json");

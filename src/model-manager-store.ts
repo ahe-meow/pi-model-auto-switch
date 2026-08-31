@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+	lstat,
 	mkdir,
 	open,
 	readFile,
@@ -88,6 +89,22 @@ async function releaseLock(path: string, token: string): Promise<void> {
 	}
 }
 
+type LockIdentity = {
+	device: string;
+	inode: string;
+};
+
+async function cleanupCreatedLock(
+	path: string,
+	identity: LockIdentity | undefined,
+): Promise<void> {
+	if (!identity) throw new Error("Lock ownership could not be verified");
+	const current = await lstat(path, { bigint: true });
+	if (String(current.dev) !== identity.device || String(current.ino) !== identity.inode)
+		throw new Error("Lock ownership changed before cleanup");
+	await unlink(path);
+}
+
 async function acquireLock(path: string): Promise<{ path: string; token: string }> {
 	const lock = lockPath(path);
 	const token = randomUUID();
@@ -96,10 +113,16 @@ async function acquireLock(path: string): Promise<{ path: string; token: string 
 
 	for (;;) {
 		let created = false;
+		let identity: LockIdentity | undefined;
 		try {
 			const handle = await open(lock, "wx", 0o600);
 			created = true;
 			try {
+				const metadata = await handle.stat({ bigint: true });
+				identity = {
+					device: String(metadata.dev),
+					inode: String(metadata.ino),
+				};
 				await handle.writeFile(token, "utf8");
 				await handle.sync();
 			} finally {
@@ -109,7 +132,7 @@ async function acquireLock(path: string): Promise<{ path: string; token: string 
 		} catch (error) {
 			if (created) {
 				try {
-					await unlink(lock);
+					await cleanupCreatedLock(lock, identity);
 				} catch (cleanupError) {
 					throw new Error(
 						`lock setup failed (${safeErrorName(error)}); cleanup failed (${safeErrorName(cleanupError)})`,
