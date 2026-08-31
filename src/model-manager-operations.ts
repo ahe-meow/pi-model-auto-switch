@@ -40,11 +40,19 @@ export interface RecordDraftFields {
 export interface ModelManagerDraft {
 	kind: "create" | "edit" | "clone";
 	recordId?: string;
-	readonly sourceRecordId?: string;
 	fields: RecordDraftFields;
 	advanced: Record<string, unknown>;
 	secret?: string;
 }
+
+type DraftOrigin = {
+	recordId: string;
+	providerAlias: string;
+	providerName: string;
+	modelId: string;
+};
+
+const draftOrigins = new WeakMap<ModelManagerDraft, DraftOrigin>();
 
 export interface PreviewPayload {
 	sidecarAfter: ModelManagerSidecar;
@@ -183,16 +191,19 @@ export function editDraft(
 		}
 	}
 	const copied = splitRecord(record);
-	return {
-		ok: true,
-		value: {
-			kind: "edit",
-			recordId,
-			sourceRecordId: recordId,
-			fields: copyFields({ ...copied.fields, ...structuredClone(fields) }),
-			advanced: copied.advanced,
-		},
+	const draft: ModelManagerDraft = {
+		kind: "edit",
+		recordId,
+		fields: copyFields({ ...copied.fields, ...structuredClone(fields) }),
+		advanced: copied.advanced,
 	};
+	draftOrigins.set(draft, {
+		recordId,
+		providerAlias: record.providerAlias,
+		providerName: record.providerName,
+		modelId: record.modelId,
+	});
+	return { ok: true, value: draft };
 }
 
 export function cloneDraft(
@@ -272,49 +283,44 @@ function recordForDraft(
 	draft: ModelManagerDraft,
 ): ModelManagerResult<ModelManagerRecord> {
 	if (draft.kind === "edit") {
-		const recordId = draft.recordId;
-		const sourceRecordId = draft.sourceRecordId;
-		if (!sourceRecordId) {
+		const origin = draftOrigins.get(draft);
+		if (!origin) {
 			return failure(
 				"malformed-draft",
-				"Edit draft is missing its source record identity",
+				"Edit draft origin is unavailable",
 				secretList(draft),
 			);
 		}
-		if (sourceRecordId !== recordId) {
-			return failure(
-				"immutable-identity",
-				"Provider alias, provider name, and model ID cannot be changed by edit",
-				secretList(draft),
-			);
-		}
-		const existing = recordId ? snapshot.byId.get(recordId) : undefined;
-		if (!recordId || !existing) {
+		const existing = snapshot.byId.get(origin.recordId);
+		if (!existing) {
 			return failure(
 				"record-not-found",
 				"The requested catalog record is not present in the snapshot",
 				secretList(draft),
 			);
 		}
-		for (const key of ["providerAlias", "providerName", "modelId"] as const) {
-			if (
-				typeof draft.fields[key] !== "string" ||
-				draft.fields[key].trim().length === 0 ||
-				draft.fields[key] !== existing[key]
-			) {
-				return failure(
-					"immutable-identity",
-					"Provider alias, provider name, and model ID cannot be changed by edit",
-					secretList(draft),
-				);
-			}
+		const identityMatches =
+			draft.recordId === origin.recordId &&
+			draft.fields?.providerAlias === origin.providerAlias &&
+			draft.fields?.providerName === origin.providerName &&
+			draft.fields?.modelId === origin.modelId &&
+			origin.recordId === existing.id &&
+			origin.providerAlias === existing.providerAlias &&
+			origin.providerName === existing.providerName &&
+			origin.modelId === existing.modelId;
+		if (!identityMatches) {
+			return failure(
+				"immutable-identity",
+				"Provider alias, provider name, and model ID cannot be changed by edit",
+				secretList(draft),
+			);
 		}
 		return {
 			ok: true,
 			value: {
 				...copyAdvanced(draft.advanced, secretList(draft)),
 				...copyFields(draft.fields),
-				id: recordId,
+				id: origin.recordId,
 			},
 		};
 	}
@@ -482,9 +488,11 @@ function canonicalJson(value: unknown): Uint8Array {
 function mergedModels(
 	existingProvider: JsonObject | undefined,
 	projectedProvider: PiProviderDraft,
+	draft: ModelManagerDraft,
+	applyDraftLabel: boolean,
 ): unknown[] {
 	const existing = Array.isArray(existingProvider?.models)
-		? [...existingProvider.models]
+		? existingProvider.models.map((model) => structuredClone(model))
 		: [];
 	const used = new Set<number>();
 	for (const projected of projectedProvider.models) {
@@ -497,14 +505,15 @@ function mergedModels(
 				break;
 			}
 		}
+		const managed: JsonObject = { id: projected.id };
+		if (applyDraftLabel && draft.fields.label !== undefined) {
+			managed.name = draft.fields.label;
+		}
 		if (match === -1) {
-			existing.push(structuredClone(projected));
+			existing.push({ ...structuredClone(projected), ...managed });
 			used.add(existing.length - 1);
 		} else {
-			existing[match] = {
-				...(existing[match] as JsonObject),
-				...structuredClone(projected),
-			};
+			existing[match] = { ...(existing[match] as JsonObject), ...managed };
 			used.add(match);
 		}
 	}
@@ -515,6 +524,7 @@ function providerBytes(
 	preview: PreviewPayload,
 	draft: ModelManagerDraft,
 	current: JsonObject | undefined,
+	applyDraftLabel: boolean,
 ): ModelManagerResult<Uint8Array> {
 	const secrets = secretList(draft);
 	const secret = draft.secret;
@@ -535,12 +545,17 @@ function providerBytes(
 	const providers = [...(document.providers as JsonObject[])];
 	const index = providers.findIndex((provider) => provider.name === target.name);
 	const existing = index === -1 ? undefined : providers[index];
-	const updated: JsonObject = {
-		...existing,
-		...structuredClone(target),
-		models: mergedModels(existing, target),
-		apiKey: secret,
-	};
+	const updated: JsonObject = index === -1
+		? {
+			...structuredClone(target),
+			models: mergedModels(undefined, target, draft, applyDraftLabel),
+		}
+		: {
+			...structuredClone(existing),
+			name: target.name,
+			models: mergedModels(existing, target, draft, applyDraftLabel),
+		};
+	updated.apiKey = secret;
 	if (index === -1) providers.push(updated);
 	else providers[index] = updated;
 	return {
@@ -586,6 +601,9 @@ export async function commitDraft(
 		readCurrentJson(modelsPath, "models", secrets),
 	]);
 	if (!sidecarCurrent.ok) return sidecarCurrent;
+	if (draft.kind === "edit" && sidecarCurrent.value.revision === "missing") {
+		return failure("sidecar-missing", "sidecar could not be read", secrets);
+	}
 	if (!modelsCurrent.ok) return modelsCurrent;
 	if (draft.kind === "edit" && !modelsCurrent.value.document) {
 		return failure("models-missing", "models could not be read", secrets);
@@ -607,10 +625,15 @@ export async function commitDraft(
 		expectRevision: sidecarCurrent.value.revision,
 	}];
 	if (draft.secret) {
+		const sourceRecord = draft.kind === "edit" && draft.recordId
+			? io.snapshot.byId.get(draft.recordId)
+			: undefined;
+		const applyDraftLabel = draft.kind !== "edit" || draft.fields.label !== sourceRecord?.label;
 		const modelsBytes = providerBytes(
 			preview.value,
 			draft,
 			modelsCurrent.value.document,
+			applyDraftLabel,
 		);
 		if (!modelsBytes.ok) return modelsBytes;
 		writes.push({
@@ -629,8 +652,13 @@ export async function commitDraft(
 	try {
 		const committed = await io.commit({ writes });
 		if (!committed.ok) {
+			const transactionCode = committed.phase === "prepare"
+				? "transaction-prepare-failed"
+				: committed.phase === "commit"
+					? "transaction-commit-failed"
+					: "transaction-failed";
 			return failure(
-				committed.code ?? committed.error?.code ?? `transaction-${committed.phase}-failed`,
+				transactionCode,
 				committed.message,
 				[...secrets, io.sidecarPath, modelsPath],
 			);
