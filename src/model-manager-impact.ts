@@ -50,14 +50,25 @@ function stringField(
 }
 
 function isModelEntry(value: JsonObject, record: ModelManagerRecord): boolean {
+	const providers = [value.provider, value.providerAlias].filter(
+		(candidate): candidate is string => typeof candidate === "string",
+	);
+	const models = [value.modelId, value.id].filter(
+		(candidate): candidate is string => typeof candidate === "string",
+	);
 	return (
-		stringField(value, ["provider", "providerAlias"]) ===
-			record.providerAlias &&
-		stringField(value, ["modelId", "id"]) === record.modelId
+		providers.some((candidate) => candidate === record.providerAlias) &&
+		models.some((candidate) => candidate === record.modelId)
 	);
 }
 
-const CHAIN_CONTAINER_KEYS = new Set(["chain", "chains", "entries", "models"]);
+const CHAIN_CONTAINER_KEYS = new Set([
+	"chain",
+	"chains",
+	"entries",
+	"models",
+	"providers",
+]);
 
 function hasChainContainer(value: JsonObject): boolean {
 	return [...CHAIN_CONTAINER_KEYS].some((key) => {
@@ -104,20 +115,24 @@ interface ChainScanContext {
 	mapKey?: string;
 	entryCandidate: boolean;
 	mapContainer: boolean;
+	inProviders: boolean;
 }
 
 function childContext(
 	key: string,
 	child: unknown,
 	chainId: string | undefined,
+	context: ChainScanContext,
 ): ChainScanContext {
 	const container = CHAIN_CONTAINER_KEYS.has(key);
 	return {
 		chainId,
 		entryCandidate:
-			container && (key === "chain" || key === "entries") &&
+			container &&
+			(key === "chain" || key === "entries" || key === "models") &&
 			!isObject(child),
 		mapContainer: container && isObject(child),
+		inProviders: context.inProviders || key === "providers",
 	};
 }
 
@@ -157,6 +172,7 @@ function scanChain(
 				mapKey: key,
 				entryCandidate: true,
 				mapContainer: false,
+				inProviders: context.inProviders,
 			}, result);
 		}
 		return;
@@ -165,7 +181,7 @@ function scanChain(
 	const wrapper = hasChainContainer(value);
 	const chainId =
 		context.mapKey ??
-		(wrapper
+		(!context.inProviders && wrapper
 			? stringField(value, ["chainId", "id"])
 			: undefined) ??
 		context.chainId;
@@ -178,7 +194,13 @@ function scanChain(
 	}
 
 	for (const [key, child] of Object.entries(value)) {
-		scanChain(child, file, record, childContext(key, child, chainId), result);
+		scanChain(
+			child,
+			file,
+			record,
+			childContext(key, child, chainId, context),
+			result,
+		);
 	}
 }
 
@@ -193,7 +215,7 @@ export function scanModelEntries(
 		document,
 		file,
 		record,
-		{ entryCandidate: false, mapContainer: false },
+		{ entryCandidate: false, mapContainer: false, inProviders: false },
 		result,
 	);
 	return uniqueChainReferences(result);
@@ -232,6 +254,7 @@ function scanGenerated(
 				mapKey: key,
 				entryCandidate: true,
 				mapContainer: false,
+				inProviders: context.inProviders,
 			}, result);
 		}
 		return;
@@ -241,16 +264,17 @@ function scanGenerated(
 	const objectId = stringField(value, ["id"]);
 	const chainId =
 		context.mapKey ??
-		(wrapper
+		(!context.inProviders && wrapper
 			? stringField(value, ["chainId", "id"])
 			: undefined) ??
 		context.chainId;
 	const blockId =
-		(objectId?.startsWith("mm-") === true ? objectId : undefined) ??
 		context.mapKey ??
+		(objectId?.startsWith("mm-") === true ? objectId : undefined) ??
 		stringField(value, ["chainId", "id"]) ??
 		context.chainId;
 	if (
+		!context.inProviders &&
 		blockId !== undefined &&
 		isGeneratedBlock(value, context.mapKey) &&
 		containsRecordReference(value, record)
@@ -259,7 +283,13 @@ function scanGenerated(
 	}
 
 	for (const [key, child] of Object.entries(value)) {
-		scanGenerated(child, file, record, childContext(key, child, chainId), result);
+		scanGenerated(
+			child,
+			file,
+			record,
+			childContext(key, child, chainId, context),
+			result,
+		);
 	}
 }
 
@@ -274,7 +304,7 @@ export function scanGeneratedBlocks(
 		document,
 		file,
 		record,
-		{ entryCandidate: false, mapContainer: false },
+		{ entryCandidate: false, mapContainer: false, inProviders: false },
 		result,
 	);
 	return uniqueChainReferences(result);

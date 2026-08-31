@@ -234,7 +234,20 @@ test("scanModelEntries matches only exact model reference fields", () => {
 			id: "alias-fields",
 			entries: [{ providerAlias: "provider-a", modelId: "target-model" }],
 		},
+		{
+			id: "later-exact-fields",
+			entries: [
+				{
+					provider: "wrong-provider",
+					providerAlias: "provider-a",
+					modelId: "wrong-model",
+					id: "target-model",
+				},
+			],
+		},
 		{ id: "compound", entries: ["provider-a/target-model"] },
+		{ id: "compound-prefix", entries: ["prefix-provider-a/target-model"] },
+		{ id: "compound-suffix", entries: ["provider-a/target-model-suffix"] },
 		{
 			id: "provider-prefix",
 			entries: [{ provider: "provider-a-backup", id: "target-model" }],
@@ -244,8 +257,15 @@ test("scanModelEntries matches only exact model reference fields", () => {
 			entries: [{ provider: "provider-a", id: "target-model-v2" }],
 		},
 		{
-			id: "notes",
+			id: "near-fields-and-notes",
 			entries: [
+				{
+					provider: "provider-a-prefix",
+					providerAlias: "provider-a-suffix",
+					modelId: "target-model-prefix",
+					id: "target-model-suffix",
+					note: "provider-a/target-model",
+				},
 				{ path: "provider-a/target-model" },
 				{ name: "provider-a/target-model" },
 				{ description: "uses provider-a/target-model as a fallback" },
@@ -256,8 +276,59 @@ test("scanModelEntries matches only exact model reference fields", () => {
 	assert.deepEqual(scanModelEntries(document, file, record), [
 		{ file, chainId: "alias-fields", kind: "model-entry" },
 		{ file, chainId: "compound", kind: "model-entry" },
+		{ file, chainId: "later-exact-fields", kind: "model-entry" },
 		{ file, chainId: "provider-id-fields", kind: "model-entry" },
 		{ file, chainId: "provider-model-id-fields", kind: "model-entry" },
+	]);
+});
+
+test("scanModelEntries traverses generated providers maps with provider chain ids", () => {
+	const file = "chains.json";
+	const document = {
+		id: "mm-wrapper",
+		generated: true,
+		providers: {
+			"mm-provider-chain": {
+				models: [
+					{
+						provider: "wrong-provider",
+						providerAlias: "provider-a",
+						modelId: "wrong-model",
+						id: "target-model",
+					},
+				],
+			},
+			"provider-a": {
+				entries: [{ provider: "provider-a", id: "target-model" }],
+			},
+			"near-provider": {
+				models: [{ provider: "provider-a-prefix", id: "target-model" }],
+			},
+		},
+	};
+
+	assert.deepEqual(scanModelEntries(document, file, record), [
+		{ file, chainId: "mm-provider-chain", kind: "model-entry" },
+		{ file, chainId: "provider-a", kind: "model-entry" },
+	]);
+	assert.deepEqual(scanGeneratedBlocks(document, file, record), [
+		{ file, chainId: "mm-wrapper", kind: "generated-block" },
+	]);
+
+	const arrayDocument = {
+		id: "mm-array-wrapper",
+		providers: [
+			{
+				id: "nested-provider",
+				models: [{ provider: "provider-a", id: "target-model" }],
+			},
+		],
+	};
+	assert.deepEqual(scanModelEntries(arrayDocument, file, record), [
+		{ file, chainId: "mm-array-wrapper", kind: "model-entry" },
+	]);
+	assert.deepEqual(scanGeneratedBlocks(arrayDocument, file, record), [
+		{ file, chainId: "mm-array-wrapper", kind: "generated-block" },
 	]);
 });
 
