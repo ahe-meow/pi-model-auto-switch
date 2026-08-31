@@ -37,7 +37,7 @@ interface Fixture {
 }
 
 function makeFixtureData(): Omit<Fixture, "dir" | "modelsPath" | "sidecarPath" | "failoverPaths"> {
-	const firstId = createStableId("provider-a", "gpt-4o");
+	const firstId = "arbitrary-record-id";
 	const records: ModelManagerRecord[] = [
 		{
 			id: firstId,
@@ -128,12 +128,102 @@ test("readModelCatalog builds stable id index from records and models config", a
 		assert.equal(snapshot.providers[0]?.baseUrl, "https://api.example.test/v1");
 		assert.deepEqual(snapshot.providers[0]?.models.map(({ id }) => id), ["gpt-4o", "gpt-4o"]);
 		assert.equal(snapshot.providers[0]?.apiKey, "");
-		assert.equal(snapshot.byId.get(createStableId("provider-a", "gpt-4o")), snapshot.records[0]);
-		assert.equal(
-			snapshot.byId.get(createStableId("provider-a", "gpt-4o", new Set([createStableId("provider-a", "gpt-4o")]))),
-			snapshot.records[1],
-		);
+		assert.equal(snapshot.byId.get(snapshot.records[0]!.id), snapshot.records[0]);
+		assert.equal(snapshot.byId.get(snapshot.records[1]!.id), snapshot.records[1]);
+		assert.equal(snapshot.byId.get(createStableId("provider-a", "gpt-4o")), undefined);
 		assert.equal(snapshot.failoverUntouched, true);
+	});
+});
+
+test("readModelCatalog rejects invalid provider credentials and model shapes", async () => {
+	await withFixture(async ({ modelsPath, sidecarPath }) => {
+		const cases = [
+			{ name: "missing apiKey", provider: { name: "provider-a", models: [{ id: "gpt-4o" }] } },
+			{
+				name: "non-string apiKey",
+				provider: { name: "provider-a", apiKey: 42, models: [{ id: "gpt-4o" }] },
+			},
+			{ name: "missing models", provider: { name: "provider-a", apiKey: opaqueApiKey } },
+			{
+				name: "non-array models",
+				provider: { name: "provider-a", apiKey: opaqueApiKey, models: {} },
+			},
+		];
+
+		for (const { name, provider } of cases) {
+			await writeFile(modelsPath, JSON.stringify({ providers: [provider] }), "utf8");
+			const result = await readModelCatalog(modelsPath, sidecarPath);
+			assertBlocked(result);
+			if (result.ok) continue;
+			assert.equal("code" in result.error, true, name);
+			if (!("code" in result.error)) continue;
+			assert.equal(result.error.code, "unreadable-models", name);
+			assert.equal(result.error.message.includes(opaqueApiKey), false, name);
+		}
+	});
+});
+
+test("applyCatalogDraft preserves provider and model metadata", async () => {
+	await withFixture(async ({ modelsPath, sidecarPath }) => {
+		const snapshot = assertSnapshot(await readModelCatalog(modelsPath, sidecarPath));
+		const edited = applyCatalogDraft(snapshot, {
+			edit: [{ id: snapshot.records[0]!.id, fields: { label: "Edited" } }],
+		});
+
+		assert.equal((snapshot.providers[0] as Record<string, unknown>).api, "openai-completions");
+		assert.equal((edited.providers[0] as Record<string, unknown>).api, "openai-completions");
+		assert.equal(snapshot.providers[0]?.models[0]?.reasoning, true);
+		assert.equal(edited.providers[0]?.models[0]?.reasoning, true);
+	});
+});
+
+test("applyCatalogDraft keeps record identity fields immutable", async () => {
+	await withFixture(async ({ modelsPath, sidecarPath }) => {
+		const snapshot = assertSnapshot(await readModelCatalog(modelsPath, sidecarPath));
+		const original = snapshot.records[0]!;
+		const edited = applyCatalogDraft(snapshot, {
+			edit: [{
+				id: original.id,
+				fields: {
+					id: "replacement-id",
+					providerAlias: "replacement-provider",
+					modelId: "replacement-model",
+					label: "Edited",
+				},
+			}],
+		});
+		const record = edited.records[0]!;
+
+		assert.equal(record.id, original.id);
+		assert.equal(record.providerAlias, original.providerAlias);
+		assert.equal(record.modelId, original.modelId);
+		assert.equal(record.label, "Edited");
+		assert.equal(edited.byId.get(original.id), record);
+		assert.equal(edited.byId.has("replacement-id"), false);
+	});
+});
+
+test("readModelCatalog strips nested secrets from sidecar records and outputs", async () => {
+	await withFixture(async ({ modelsPath, sidecarPath, sidecar, records }) => {
+		const secret = "nested-record-secret";
+		const nestedRecord = {
+			...records[0],
+			nestedMetadata: {
+				token: secret,
+				keep: true,
+				deeper: [{ api_key: secret, visible: "yes" }],
+			},
+		};
+		await writeFile(sidecarPath, JSON.stringify({ ...sidecar, models: [nestedRecord, records[1]] }), "utf8");
+
+		const snapshot = assertSnapshot(await readModelCatalog(modelsPath, sidecarPath));
+		const output = JSON.stringify(snapshot);
+		assert.equal(output.includes(secret), false);
+		assert.deepEqual(snapshot.records[0]?.nestedMetadata, {
+			keep: true,
+			deeper: [{ visible: "yes" }],
+		});
+		assert.equal(JSON.stringify(toPiProviderAlias(snapshot.records[0]!)).includes(secret), false);
 	});
 });
 

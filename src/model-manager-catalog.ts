@@ -4,7 +4,6 @@ import {
 	type SidecarReadSuccess,
 } from "./model-manager-sidecar.ts";
 import {
-	cloneRecord,
 	createStableId,
 	type ModelManagerRecord,
 	type ModelManagerResult,
@@ -21,6 +20,7 @@ export interface PiProviderDraft {
 	baseUrl?: string;
 	apiKey: string;
 	models: PiProviderModel[];
+	[key: string]: unknown;
 }
 
 export interface ModelManagerCatalogSnapshot {
@@ -91,16 +91,15 @@ function unreadableModels(): ModelManagerResult<never> {
 	};
 }
 
+function sanitizeRecord(record: ModelManagerRecord): ModelManagerRecord {
+	return stripSecrets(record) as ModelManagerRecord;
+}
+
 function recordIndex(
 	records: readonly ModelManagerRecord[],
 ): Map<string, ModelManagerRecord> {
 	const byId = new Map<string, ModelManagerRecord>();
-	const taken = new Set<string>();
-	for (const record of records) {
-		const id = createStableId(record.providerAlias, record.modelId, taken);
-		taken.add(id);
-		byId.set(id, record);
-	}
+	for (const record of records) byId.set(record.id, record);
 	return byId;
 }
 
@@ -120,26 +119,37 @@ function providerForRecords(
 ): PiProviderDraft[] {
 	const previousByName = new Map(previous.map((provider) => [provider.name, provider]));
 	const providers = new Map<string, PiProviderDraft>();
+	const modelOccurrences = new Map<string, number>();
 
 	for (const record of records) {
+		const old = previousByName.get(record.providerAlias);
 		let provider = providers.get(record.providerAlias);
 		if (!provider) {
-			const old = previousByName.get(record.providerAlias);
+			const safeOld = old ? (stripSecrets(old) as JsonObject) : {};
 			provider = {
+				...safeOld,
 				name: record.providerAlias,
-				...(old?.baseUrl === undefined ? {} : { baseUrl: old.baseUrl }),
 				apiKey: "",
 				models: [],
 			};
 			providers.set(record.providerAlias, provider);
 		}
-		provider.models.push(modelFromRecord(record));
+
+		const occurrenceKey = `${record.providerAlias}\u0000${record.modelId}`;
+		const occurrence = modelOccurrences.get(occurrenceKey) ?? 0;
+		modelOccurrences.set(occurrenceKey, occurrence + 1);
+		const oldModel = old?.models.filter((model) => model.id === record.modelId)[occurrence];
+		const model = {
+			...(oldModel ? (stripSecrets(oldModel) as JsonObject) : {}),
+			...modelFromRecord(record),
+		};
+		provider.models.push(model as PiProviderModel);
 	}
 	return [...providers.values()];
 }
 
 function parseProviderModels(provider: JsonObject): PiProviderModel[] | undefined {
-	if (!Array.isArray(provider.models)) return [];
+	if (!Array.isArray(provider.models)) return undefined;
 	const models: PiProviderModel[] = [];
 	for (const value of provider.models) {
 		if (!isObject(value) || typeof value.id !== "string" || value.id.trim() === "") {
@@ -168,14 +178,18 @@ function parseProviders(document: unknown): PiProviderDraft[] | undefined {
 		) {
 			return undefined;
 		}
+		if (
+			providerValue.apiKey === undefined ||
+			typeof providerValue.apiKey !== "string"
+		) {
+			return undefined;
+		}
 		const models = parseProviderModels(providerValue);
 		if (!models) return undefined;
-		providers.push({
-			name: providerValue.name,
-			...(providerValue.baseUrl === undefined ? {} : { baseUrl: providerValue.baseUrl }),
-			apiKey: "",
-			models,
-		});
+		const safe = stripSecrets(providerValue) as JsonObject;
+		safe.apiKey = "";
+		safe.models = models;
+		providers.push(safe as PiProviderDraft);
 	}
 	return providers;
 }
@@ -191,7 +205,7 @@ function buildRecords(
 	);
 	return sidecar.models
 		.filter((record) => identities.has(`${record.providerAlias}\u0000${record.modelId}`))
-	.map(cloneRecord);
+		.map(sanitizeRecord);
 }
 
 export async function readModelCatalog(
@@ -247,7 +261,7 @@ export function toSidecarRecord(
 		typeof copiedFields.providerAlias === "string" && copiedFields.providerAlias.length > 0
 			? copiedFields.providerAlias
 			: providerName;
-	return {
+	return sanitizeRecord({
 		...copiedFields,
 		id: createStableId(providerAlias, modelId),
 		providerAlias,
@@ -255,20 +269,37 @@ export function toSidecarRecord(
 		modelId,
 		multiplier: copiedFields.multiplier ?? 1,
 		groupOwner: copiedFields.groupOwner ?? false,
-	};
+	});
 }
 
 export function applyCatalogDraft(
 	snapshot: ModelManagerCatalogSnapshot,
 	edits: CatalogEdits,
 ): ModelManagerCatalogSnapshot {
-	let records = snapshot.records.map(cloneRecord);
-	for (const record of edits.add ?? []) records.push(cloneRecord(record));
+	let records = snapshot.records.map(sanitizeRecord);
+	const taken = new Set(records.map((record) => record.id));
+	for (const record of edits.add ?? []) {
+		const safeRecord = sanitizeRecord(record);
+		const id = taken.has(safeRecord.id)
+			? createStableId(safeRecord.providerAlias, safeRecord.modelId, taken)
+			: safeRecord.id;
+		const added = id === safeRecord.id ? safeRecord : { ...safeRecord, id };
+		records.push(added);
+		taken.add(id);
+	}
 
 	for (const edit of edits.edit ?? []) {
 		const index = records.findIndex((record) => record.id === edit.id);
 		if (index === -1) continue;
-		records[index] = structuredClone({ ...records[index], ...edit.fields });
+		const editableFields: JsonObject = {};
+		for (const [key, value] of Object.entries(edit.fields)) {
+			if (key === "id" || key === "providerAlias" || key === "providerName" || key === "modelId") continue;
+			editableFields[key] = value;
+		}
+		records[index] = structuredClone({
+			...records[index],
+			...(stripSecrets(editableFields) as JsonObject),
+		});
 	}
 	const removed = new Set(edits.remove ?? []);
 	if (removed.size > 0) records = records.filter((record) => !removed.has(record.id));
