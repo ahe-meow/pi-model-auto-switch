@@ -35,10 +35,6 @@ function isObject(value: unknown): value is JsonObject {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function includesIdentity(value: string, identity: string): boolean {
-	return value === identity || value.includes(identity);
-}
-
 function identityPair(record: ModelManagerRecord): string {
 	return `${record.providerAlias}/${record.modelId}`;
 }
@@ -54,43 +50,32 @@ function stringField(
 }
 
 function isModelEntry(value: JsonObject, record: ModelManagerRecord): boolean {
-	const provider = stringField(value, ["provider", "providerAlias"]);
-	const model = stringField(value, ["modelId"]);
-	const id = stringField(value, ["id"]);
-	if (
-		provider !== undefined &&
-		model !== undefined &&
-		includesIdentity(provider, record.providerAlias) &&
-		includesIdentity(model, record.modelId)
-	)
-		return true;
-	if (
-		provider !== undefined &&
-		id !== undefined &&
-		includesIdentity(provider, record.providerAlias) &&
-		includesIdentity(id, record.modelId)
-	)
-		return true;
-	return Object.values(value).some(
-		(entry) =>
-			typeof entry === "string" &&
-			includesIdentity(entry, identityPair(record)),
+	return (
+		stringField(value, ["provider", "providerAlias"]) ===
+			record.providerAlias &&
+		stringField(value, ["modelId", "id"]) === record.modelId
 	);
 }
 
+const CHAIN_CONTAINER_KEYS = new Set(["chain", "chains", "entries", "models"]);
+
 function hasChainContainer(value: JsonObject): boolean {
-	return ["chain", "chains", "entries", "models"].some((key) => {
+	return [...CHAIN_CONTAINER_KEYS].some((key) => {
 		const child = value[key];
 		return Array.isArray(child) || isObject(child);
 	});
 }
 
-function isGeneratedMarker(value: JsonObject, keyHint: string | undefined): boolean {
-	if (keyHint === "generated") return true;
-	if (value.generated === true || value.virtual === true) return true;
-	if (value.kind === "generated" || value.type === "generated") return true;
-	return ["provider", "providerAlias", "providerName", "name"].some(
-		(key) => value[key] === "failover",
+function isGeneratedBlock(value: JsonObject, mapKey?: string): boolean {
+	const id = stringField(value, ["id"]) ?? mapKey;
+	return (
+		id?.startsWith("mm-") === true ||
+		value.generated === true ||
+		value.virtual === true ||
+		value.kind === "generated" ||
+		value.kind === "virtual" ||
+		value.type === "generated" ||
+		value.type === "virtual"
 	);
 }
 
@@ -116,10 +101,24 @@ function uniqueChainReferences(references: readonly ChainReference[]): ChainRefe
 
 interface ChainScanContext {
 	chainId?: string;
-	generated: boolean;
-	inChain: boolean;
-	keyHint?: string;
-	mapKeyContainer: boolean;
+	mapKey?: string;
+	entryCandidate: boolean;
+	mapContainer: boolean;
+}
+
+function childContext(
+	key: string,
+	child: unknown,
+	chainId: string | undefined,
+): ChainScanContext {
+	const container = CHAIN_CONTAINER_KEYS.has(key);
+	return {
+		chainId,
+		entryCandidate:
+			container && (key === "chain" || key === "entries") &&
+			!isObject(child),
+		mapContainer: container && isObject(child),
+	};
 }
 
 function scanChain(
@@ -130,7 +129,7 @@ function scanChain(
 	result: ChainReference[],
 ): void {
 	if (typeof value === "string") {
-		if (context.inChain && includesIdentity(value, identityPair(record))) {
+		if (context.entryCandidate && value === identityPair(record)) {
 			result.push({
 				file,
 				chainId: context.chainId ?? "unknown",
@@ -140,34 +139,37 @@ function scanChain(
 		return;
 	}
 	if (Array.isArray(value)) {
-		for (const [index, child] of value.entries()) {
+		for (const child of value) {
 			scanChain(child, file, record, {
 				...context,
-				keyHint: String(index),
-				mapKeyContainer: false,
+				mapKey: undefined,
+				mapContainer: false,
 			}, result);
 		}
 		return;
 	}
 	if (!isObject(value)) return;
 
-	const explicitId = stringField(value, ["chainId"]);
-	const objectId = stringField(value, ["id"]);
-	const mapId =
-		context.mapKeyContainer && context.keyHint && !/^\d+$/.test(context.keyHint)
-			? context.keyHint
-			: undefined;
-	const chainId =
-		explicitId ??
-		((hasChainContainer(value) || objectId?.startsWith("mm-"))
-			? objectId
-			: undefined) ??
-		mapId ??
-		context.chainId;
-	const marker = context.generated || isGeneratedMarker(value, context.keyHint);
-	const inChain = context.inChain || hasChainContainer(value) || chainId !== undefined;
+	if (context.mapContainer) {
+		for (const [key, child] of Object.entries(value)) {
+			scanChain(child, file, record, {
+				chainId: key,
+				mapKey: key,
+				entryCandidate: true,
+				mapContainer: false,
+			}, result);
+		}
+		return;
+	}
 
-	if (inChain && isModelEntry(value, record)) {
+	const wrapper = hasChainContainer(value);
+	const chainId =
+		context.mapKey ??
+		(wrapper
+			? stringField(value, ["chainId", "id"])
+			: undefined) ??
+		context.chainId;
+	if (context.entryCandidate && isModelEntry(value, record)) {
 		result.push({
 			file,
 			chainId: chainId ?? "unknown",
@@ -176,14 +178,7 @@ function scanChain(
 	}
 
 	for (const [key, child] of Object.entries(value)) {
-		scanChain(child, file, record, {
-			chainId,
-			generated: marker || key === "generated",
-			inChain,
-			keyHint: key,
-			mapKeyContainer:
-				key === "chains" || key === "entries" || key === "models",
-		}, result);
+		scanChain(child, file, record, childContext(key, child, chainId), result);
 	}
 }
 
@@ -198,24 +193,17 @@ export function scanModelEntries(
 		document,
 		file,
 		record,
-		{ generated: false, inChain: false, mapKeyContainer: false },
+		{ entryCandidate: false, mapContainer: false },
 		result,
 	);
-	return uniqueChainReferences(
-		result.filter((reference) => reference.kind === "model-entry"),
-	);
+	return uniqueChainReferences(result);
 }
 
 function containsRecordReference(
 	value: unknown,
 	record: ModelManagerRecord,
 ): boolean {
-	if (typeof value === "string") return value === identityPair(record);
-	if (Array.isArray(value))
-		return value.some((child) => containsRecordReference(child, record));
-	if (!isObject(value)) return false;
-	if (isModelEntry(value, record)) return true;
-	return Object.values(value).some((child) => containsRecordReference(child, record));
+	return scanModelEntries(value, "", record).length > 0;
 }
 
 function scanGenerated(
@@ -226,42 +214,52 @@ function scanGenerated(
 	result: ChainReference[],
 ): void {
 	if (Array.isArray(value)) {
-		for (const [index, child] of value.entries()) {
+		for (const child of value) {
 			scanGenerated(child, file, record, {
 				...context,
-				keyHint: String(index),
-				mapKeyContainer: false,
+				mapKey: undefined,
+				mapContainer: false,
 			}, result);
 		}
 		return;
 	}
 	if (!isObject(value)) return;
 
-	const explicitId = stringField(value, ["chainId"]);
+	if (context.mapContainer) {
+		for (const [key, child] of Object.entries(value)) {
+			scanGenerated(child, file, record, {
+				chainId: key,
+				mapKey: key,
+				entryCandidate: true,
+				mapContainer: false,
+			}, result);
+		}
+		return;
+	}
+
+	const wrapper = hasChainContainer(value);
 	const objectId = stringField(value, ["id"]);
-	const mapId =
-		context.mapKeyContainer && context.keyHint && !/^\d+$/.test(context.keyHint)
-			? context.keyHint
-			: undefined;
-	const chainId = explicitId ?? objectId ?? mapId ?? context.chainId;
-	const generated = context.generated || isGeneratedMarker(value, context.keyHint);
+	const chainId =
+		context.mapKey ??
+		(wrapper
+			? stringField(value, ["chainId", "id"])
+			: undefined) ??
+		context.chainId;
+	const blockId =
+		(objectId?.startsWith("mm-") === true ? objectId : undefined) ??
+		context.mapKey ??
+		stringField(value, ["chainId", "id"]) ??
+		context.chainId;
 	if (
-		chainId !== undefined &&
-		(objectId?.startsWith("mm-") === true || generated) &&
+		blockId !== undefined &&
+		isGeneratedBlock(value, context.mapKey) &&
 		containsRecordReference(value, record)
 	) {
-		result.push({ file, chainId, kind: "generated-block" });
+		result.push({ file, chainId: blockId, kind: "generated-block" });
 	}
+
 	for (const [key, child] of Object.entries(value)) {
-		scanGenerated(child, file, record, {
-			chainId,
-			generated: generated || key === "generated",
-			inChain: context.inChain,
-			keyHint: key,
-			mapKeyContainer:
-				key === "chains" || key === "entries" || key === "models" ||
-				(key === "providers" && generated),
-		}, result);
+		scanGenerated(child, file, record, childContext(key, child, chainId), result);
 	}
 }
 
@@ -276,12 +274,10 @@ export function scanGeneratedBlocks(
 		document,
 		file,
 		record,
-		{ generated: false, inChain: false, mapKeyContainer: false },
+		{ entryCandidate: false, mapContainer: false },
 		result,
 	);
-	return uniqueChainReferences(
-		result.filter((reference) => reference.kind === "generated-block"),
-	);
+	return uniqueChainReferences(result);
 }
 
 function statePath(parent: string, key: string, array: boolean): string {
@@ -290,31 +286,21 @@ function statePath(parent: string, key: string, array: boolean): string {
 	return `${parent}.${key}`;
 }
 
-function isStateIdentity(value: string, record: ModelManagerRecord): boolean {
-	return value === identityPair(record) || value === record.id;
-}
-
-function scanStateValue(
+function scanStateTargets(
 	value: unknown,
 	file: string,
-	record: ModelManagerRecord,
+	identity: string,
 	path: string,
 	result: StateReference[],
 ): void {
-	if (typeof value === "string") {
-		if (isStateIdentity(value, record)) result.push({ file, key: path });
-		return;
-	}
-	if (Array.isArray(value)) {
-		for (const [index, child] of value.entries())
-			scanStateValue(child, file, record, statePath(path, String(index), true), result);
-		return;
-	}
-	if (!isObject(value)) return;
-	for (const [key, child] of Object.entries(value)) {
-		const childPath = statePath(path, key, false);
-		if (isStateIdentity(key, record)) result.push({ file, key: childPath });
-		scanStateValue(child, file, record, childPath, result);
+	if (!Array.isArray(value)) return;
+	for (const [index, target] of value.entries()) {
+		if (target === identity) {
+			result.push({
+				file,
+				key: statePath(path, String(index), true),
+			});
+		}
 	}
 }
 
@@ -324,8 +310,44 @@ export function scanStateReferences(
 	file: string,
 	record: ModelManagerRecord,
 ): StateReference[] {
+	if (!isObject(document)) return [];
+	const identity = identityPair(record);
 	const result: StateReference[] = [];
-	scanStateValue(document, file, record, "", result);
+	if (isObject(document.targets) && Object.hasOwn(document.targets, identity)) {
+		result.push({ file, key: `targets.${identity}` });
+	}
+	if (isObject(document.registrations)) {
+		for (const [registrationKey, registration] of Object.entries(
+			document.registrations,
+		)) {
+			if (!isObject(registration)) continue;
+			scanStateTargets(
+				registration.targets,
+				file,
+				identity,
+				`registrations.${registrationKey}.targets`,
+				result,
+			);
+		}
+	}
+	if (isObject(document.scopes)) {
+		for (const [scopeKey, scope] of Object.entries(document.scopes)) {
+			if (!isObject(scope)) continue;
+			scanStateTargets(
+				scope.targets,
+				file,
+				identity,
+				`scopes.${scopeKey}.targets`,
+				result,
+			);
+			if (isObject(scope.overrides) && Object.hasOwn(scope.overrides, identity)) {
+				result.push({
+					file,
+					key: `scopes.${scopeKey}.overrides.${identity}`,
+				});
+			}
+		}
+	}
 	const seen = new Set<string>();
 	return result
 		.filter((reference) => {

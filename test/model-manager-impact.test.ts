@@ -6,6 +6,9 @@ import { test } from "node:test";
 import {
 	analyzeDeletionImpact,
 	confirmCascade,
+	scanGeneratedBlocks,
+	scanModelEntries,
+	scanStateReferences,
 	type CatalogImpact,
 } from "../src/model-manager-impact.ts";
 import type { ModelManagerCatalogSnapshot } from "../src/model-manager-catalog.ts";
@@ -214,6 +217,118 @@ test("analyzeDeletionImpact supports array and wrapped v8 chain shapes", async (
 			{ file: chainsPath, chainId: "mm-array", kind: "model-entry" },
 		]);
 	});
+});
+
+test("scanModelEntries matches only exact model reference fields", () => {
+	const file = "chains.json";
+	const document = [
+		{
+			id: "provider-id-fields",
+			entries: [{ provider: "provider-a", id: "target-model" }],
+		},
+		{
+			id: "provider-model-id-fields",
+			entries: [{ provider: "provider-a", modelId: "target-model" }],
+		},
+		{
+			id: "alias-fields",
+			entries: [{ providerAlias: "provider-a", modelId: "target-model" }],
+		},
+		{ id: "compound", entries: ["provider-a/target-model"] },
+		{
+			id: "provider-prefix",
+			entries: [{ provider: "provider-a-backup", id: "target-model" }],
+		},
+		{
+			id: "model-suffix",
+			entries: [{ provider: "provider-a", id: "target-model-v2" }],
+		},
+		{
+			id: "notes",
+			entries: [
+				{ path: "provider-a/target-model" },
+				{ name: "provider-a/target-model" },
+				{ description: "uses provider-a/target-model as a fallback" },
+			],
+		},
+	];
+
+	assert.deepEqual(scanModelEntries(document, file, record), [
+		{ file, chainId: "alias-fields", kind: "model-entry" },
+		{ file, chainId: "compound", kind: "model-entry" },
+		{ file, chainId: "provider-id-fields", kind: "model-entry" },
+		{ file, chainId: "provider-model-id-fields", kind: "model-entry" },
+	]);
+});
+
+test("scanGeneratedBlocks reports only generated wrapper blocks", () => {
+	const file = "chains.json";
+	const target = { provider: "provider-a", id: "target-model" };
+	const mmBlock = { id: "mm-x", generated: true, chain: [target] };
+	const document = {
+		models: [
+			mmBlock,
+			{ id: "explicit-virtual", virtual: true, chain: [target] },
+			{ id: "provider-marker", provider: "failover", chain: [target] },
+			{ id: "name-marker", name: "failover", chain: [target] },
+		],
+	};
+
+	assert.deepEqual(scanGeneratedBlocks(document, file, record), [
+		{ file, chainId: "explicit-virtual", kind: "generated-block" },
+		{ file, chainId: "mm-x", kind: "generated-block" },
+	]);
+	assert.deepEqual(scanModelEntries([mmBlock], file, record), [
+		{ file, chainId: "mm-x", kind: "model-entry" },
+	]);
+});
+
+test("scanModelEntries uses chain map keys as chain ids", () => {
+	const file = "chains.json";
+	const target = { providerAlias: "provider-a", modelId: "target-model" };
+	const document = {
+		chains: { primary: { entries: [target] } },
+		models: { secondary: { entries: [target] } },
+		entries: { tertiary: { chain: [target] } },
+	};
+
+	assert.deepEqual(scanModelEntries(document, file, record), [
+		{ file, chainId: "primary", kind: "model-entry" },
+		{ file, chainId: "secondary", kind: "model-entry" },
+		{ file, chainId: "tertiary", kind: "model-entry" },
+	]);
+});
+
+test("scanStateReferences reports only shared-state identity locations", () => {
+	const file = "failover-state.json";
+	const identity = "provider-a/target-model";
+	const document = {
+		targets: {
+			[identity]: {},
+			[record.id]: {},
+		},
+		registrations: {
+			"/agent/project": {
+				targets: [identity, record.id],
+				note: identity,
+			},
+		},
+		scopes: {
+			primary: {
+				targets: [identity, record.id],
+				overrides: { [identity]: {}, [record.id]: {} },
+				description: identity,
+			},
+		},
+		note: identity,
+	};
+
+	assert.deepEqual(scanStateReferences(document, file, record), [
+		{ file, key: "registrations./agent/project.targets[0]" },
+		{ file, key: "scopes.primary.overrides.provider-a/target-model" },
+		{ file, key: "scopes.primary.targets[0]" },
+		{ file, key: "targets.provider-a/target-model" },
+	]);
 });
 
 test("analyzeDeletionImpact never writes files or source implementation", async () => {
