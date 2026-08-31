@@ -6,6 +6,7 @@ import {
 	createStableId,
 	groupCatalog,
 	validateMultiplier,
+	type CatalogGroup,
 	type ModelManagerRecord,
 } from "../src/model-manager-types.ts";
 
@@ -60,18 +61,17 @@ test("validateMultiplier rejects more than 3 decimals", () => {
 });
 
 test("createStableId is deterministic and collision safe", () => {
+	const formatted = createStableId("Anthropic", "Claude 3.5");
+	assert.match(formatted, /^anthropic--claude-3-5-[0-9a-f]{64}$/);
 	assert.equal(
-		createStableId("Anthropic", "Claude 3.5"),
-		"anthropic--claude-3-5",
+		formatted,
+		createStableId("anthropic", "Claude 3.5"),
 	);
+	assert.equal(createStableId("anthropic", "claude35"), "anthropic--claude35");
+	const taken = new Set(["provider--model"]);
 	assert.equal(
-		createStableId("Anthropic", "Claude 3.5"),
-		createStableId("anthropic", "claude-3-5"),
-	);
-	const taken = new Set(["provider-a--model-a"]);
-	assert.equal(
-		createStableId("provider-a", "model-a", taken),
-		"provider-a--model-a-2",
+		createStableId("provider", "model", taken),
+		"provider--model-2",
 	);
 	const takenTwo = new Set(["x--y", "x--y-2"]);
 	assert.equal(createStableId("x", "y", takenTwo), "x--y-3");
@@ -79,6 +79,13 @@ test("createStableId is deterministic and collision safe", () => {
 	const c1 = createStableId("a", "b--c");
 	const c2 = createStableId("a--b", "c");
 	assert.notEqual(c1, c2, "slug collisions must differ");
+	// Punctuation collisions must differ without a `taken` set.
+	const punctuationCollision = createStableId("a.b", "c");
+	const hyphenCollision = createStableId("a-b", "c");
+	assert.notEqual(punctuationCollision, hyphenCollision);
+	const delimiterCollision = createStableId("a::b", "c");
+	const reversedDelimiterCollision = createStableId("a", "b::c");
+	assert.notEqual(delimiterCollision, reversedDelimiterCollision);
 	// Deterministic: same inputs always same output.
 	assert.equal(createStableId("a", "b--c"), createStableId("a", "b--c"));
 	assert.equal(createStableId("a--b", "c"), createStableId("a--b", "c"));
@@ -148,24 +155,24 @@ test("groupCatalog groups by remoteGroup then providerAlias with owner flagged",
 
 	// Sorted by group key.
 	assert.deepEqual(
-		groups.map((g) => g.key),
+		groups.map((g: CatalogGroup) => g.key),
 		["gamma", "shared", "solo"],
 	);
 
 	// "shared" has two owners -> smallest id wins.
-	const shared = groups.find((g) => g.key === "shared");
+	const shared = groups.find((g: CatalogGroup) => g.key === "shared");
 	assert.ok(shared);
 	assert.equal(shared.owner?.id, "a");
 	assert.equal(shared.records.length, 2);
 
 	// No remoteGroup -> key is providerAlias, no owner.
-	const gamma = groups.find((g) => g.key === "gamma");
+	const gamma = groups.find((g: CatalogGroup) => g.key === "gamma");
 	assert.ok(gamma);
 	assert.equal(gamma.owner, null);
 	assert.equal(gamma.records.length, 1);
 
 	// "solo" has no owner flagged.
-	const solo = groups.find((g) => g.key === "solo");
+	const solo = groups.find((g: CatalogGroup) => g.key === "solo");
 	assert.ok(solo);
 	assert.equal(solo.owner, null);
 });

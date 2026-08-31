@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export type Multiplier = number;
 
 export interface ModelManagerRecord {
@@ -53,14 +55,18 @@ function slug(value: string): string {
 	return value.toLowerCase().replace(/[^a-z0-9]/g, "-");
 }
 
-/** FNV-1a 32-bit hex digest, deterministic and dependency-free. */
-function fnv1a(input: string): string {
-	let hash = 0x811c9dc5;
-	for (let i = 0; i < input.length; i++) {
-		hash ^= input.charCodeAt(i);
-		hash = Math.imul(hash, 0x01000193) >>> 0;
-	}
-	return hash.toString(16).padStart(8, "0");
+/** Encode one case-insensitive pair part with its UTF-8 byte length. */
+function encodePairPart(value: string): string {
+	const normalized = value.toLowerCase();
+	return `${Buffer.byteLength(normalized, "utf8")}:${normalized}`;
+}
+
+/** SHA-256 over an unambiguous, length-prefixed provider/model pair. */
+function sha256Pair(providerAlias: string, modelId: string): string {
+	return createHash("sha256")
+		.update(encodePairPart(providerAlias))
+		.update(encodePairPart(modelId))
+		.digest("hex");
 }
 
 /** Append `-2`, `-3`, ... when `base` (or a taken suffix) is already taken. */
@@ -78,14 +84,11 @@ export function createStableId(
 ): string {
 	const provider = slug(providerAlias);
 	const model = slug(modelId);
-	// A `--` inside either slug would blur the `--` separator boundary
-	// (e.g. ("a","b--c") vs ("a--b","c")). Bind lossy/ambiguous inputs
-	// to a digest of the raw values so distinct inputs never collide.
-	if (provider.includes("--") || model.includes("--")) {
-		const digest = fnv1a(`${providerAlias}::${modelId}`);
-		return uniqueWithSuffix(`${provider}--${model}-${digest}`, taken);
-	}
-	return uniqueWithSuffix(`${provider}--${model}`, taken);
+	const needsDigest =
+		!/^[a-z0-9]+$/.test(providerAlias.toLowerCase()) ||
+		!/^[a-z0-9]+$/.test(modelId.toLowerCase());
+	const digest = needsDigest ? `-${sha256Pair(providerAlias, modelId)}` : "";
+	return uniqueWithSuffix(`${provider}--${model}${digest}`, taken);
 }
 
 export function createProviderAlias(
