@@ -295,17 +295,28 @@ test("commitDraft preserves existing apiKey bytes when key is unchanged and inje
 			providers: [{ name: source.providerAlias, apiKey: opaqueKey, models: [{ id: source.modelId }] }],
 		}, null, 2)}\n`, "utf8");
 		await writeFile(modelsPath, originalModels);
+		const expectedModelsRevision = (await readRevision(modelsPath)).revision;
 		const edit = assertOk(editDraft(snapshot(), source.id, { label: "Edited" }));
+		let commits = 0;
 
 		const unchanged = await commitDraft(edit, {
 			snapshot: snapshot(),
 			sidecarPath,
-			commit: commitCatalogTransaction,
+			commit: async (input) => {
+				commits += 1;
+				assert.equal(input.writes.length, 2);
+				const modelsWrite = input.writes.find((write) => write.path === modelsPath);
+				assert.ok(modelsWrite);
+				assert.equal(modelsWrite.expectRevision, expectedModelsRevision);
+				assert.deepEqual(Buffer.from(modelsWrite.bytes), originalModels);
+				return commitCatalogTransaction(input);
+			},
 			impact: null,
 			confirmed: true,
 		});
 
 		assert.equal(unchanged.ok, true);
+		assert.equal(commits, 1);
 		assert.deepEqual(await readFile(modelsPath), originalModels);
 		assert.equal(JSON.stringify(unchanged).includes(opaqueKey), false);
 	});
@@ -421,6 +432,148 @@ test("commitDraft uses existing revisions and preserves sidecar and provider met
 		assert.equal(commits, 1);
 		assert.equal(JSON.stringify(result).includes(secret), false);
 	});
+});
+
+test("commitDraft rejects secret-free edit when models catalog is missing", async () => {
+	await withTempDir(async (dir) => {
+		const sidecarPath = join(dir, "model-manager.json");
+		let commits = 0;
+		const edit = assertOk(editDraft(snapshot(), source.id, { label: "Edited" }));
+
+		const result = await commitDraft(edit, {
+			snapshot: snapshot(),
+			sidecarPath,
+			commit: async () => {
+				commits += 1;
+				return { ok: true, committed: [] };
+			},
+			impact: null,
+			confirmed: true,
+		});
+
+		assertError(result, "models-missing");
+		assert.equal(commits, 0);
+	});
+});
+
+test("commitDraft rejects existing models providers without string apiKey", async () => {
+	for (const apiKey of [undefined, 42]) {
+		await withTempDir(async (dir) => {
+			const sidecarPath = join(dir, "model-manager.json");
+			const modelsPath = join(dir, "models.json");
+			const provider = {
+				name: source.providerAlias,
+				models: [{ id: source.modelId }],
+				...(apiKey === undefined ? {} : { apiKey }),
+			};
+			await writeFile(modelsPath, `${JSON.stringify({ providers: [provider] })}\n`);
+			let commits = 0;
+
+			const result = await commitDraft(newDraft("shape-secret"), {
+				snapshot: snapshot([]),
+				sidecarPath,
+				commit: async () => {
+					commits += 1;
+					return { ok: true, committed: [] };
+				},
+				impact: null,
+				confirmed: true,
+			});
+
+			assertError(result, "models-malformed");
+			assert.equal(commits, 0);
+		});
+	}
+});
+
+test("commitDraft rejects nested secret keys in existing sidecar metadata", async () => {
+	for (const key of ["apiKey", "api_key", "token", "secret"]) {
+		await withTempDir(async (dir) => {
+			const sidecarPath = join(dir, "model-manager.json");
+			const modelsPath = join(dir, "models.json");
+			const marker = `nested-${key}-must-not-leak`;
+			await writeFile(sidecarPath, `${JSON.stringify({
+				version: 1,
+				uiState: { nested: { [key]: marker }, keep: true },
+				models: [source],
+			})}\n`);
+			await writeFile(modelsPath, `${JSON.stringify({
+				providers: [{
+					name: source.providerAlias,
+					apiKey: "opaque-native-reference",
+					models: [{ id: source.modelId }],
+				}],
+			})}\n`);
+			let commits = 0;
+			const result = await commitDraft(
+				assertOk(editDraft(snapshot(), source.id, { label: "Edited" })),
+				{
+					snapshot: snapshot(),
+					sidecarPath,
+					commit: async () => {
+						commits += 1;
+						return { ok: true, committed: [] };
+					},
+					impact: null,
+					confirmed: true,
+				},
+			);
+
+			assertError(result, "sidecar-malformed");
+			assert.equal(commits, 0);
+			assert.equal(JSON.stringify(result).includes(marker), false);
+			assert.equal(JSON.stringify(result).includes(dir), false);
+		});
+	}
+});
+
+test("direct malformed edit drafts cannot preview or commit another provider secret", async () => {
+	for (const identity of [
+		{ providerAlias: "another-provider" },
+		{ providerAlias: "" },
+		{ providerName: "" },
+		{ modelId: "" },
+	]) {
+		await withTempDir(async (dir) => {
+			const sidecarPath = join(dir, "model-manager.json");
+			const modelsPath = join(dir, "models.json");
+			await writeFile(modelsPath, `${JSON.stringify({
+				providers: [{
+					name: source.providerAlias,
+					apiKey: "opaque-native-reference",
+					models: [{ id: source.modelId }],
+				}],
+			})}\n`);
+			const secret = "malformed-draft-secret";
+			const draft: ModelManagerDraft = {
+				...assertOk(editDraft(snapshot(), source.id, { label: "Edited" })),
+				fields: {
+					...assertOk(editDraft(snapshot(), source.id, {})).fields,
+					...identity,
+				},
+				secret,
+			};
+			let commits = 0;
+
+			const preview = buildPreview(snapshot(), draft);
+			const result = await commitDraft(draft, {
+				snapshot: snapshot(),
+				sidecarPath,
+				commit: async () => {
+					commits += 1;
+					return { ok: true, committed: [] };
+				},
+				impact: null,
+				confirmed: true,
+			});
+
+			assertError(preview, "immutable-identity");
+			assertError(result, "immutable-identity");
+			assert.equal(commits, 0);
+			assert.equal(JSON.stringify(preview).includes(secret), false);
+			assert.equal(JSON.stringify(result).includes(secret), false);
+		});
+	}
 });
 
 test("commitDraft rejects malformed existing catalog files without committing", async () => {

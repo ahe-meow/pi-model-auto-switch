@@ -267,19 +267,34 @@ function recordForDraft(
 	draft: ModelManagerDraft,
 ): ModelManagerResult<ModelManagerRecord> {
 	if (draft.kind === "edit") {
-		if (!draft.recordId || !snapshot.byId.has(draft.recordId)) {
+		const recordId = draft.recordId;
+		const existing = recordId ? snapshot.byId.get(recordId) : undefined;
+		if (!recordId || !existing) {
 			return failure(
 				"record-not-found",
 				"The requested catalog record is not present in the snapshot",
 				secretList(draft),
 			);
 		}
+		for (const key of ["providerAlias", "providerName", "modelId"] as const) {
+			if (
+				typeof draft.fields[key] !== "string" ||
+				draft.fields[key].trim().length === 0 ||
+				draft.fields[key] !== existing[key]
+			) {
+				return failure(
+					"immutable-identity",
+					"Provider alias, provider name, and model ID cannot be changed by edit",
+					secretList(draft),
+				);
+			}
+		}
 		return {
 			ok: true,
 			value: {
 				...copyAdvanced(draft.advanced, secretList(draft)),
 				...copyFields(draft.fields),
-				id: draft.recordId,
+				id: recordId,
 			},
 		};
 	}
@@ -358,10 +373,19 @@ type JsonObject = Record<string, unknown>;
 type CurrentJson = {
 	revision: string;
 	document?: JsonObject;
+	bytes?: Uint8Array;
 };
 
 function isJsonObject(value: unknown): value is JsonObject {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasSecretKey(value: unknown): boolean {
+	if (Array.isArray(value)) return value.some(hasSecretKey);
+	if (!isJsonObject(value)) return false;
+	return Object.entries(value).some(
+		([key, child]) => secretKeys.has(key) || hasSecretKey(child),
+	);
 }
 
 function revisionFor(bytes: Uint8Array): string {
@@ -374,6 +398,7 @@ function validModelsDocument(value: JsonObject): boolean {
 		isJsonObject(provider) &&
 		typeof provider.name === "string" &&
 		provider.name.trim().length > 0 &&
+		typeof provider.apiKey === "string" &&
 		Array.isArray(provider.models) &&
 		provider.models.every((model) =>
 			isJsonObject(model) &&
@@ -420,13 +445,13 @@ async function readCurrentJson(
 		return failure(`${kind}-malformed`, `${kind} has an unsupported shape`, secrets);
 	}
 	if (kind === "sidecar") {
-		if (!validateSidecar(document).ok) {
+		if (hasSecretKey(document) || !validateSidecar(document).ok) {
 			return failure("sidecar-malformed", "sidecar has an unsupported shape", secrets);
 		}
 	} else if (!validModelsDocument(document)) {
 		return failure("models-malformed", "models has an unsupported shape", secrets);
 	}
-	return { ok: true, value: { revision, document } };
+	return { ok: true, value: { revision, document, bytes } };
 }
 
 function canonicalJson(value: unknown): Uint8Array {
@@ -541,6 +566,9 @@ export async function commitDraft(
 	]);
 	if (!sidecarCurrent.ok) return sidecarCurrent;
 	if (!modelsCurrent.ok) return modelsCurrent;
+	if (draft.kind === "edit" && !modelsCurrent.value.document) {
+		return failure("models-missing", "models could not be read", secrets);
+	}
 
 	const sidecarAfter = sidecarCurrent.value.document
 		? {
@@ -567,6 +595,12 @@ export async function commitDraft(
 		writes.push({
 			path: modelsPath,
 			bytes: modelsBytes.value,
+			expectRevision: modelsCurrent.value.revision,
+		});
+	} else if (modelsCurrent.value.bytes) {
+		writes.push({
+			path: modelsPath,
+			bytes: modelsCurrent.value.bytes,
 			expectRevision: modelsCurrent.value.revision,
 		});
 	}
