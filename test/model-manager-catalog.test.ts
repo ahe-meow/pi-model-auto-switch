@@ -20,7 +20,7 @@ import {
 	type ModelManagerBlockedState,
 	type ModelManagerRecord,
 	type ModelManagerResult,
-	 type ModelManagerSidecar,
+	type ModelManagerSidecar,
 } from "../src/model-manager-types.ts";
 
 const opaqueApiKey = "opaque-native-api-key-reference";
@@ -278,4 +278,3 @@ test("readModelCatalog never reads or modifies failover files", async () => {
 		assert.equal(JSON.stringify(result).includes(failoverMarker), false);
 	});
 });
-
