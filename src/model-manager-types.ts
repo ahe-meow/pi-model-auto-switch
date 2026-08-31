@@ -53,23 +53,47 @@ function slug(value: string): string {
 	return value.toLowerCase().replace(/[^a-z0-9]/g, "-");
 }
 
-export function createStableId(
-	providerAlias: string,
-	modelId: string,
-	taken?: ReadonlySet<string>,
-): string {
-	const base = `${slug(providerAlias)}--${slug(modelId)}`;
+/** FNV-1a 32-bit hex digest, deterministic and dependency-free. */
+function fnv1a(input: string): string {
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < input.length; i++) {
+		hash ^= input.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193) >>> 0;
+	}
+	return hash.toString(16).padStart(8, "0");
+}
+
+/** Append `-2`, `-3`, ... when `base` (or a taken suffix) is already taken. */
+function uniqueWithSuffix(base: string, taken?: ReadonlySet<string>): string {
 	if (!taken || !taken.has(base)) return base;
 	let n = 2;
 	while (taken.has(`${base}-${n}`)) n += 1;
 	return `${base}-${n}`;
 }
 
+export function createStableId(
+	providerAlias: string,
+	modelId: string,
+	taken?: ReadonlySet<string>,
+): string {
+	const provider = slug(providerAlias);
+	const model = slug(modelId);
+	// A `--` inside either slug would blur the `--` separator boundary
+	// (e.g. ("a","b--c") vs ("a--b","c")). Bind lossy/ambiguous inputs
+	// to a digest of the raw values so distinct inputs never collide.
+	if (provider.includes("--") || model.includes("--")) {
+		const digest = fnv1a(`${providerAlias}::${modelId}`);
+		return uniqueWithSuffix(`${provider}--${model}-${digest}`, taken);
+	}
+	return uniqueWithSuffix(`${provider}--${model}`, taken);
+}
+
 export function createProviderAlias(
 	providerName: string,
 	keyFingerprint: string,
+	taken?: ReadonlySet<string>,
 ): string {
-	return `mm-${slug(providerName)}-${keyFingerprint.slice(0, 8)}`;
+	return uniqueWithSuffix(`mm-${slug(providerName)}-${keyFingerprint}`, taken);
 }
 
 export function cloneRecord(record: ModelManagerRecord): ModelManagerRecord {

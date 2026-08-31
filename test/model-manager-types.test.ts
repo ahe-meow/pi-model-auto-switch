@@ -49,6 +49,14 @@ test("validateMultiplier rejects more than 3 decimals", () => {
 		const result = validateMultiplier(v);
 		assert.equal(result.ok, false, `expected ${v} to be rejected`);
 	}
+	// In-range values with >3 decimals must produce too_precise.
+	const inRange = validateMultiplier(1.2345);
+	assert.equal(inRange.ok, false);
+	if (!inRange.ok) {
+		assert.equal("code" in inRange.error, true);
+		const error = inRange.error as { code: string };
+		assert.equal(error.code, "too_precise");
+	}
 });
 
 test("createStableId is deterministic and collision safe", () => {
@@ -67,15 +75,34 @@ test("createStableId is deterministic and collision safe", () => {
 	);
 	const takenTwo = new Set(["x--y", "x--y-2"]);
 	assert.equal(createStableId("x", "y", takenTwo), "x--y-3");
+	// Ambiguity: slug losses cause collision without disambiguation.
+	const c1 = createStableId("a", "b--c");
+	const c2 = createStableId("a--b", "c");
+	assert.notEqual(c1, c2, "slug collisions must differ");
+	// Deterministic: same inputs always same output.
+	assert.equal(createStableId("a", "b--c"), createStableId("a", "b--c"));
+	assert.equal(createStableId("a--b", "c"), createStableId("a--b", "c"));
 });
 
 test("createProviderAlias sanitizes and differs per fingerprint", () => {
-	const a = createProviderAlias("Anthropic", "a1b2c3d4e5f6g7h8");
-	const b = createProviderAlias("Anthropic", "ffffffffffffffff");
-	assert.equal(a, "mm-anthropic-a1b2c3d4");
+	const fp1 = "a1b2c3d4e5f6g7h8";
+	const fp2 = "a1b2c3d4ffffffff";
+	const a = createProviderAlias("Anthropic", fp1);
+	const b = createProviderAlias("Anthropic", fp2);
+	// Full fingerprint, not just first 8 chars.
+	assert.equal(a, `mm-anthropic-${fp1}`);
 	assert.notEqual(a, b);
 	assert.ok(a.startsWith("mm-"));
-	assert.ok(a.endsWith("-a1b2c3d4"));
+	// Sanitize provider name with special chars.
+	const c = createProviderAlias("OpenAI Inc.", "abcdef1234567890");
+	assert.equal(c, "mm-openai-inc--abcdef1234567890");
+	assert.ok(c.startsWith("mm-"));
+	// Taken suffix keeps distinct fingerprints distinct and stays deterministic.
+	const taken = new Set(["mm-openai-inc--abcdef1234567890"]);
+	assert.equal(
+		createProviderAlias("OpenAI Inc.", "abcdef1234567890", taken),
+		"mm-openai-inc--abcdef1234567890-2",
+	);
 });
 
 test("cloneRecord deep copies unknown fields", () => {
