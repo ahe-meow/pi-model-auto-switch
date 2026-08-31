@@ -71,7 +71,14 @@ function makeFixtureData(): Omit<Fixture, "dir" | "modelsPath" | "sidecarPath" |
 				models: [
 					{ id: "gpt-4o", name: "GPT-4o", reasoning: true },
 					{ id: "gpt-4o", name: "GPT-4o duplicate", reasoning: false },
+					{ id: "orphan-model", name: "Orphan Model", metadata: { source: "native" } },
 				],
+			},
+			{
+				name: "provider-b",
+				api: "anthropic-messages",
+				apiKey: opaqueApiKey,
+				models: [{ id: "orphan-provider-model", name: "Orphan Provider Model", metadata: { tier: "native" } }],
 			},
 		],
 	};
@@ -123,11 +130,14 @@ test("readModelCatalog builds stable id index from records and models config", a
 		const snapshot = assertSnapshot(result);
 
 		assert.deepEqual(snapshot.records, records);
-		assert.equal(snapshot.providers.length, 1);
+		assert.equal(snapshot.providers.length, 2);
 		assert.equal(snapshot.providers[0]?.name, "provider-a");
 		assert.equal(snapshot.providers[0]?.baseUrl, "https://api.example.test/v1");
-		assert.deepEqual(snapshot.providers[0]?.models.map(({ id }) => id), ["gpt-4o", "gpt-4o"]);
+		assert.deepEqual(snapshot.providers[0]?.models.map(({ id }) => id), ["gpt-4o", "gpt-4o", "orphan-model"]);
+		assert.equal(snapshot.providers[1]?.name, "provider-b");
+		assert.deepEqual(snapshot.providers[1]?.models.map(({ id }) => id), ["orphan-provider-model"]);
 		assert.equal(snapshot.providers[0]?.apiKey, "");
+		assert.equal(snapshot.providers[1]?.apiKey, "");
 		assert.equal(snapshot.byId.get(snapshot.records[0]!.id), snapshot.records[0]);
 		assert.equal(snapshot.byId.get(snapshot.records[1]!.id), snapshot.records[1]);
 		assert.equal(snapshot.byId.get(createStableId("provider-a", "gpt-4o")), undefined);
@@ -177,6 +187,32 @@ test("applyCatalogDraft preserves provider and model metadata", async () => {
 	});
 });
 
+test("applyCatalogDraft preserves orphan providers and models", async () => {
+	await withFixture(async ({ modelsPath, sidecarPath }) => {
+		const snapshot = assertSnapshot(await readModelCatalog(modelsPath, sidecarPath));
+		const edited = applyCatalogDraft(snapshot, {
+			edit: [{ id: snapshot.records[0]!.id, fields: { label: "Edited" } }],
+		});
+
+		assert.equal(edited.providers.length, 2);
+		const providerA = edited.providers.find((provider) => provider.name === "provider-a")!;
+		const providerB = edited.providers.find((provider) => provider.name === "provider-b")!;
+		assert.equal(providerA.api, "openai-completions");
+		assert.equal(providerB.api, "anthropic-messages");
+		assert.deepEqual(providerA.models.find((model) => model.id === "orphan-model"), {
+			id: "orphan-model",
+			name: "Orphan Model",
+			metadata: { source: "native" },
+		});
+		assert.deepEqual(providerB.models, [{
+			id: "orphan-provider-model",
+			name: "Orphan Provider Model",
+			metadata: { tier: "native" },
+		}]);
+		assert.equal(providerA.apiKey, "");
+		assert.equal(providerB.apiKey, "");
+	});
+});
 test("applyCatalogDraft keeps record identity fields immutable", async () => {
 	await withFixture(async ({ modelsPath, sidecarPath }) => {
 		const snapshot = assertSnapshot(await readModelCatalog(modelsPath, sidecarPath));
@@ -319,12 +355,12 @@ test("applyCatalogDraft add edit remove returns new snapshot without mutating in
 		assert.deepEqual(snapshot.records, originalRecords);
 		assert.deepEqual([...snapshot.byId.entries()], originalIndex);
 		assert.equal(draft.records.length, 2);
-		assert.equal(draft.records.find((record) => record.id === editedId)?.label, "Edited");
-		assert.equal(draft.records.find((record) => record.id === editedId)?.multiplier, 3);
-		assert.deepEqual(draft.records.find((record) => record.id === editedId)?.unknownField, {
+		assert.equal(draft.records.find((record: ModelManagerRecord) => record.id === editedId)?.label, "Edited");
+		assert.equal(draft.records.find((record: ModelManagerRecord) => record.id === editedId)?.multiplier, 3);
+		assert.deepEqual(draft.records.find((record: ModelManagerRecord) => record.id === editedId)?.unknownField, {
 			nested: [1, 2, 3],
 		});
-		assert.equal(draft.records.some((record) => record.id === removedId), false);
+		assert.equal(draft.records.some((record: ModelManagerRecord) => record.id === removedId), false);
 		assert.equal(draft.byId.get(added.id), draft.records.find((record) => record.id === added.id));
 		assert.equal(draft.byId.get(createStableId("provider-a", "new-model")), draft.records.find((record) => record.id === added.id));
 		assert.equal(draft.failoverUntouched, true);

@@ -117,35 +117,51 @@ function providerForRecords(
 	records: readonly ModelManagerRecord[],
 	previous: readonly PiProviderDraft[],
 ): PiProviderDraft[] {
-	const previousByName = new Map(previous.map((provider) => [provider.name, provider]));
-	const providers = new Map<string, PiProviderDraft>();
+	const providers = previous.map((provider) => {
+		const safe = stripSecrets(provider) as PiProviderDraft;
+		safe.apiKey = "";
+		safe.models = provider.models.map((model) => stripSecrets(model) as PiProviderModel);
+		return safe;
+	});
+	const providerIndexes = new Map<string, number>();
+	for (let index = 0; index < providers.length; index += 1) {
+		const provider = providers[index]!;
+		if (!providerIndexes.has(provider.name)) providerIndexes.set(provider.name, index);
+	}
 	const modelOccurrences = new Map<string, number>();
 
 	for (const record of records) {
-		const old = previousByName.get(record.providerAlias);
-		let provider = providers.get(record.providerAlias);
-		if (!provider) {
-			const safeOld = old ? (stripSecrets(old) as JsonObject) : {};
-			provider = {
-				...safeOld,
-				name: record.providerAlias,
-				apiKey: "",
-				models: [],
-			};
-			providers.set(record.providerAlias, provider);
+		let providerIndex = providerIndexes.get(record.providerAlias);
+		if (providerIndex === undefined) {
+			providerIndex = providers.length;
+			providers.push({ name: record.providerAlias, apiKey: "", models: [] });
+			providerIndexes.set(record.providerAlias, providerIndex);
 		}
-
+		const provider = providers[providerIndex]!;
 		const occurrenceKey = `${record.providerAlias}\u0000${record.modelId}`;
 		const occurrence = modelOccurrences.get(occurrenceKey) ?? 0;
 		modelOccurrences.set(occurrenceKey, occurrence + 1);
-		const oldModel = old?.models.filter((model) => model.id === record.modelId)[occurrence];
-		const model = {
-			...(oldModel ? (stripSecrets(oldModel) as JsonObject) : {}),
-			...modelFromRecord(record),
-		};
-		provider.models.push(model as PiProviderModel);
+		let modelIndex = -1;
+		let matchedOccurrence = 0;
+		for (let index = 0; index < provider.models.length; index += 1) {
+			if (provider.models[index]?.id !== record.modelId) continue;
+			if (matchedOccurrence === occurrence) {
+				modelIndex = index;
+				break;
+			}
+			matchedOccurrence += 1;
+		}
+		const projected = modelFromRecord(record);
+		if (modelIndex === -1) {
+			provider.models.push(projected);
+		} else {
+			provider.models[modelIndex] = {
+				...provider.models[modelIndex],
+				...projected,
+			};
+		}
 	}
-	return [...providers.values()];
+	return providers;
 }
 
 function parseProviderModels(provider: JsonObject): PiProviderModel[] | undefined {
