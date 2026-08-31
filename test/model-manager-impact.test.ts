@@ -354,6 +354,22 @@ test("scanGeneratedBlocks reports only generated wrapper blocks", () => {
 	]);
 });
 
+test("scanGeneratedBlocks recognizes mm-prefixed model map keys", () => {
+	const file = "chains.json";
+	const document = {
+		models: {
+			"mm-map-block": {
+				id: "inner-id",
+				chain: [{ provider: "provider-a", id: "target-model" }],
+			},
+		},
+	};
+
+	assert.deepEqual(scanGeneratedBlocks(document, file, record), [
+		{ file, chainId: "mm-map-block", kind: "generated-block" },
+	]);
+});
+
 test("scanModelEntries uses chain map keys as chain ids", () => {
 	const file = "chains.json";
 	const target = { providerAlias: "provider-a", modelId: "target-model" };

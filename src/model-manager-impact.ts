@@ -78,9 +78,9 @@ function hasChainContainer(value: JsonObject): boolean {
 }
 
 function isGeneratedBlock(value: JsonObject, mapKey?: string): boolean {
-	const id = stringField(value, ["id"]) ?? mapKey;
 	return (
-		id?.startsWith("mm-") === true ||
+		mapKey?.startsWith("mm-") === true ||
+		stringField(value, ["id"])?.startsWith("mm-") === true ||
 		value.generated === true ||
 		value.virtual === true ||
 		value.kind === "generated" ||
