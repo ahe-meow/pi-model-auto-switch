@@ -153,7 +153,7 @@ function failure<T>(
 	return {
 		ok: false,
 		error: {
-			code: redactSecrets(code, secrets),
+			code,
 			message: redactSecrets(message, secrets),
 		},
 	};
@@ -506,7 +506,11 @@ function mergedModels(
 			}
 		}
 		const managed: JsonObject = { id: projected.id };
-		if (applyDraftLabel && draft.fields.label !== undefined) {
+		if (
+			applyDraftLabel &&
+			projected.id === draft.fields.modelId &&
+			draft.fields.label !== undefined
+		) {
 			managed.name = draft.fields.label;
 		}
 		if (match === -1) {

@@ -394,6 +394,10 @@ test("commitDraft uses existing revisions and preserves sidecar and provider met
 				name: "Source label",
 				reasoning: true,
 				modelMetadata: { context: 128_000 },
+			}, {
+				id: "other-model",
+				name: "Other native label",
+				modelMetadata: { context: 64_000, keep: true },
 			}],
 		};
 		const untouchedProvider = {
@@ -417,6 +421,10 @@ test("commitDraft uses existing revisions and preserves sidecar and provider met
 				name: "Snapshot native label",
 				reasoning: false,
 				modelMetadata: { context: 16_000, source: "snapshot" },
+			}, {
+				id: "other-model",
+				name: "Other snapshot label",
+				modelMetadata: { context: 32_000, keep: "snapshot" },
 			}],
 		}];
 		await writeFile(sidecarPath, `${JSON.stringify(sidecarDocument, null, 2)}\n`);
@@ -464,6 +472,7 @@ test("commitDraft uses existing revisions and preserves sidecar and provider met
 					| { name?: string }
 					| undefined;
 				assert.equal(writtenTargetModel?.name, "Edited label");
+				assert.deepEqual(writtenModels.providers[0]?.models[1], targetProvider.models[1]);
 				return { ok: true, committed: input.writes.map((write) => write.path) };
 			},
 			impact: null,
@@ -847,8 +856,8 @@ test("commitDraft writes sidecar and provider config through commit callback", a
 	});
 });
 
-test("commitDraft redacts untrusted commit failure code and messages", async () => {
-	const secret = "failure-secret-must-be-redacted";
+test("commitDraft keeps stable transaction failure code and redacts messages", async () => {
+	const secret = "transaction-commit-failed-secret-material";
 	const sidecarPath = join("/tmp", `sidecar-${secret}`, "model-manager.json");
 	const modelsPath = join(dirname(sidecarPath), "models.json");
 	const result = await commitDraft(newDraft(secret), {
@@ -871,7 +880,7 @@ test("commitDraft redacts untrusted commit failure code and messages", async () 
 	assert.equal(result.ok, false);
 	if (result.ok) throw new Error("expected failed transaction result");
 	assert.equal("code" in result.error, true);
-	if ("code" in result.error) assert.match(result.error.code, /^transaction-commit-failed$/);
+	if ("code" in result.error) assert.equal(result.error.code, "transaction-commit-failed");
 	const serialized = JSON.stringify(result);
 	assert.equal(serialized.includes(secret), false);
 	assert.equal(serialized.includes(sidecarPath), false);
