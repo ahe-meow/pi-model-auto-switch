@@ -857,7 +857,7 @@ test("commitDraft writes sidecar and provider config through commit callback", a
 });
 
 test("commitDraft keeps stable transaction failure code and redacts messages", async () => {
-	const secret = "transaction-commit-failed-secret-material";
+	const secret = "transaction-commit-failed";
 	const sidecarPath = join("/tmp", `sidecar-${secret}`, "model-manager.json");
 	const modelsPath = join(dirname(sidecarPath), "models.json");
 	const result = await commitDraft(newDraft(secret), {
@@ -881,7 +881,17 @@ test("commitDraft keeps stable transaction failure code and redacts messages", a
 	if (result.ok) throw new Error("expected failed transaction result");
 	assert.equal("code" in result.error, true);
 	if ("code" in result.error) assert.equal(result.error.code, "transaction-commit-failed");
-	const serialized = JSON.stringify(result);
+	assert.equal("message" in result.error, true);
+	if ("message" in result.error) {
+		assert.equal(result.error.message.includes(secret), false);
+		assert.equal(result.error.message.includes(sidecarPath), false);
+		assert.equal(result.error.message.includes(modelsPath), false);
+		assert.equal(result.error.message.includes("[redacted]"), true);
+	}
+	const serialized = JSON.stringify({
+		...result,
+		error: { ...result.error, code: undefined },
+	});
 	assert.equal(serialized.includes(secret), false);
 	assert.equal(serialized.includes(sidecarPath), false);
 	assert.equal(serialized.includes(modelsPath), false);
