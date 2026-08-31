@@ -14,7 +14,7 @@ import {
 	editDraft,
 	type ModelManagerDraft,
 } from "../src/model-manager-operations.ts";
-import { commitCatalogTransaction } from "../src/model-manager-store.ts";
+import { commitCatalogTransaction, readRevision } from "../src/model-manager-store.ts";
 import {
 	createStableId,
 	type ModelManagerRecord,
@@ -151,6 +151,19 @@ test("cloneDraft copies advanced and unknown fields with new provider alias, sta
 	assert.deepEqual(catalog.records[0], original);
 });
 
+test("cloneDraft avoids aliases already owned by orphan providers", () => {
+	const catalog = snapshot();
+	catalog.providers.push({
+		name: "mm-provider-a-orphan-fingerprint",
+		apiKey: "",
+		models: [{ id: "orphan-model" }],
+	});
+
+	const draft = assertOk(cloneDraft(catalog, source.id, "orphan-fingerprint"));
+
+	assert.equal(draft.fields.providerAlias, "mm-provider-a-orphan-fingerprint-2");
+});
+
 test("cloneDraft defaults to independent group and alias; explicit remoteGroup copies its label", () => {
 	const catalog = snapshot();
 	const independent = assertOk(cloneDraft(catalog, source.id, "independent-fingerprint"));
@@ -191,6 +204,25 @@ test("cloneDraft rejects unknown remote group without owner flag", () => {
 	assert.equal(owned.fields.groupOwner, true);
 });
 
+test("editDraft rejects changed identity fields and accepts unchanged identity", () => {
+	for (const fields of [
+		{ providerAlias: "different-alias" },
+		{ providerName: "Different Provider" },
+		{ modelId: "different-model" },
+	]) {
+		assertError(editDraft(snapshot(), source.id, fields), "immutable-identity");
+	}
+
+	const unchanged = assertOk(editDraft(snapshot(), source.id, {
+		providerAlias: source.providerAlias,
+		providerName: source.providerName,
+		modelId: source.modelId,
+	}));
+	assert.equal(unchanged.fields.providerAlias, source.providerAlias);
+	assert.equal(unchanged.fields.providerName, source.providerName);
+	assert.equal(unchanged.fields.modelId, source.modelId);
+});
+
 test("editDraft rejects missing record", () => {
 	assertError(editDraft(snapshot(), "missing-record", { label: "Edited" }), "record-not-found");
 });
@@ -225,6 +257,33 @@ test("buildPreview contains no secret material and performs zero writes", async 
 		assert.deepEqual([...catalog.byId.entries()], originalIndex);
 		assert.deepEqual(draft, originalDraft);
 	});
+});
+
+test("buildPreview structurally redacts escaped secrets without JSON round-trip loss", () => {
+	const secret = "quoted\\\"secret\\\\value";
+	const draft: ModelManagerDraft = {
+		...newDraft(secret),
+		advanced: {
+			nested: {
+				apiKey: "remove-api-key",
+				token: "remove-token",
+				message: `before ${secret} after`,
+				keepUndefined: undefined,
+				finite: 4.5,
+			},
+		},
+	};
+
+	const preview = assertOk(buildPreview(snapshot([]), draft));
+	const previewRecord = preview.sidecarAfter.models[0]!;
+	const nested = previewRecord.nested as Record<string, unknown>;
+	assert.equal(nested.apiKey, undefined);
+	assert.equal(nested.token, undefined);
+	assert.equal(nested.message, "before [redacted] after");
+	assert.equal(Object.hasOwn(nested, "keepUndefined"), true);
+	assert.equal(nested.finite, 4.5);
+	assert.equal(JSON.stringify(preview).includes("remove-api-key"), false);
+	assert.equal(JSON.stringify(preview).includes("remove-token"), false);
 });
 
 test("commitDraft preserves existing apiKey bytes when key is unchanged and injects raw/environment key only on commit", async () => {
@@ -276,6 +335,156 @@ test("commitDraft preserves existing apiKey bytes when key is unchanged and inje
 			assert.equal(JSON.stringify(result).includes(secret), false);
 		});
 	}
+});
+
+test("commitDraft uses existing revisions and preserves sidecar and provider metadata", async () => {
+	await withTempDir(async (dir) => {
+		const sidecarPath = join(dir, "model-manager.json");
+		const modelsPath = join(dir, "models.json");
+		const sidecarDocument = {
+			version: 1,
+			uiState: { collapsed: true },
+			models: [source],
+		};
+		const targetProvider = {
+			name: source.providerAlias,
+			baseUrl: "https://native.example.test/v1",
+			apiKey: "opaque-target-key",
+			providerMetadata: { region: "test" },
+			models: [{
+				id: source.modelId,
+				name: "Source label",
+				reasoning: true,
+				modelMetadata: { context: 128_000 },
+			}],
+		};
+		const untouchedProvider = {
+			name: "orphan-provider",
+			apiKey: "opaque-untouched-key",
+			providerMetadata: { auth: "opaque" },
+			models: [{ id: "orphan-model", modelMetadata: { native: true } }],
+		};
+		const modelsDocument = {
+			catalogMetadata: { owner: "native" },
+			providers: [targetProvider, untouchedProvider],
+		};
+		await writeFile(sidecarPath, `${JSON.stringify(sidecarDocument, null, 2)}\n`);
+		await writeFile(modelsPath, `${JSON.stringify(modelsDocument, null, 2)}\n`);
+		const expectedSidecarRevision = (await readRevision(sidecarPath)).revision;
+		const expectedModelsRevision = (await readRevision(modelsPath)).revision;
+		const secret = "replacement-target-key";
+		const draft: ModelManagerDraft = {
+			...assertOk(editDraft(snapshot(), source.id, { label: "Edited label" })),
+			secret,
+		};
+		let commits = 0;
+
+		const result = await commitDraft(draft, {
+			snapshot: snapshot(),
+			sidecarPath,
+			commit: async (input) => {
+				commits += 1;
+				assert.deepEqual(input.writes.map((write) => write.expectRevision), [
+					expectedSidecarRevision,
+					expectedModelsRevision,
+				]);
+				const writtenSidecar = JSON.parse(
+					Buffer.from(input.writes[0]!.bytes).toString("utf8"),
+				) as typeof sidecarDocument;
+				const writtenModels = JSON.parse(
+					Buffer.from(input.writes[1]!.bytes).toString("utf8"),
+				) as typeof modelsDocument;
+				assert.deepEqual(writtenSidecar.uiState, sidecarDocument.uiState);
+				assert.equal(writtenSidecar.models[0]?.label, "Edited label");
+				assert.deepEqual(writtenModels.catalogMetadata, modelsDocument.catalogMetadata);
+				assert.deepEqual(writtenModels.providers[1], untouchedProvider);
+				assert.equal(writtenModels.providers[0]?.apiKey, secret);
+				assert.deepEqual(
+					writtenModels.providers[0]?.providerMetadata,
+					targetProvider.providerMetadata,
+				);
+				assert.deepEqual(
+					writtenModels.providers[0]?.models[0]?.modelMetadata,
+					targetProvider.models[0]?.modelMetadata,
+				);
+				const writtenTargetModel = writtenModels.providers[0]?.models[0] as
+					| { name?: string }
+					| undefined;
+				assert.equal(writtenTargetModel?.name, "Edited label");
+				return { ok: true, committed: input.writes.map((write) => write.path) };
+			},
+			impact: null,
+			confirmed: true,
+		});
+
+		assert.equal(result.ok, true);
+		assert.equal(commits, 1);
+		assert.equal(JSON.stringify(result).includes(secret), false);
+	});
+});
+
+test("commitDraft rejects malformed existing catalog files without committing", async () => {
+	for (const malformed of ["sidecar", "models"] as const) {
+		await withTempDir(async (dir) => {
+			const sidecarPath = join(dir, "model-manager.json");
+			const modelsPath = join(dir, "models.json");
+			const marker = `do-not-leak-${malformed}`;
+			await writeFile(
+				sidecarPath,
+				malformed === "sidecar"
+					? `{${marker}`
+					: `${JSON.stringify({ version: 1, models: [] })}\n`,
+			);
+			await writeFile(
+				modelsPath,
+				malformed === "models" ? `{${marker}` : `${JSON.stringify({ providers: [] })}\n`,
+			);
+			let commits = 0;
+			const secret = "malformed-read-secret";
+
+			const result = await commitDraft(newDraft(secret), {
+				snapshot: snapshot([]),
+				sidecarPath,
+				commit: async () => {
+					commits += 1;
+					return { ok: true, committed: [] };
+				},
+				impact: null,
+				confirmed: true,
+			});
+
+			assertError(result, `${malformed}-malformed`);
+			assert.equal(commits, 0);
+			assert.equal(JSON.stringify(result).includes(marker), false);
+			assert.equal(JSON.stringify(result).includes(dir), false);
+			assert.equal(JSON.stringify(result).includes(secret), false);
+		});
+	}
+});
+
+test("commitDraft requires cascade confirmation for the draft target record", async () => {
+	let commits = 0;
+	const draft = newDraft("mismatched-impact-secret");
+	const targetId = createStableId(draft.fields.providerAlias, draft.fields.modelId);
+	const impact: CatalogImpact = {
+		...noImpact,
+		recordId: `${targetId}-different`,
+		referenced: true,
+	};
+
+	const result = await commitDraft(draft, {
+		snapshot: snapshot([]),
+		sidecarPath: "/unused/model-manager.json",
+		commit: async () => {
+			commits += 1;
+			return { ok: true, committed: [] };
+		},
+		impact,
+		confirmed: true,
+	});
+
+	assertError(result, "cascade-not-confirmed");
+	assert.equal(commits, 0);
 });
 
 test("commitDraft requires cascade confirmation when referenced", async () => {

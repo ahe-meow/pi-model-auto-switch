@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
 	applyCatalogDraft,
@@ -9,10 +11,11 @@ import {
 	confirmCascade,
 	type CatalogImpact,
 } from "./model-manager-impact.ts";
-import { serializeSidecar } from "./model-manager-sidecar.ts";
-import type {
-	CatalogTransactionInput,
-	TransactionResult,
+import { serializeSidecar, validateSidecar } from "./model-manager-sidecar.ts";
+import {
+	readRevision,
+	type CatalogTransactionInput,
+	type TransactionResult,
 } from "./model-manager-store.ts";
 import {
 	cloneRecord,
@@ -76,19 +79,19 @@ type DraftValue =
 	| DraftValue[]
 	| { [key: string]: DraftValue };
 
-function stripSecretFields(value: unknown): DraftValue {
-	if (Array.isArray(value)) return value.map(stripSecretFields);
+function stripSecretFields(
+	value: unknown,
+	secrets: readonly string[] = [],
+): DraftValue {
+	if (Array.isArray(value)) return value.map((child) => stripSecretFields(child, secrets));
 	if (value === null || value === undefined) return value;
-	if (
-		typeof value === "string" ||
-		typeof value === "number" ||
-		typeof value === "boolean"
-	) return value;
+	if (typeof value === "string") return redactSecrets(value, secrets);
+	if (typeof value === "number" || typeof value === "boolean") return value;
 	if (typeof value !== "object") return null;
 	const result: { [key: string]: DraftValue } = {};
 	for (const [key, child] of Object.entries(value)) {
 		if (secretKeys.has(key)) continue;
-		result[key] = stripSecretFields(child);
+		result[key] = stripSecretFields(child, secrets);
 	}
 	return result;
 }
@@ -105,8 +108,11 @@ function copyFields(fields: RecordDraftFields): RecordDraftFields {
 	};
 }
 
-function copyAdvanced(advanced: Record<string, unknown>): Record<string, unknown> {
-	return stripSecretFields(structuredClone(advanced)) as Record<string, unknown>;
+function copyAdvanced(
+	advanced: Record<string, unknown>,
+	secrets: readonly string[] = [],
+): Record<string, unknown> {
+	return stripSecretFields(structuredClone(advanced), secrets) as Record<string, unknown>;
 }
 
 function splitRecord(record: ModelManagerRecord): {
@@ -164,6 +170,14 @@ export function editDraft(
 			"The requested catalog record is not present in the snapshot",
 		);
 	}
+	for (const key of ["providerAlias", "providerName", "modelId"] as const) {
+		if (Object.hasOwn(fields, key) && fields[key] !== record[key]) {
+			return failure(
+				"immutable-identity",
+				"Provider alias, provider name, and model ID cannot be changed by edit",
+			);
+		}
+	}
 	const copied = splitRecord(record);
 	return {
 		ok: true,
@@ -214,7 +228,10 @@ export function cloneDraft(
 	}
 
 	const copied = splitRecord(record);
-	const takenAliases = new Set(snapshot.records.map((entry) => entry.providerAlias));
+	const takenAliases = new Set([
+		...snapshot.records.map((entry) => entry.providerAlias),
+		...snapshot.providers.map((provider) => provider.name),
+	]);
 	const providerAlias = createProviderAlias(providerName, fingerprint, takenAliases);
 	const fields: RecordDraftFields = {
 		...copied.fields,
@@ -260,7 +277,7 @@ function recordForDraft(
 		return {
 			ok: true,
 			value: {
-				...copyAdvanced(draft.advanced),
+				...copyAdvanced(draft.advanced, secretList(draft)),
 				...copyFields(draft.fields),
 				id: draft.recordId,
 			},
@@ -274,7 +291,7 @@ function recordForDraft(
 	return {
 		ok: true,
 		value: {
-			...copyAdvanced(draft.advanced),
+			...copyAdvanced(draft.advanced, secretList(draft)),
 			...copyFields(draft.fields),
 			id,
 		},
@@ -287,7 +304,7 @@ function previewProviders(
 	draft: ModelManagerDraft,
 ): { sidecarAfter: ModelManagerSidecar; providerDrafts: PiProviderDraft[] } {
 	const applied = applyCatalogDraft(snapshot, draft.kind === "edit"
-		? { edit: [{ id: record.id, fields: { ...draft.advanced, ...draft.fields } }] }
+		? { edit: [{ id: record.id, fields: record }] }
 		: { add: [record] });
 	const target = applied.records.find((entry) => entry.id === record.id) ?? record;
 	const targetProvider = toPiProviderAlias(target);
@@ -309,48 +326,181 @@ export function buildPreview(
 	snapshot: ModelManagerCatalogSnapshot,
 	draft: ModelManagerDraft,
 ): ModelManagerResult<PreviewPayload> {
+	const secrets = secretList(draft);
 	try {
 		const record = recordForDraft(snapshot, draft);
 		if (!record.ok) return record;
 		const projected = previewProviders(snapshot, record.value, draft);
-		const payload: PreviewPayload = { ...projected, impact: null };
-		const text = redactSecrets(JSON.stringify(payload), secretList(draft));
-		return { ok: true, value: JSON.parse(text) as PreviewPayload };
+		const sidecarAfter = stripSecretFields(
+			projected.sidecarAfter,
+			secrets,
+		) as ModelManagerSidecar;
+		const providerDrafts = stripSecretFields(
+			projected.providerDrafts,
+			secrets,
+		) as PiProviderDraft[];
+		for (const provider of providerDrafts) provider.apiKey = "";
+		return {
+			ok: true,
+			value: { sidecarAfter, providerDrafts, impact: null },
+		};
 	} catch {
 		return failure(
 			"preview-invalid",
 			"Draft preview could not be generated",
-			secretList(draft),
+			secrets,
 		);
 	}
+}
+
+type JsonObject = Record<string, unknown>;
+
+type CurrentJson = {
+	revision: string;
+	document?: JsonObject;
+};
+
+function isJsonObject(value: unknown): value is JsonObject {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function revisionFor(bytes: Uint8Array): string {
+	return createHash("sha256").update(bytes).digest("hex").slice(0, 16);
+}
+
+function validModelsDocument(value: JsonObject): boolean {
+	if (!Array.isArray(value.providers)) return false;
+	return value.providers.every((provider) =>
+		isJsonObject(provider) &&
+		typeof provider.name === "string" &&
+		provider.name.trim().length > 0 &&
+		Array.isArray(provider.models) &&
+		provider.models.every((model) =>
+			isJsonObject(model) &&
+			typeof model.id === "string" &&
+			model.id.trim().length > 0
+		)
+	);
+}
+
+async function readCurrentJson(
+	path: string,
+	kind: "sidecar" | "models",
+	secrets: readonly string[],
+): Promise<ModelManagerResult<CurrentJson>> {
+	let revision: string;
+	try {
+		revision = (await readRevision(path)).revision;
+	} catch {
+		return failure(`${kind}-read-failed`, `${kind} could not be read`, secrets);
+	}
+	if (revision === "missing") return { ok: true, value: { revision } };
+
+	let bytes: Uint8Array;
+	try {
+		bytes = await readFile(path);
+	} catch {
+		return failure(`${kind}-read-failed`, `${kind} could not be read`, secrets);
+	}
+	if (revisionFor(bytes) !== revision) {
+		return failure(
+			"catalog-read-conflict",
+			"Catalog changed while preparing the commit",
+			secrets,
+		);
+	}
+
+	let document: unknown;
+	try {
+		document = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+	} catch {
+		return failure(`${kind}-malformed`, `${kind} is not valid JSON`, secrets);
+	}
+	if (!isJsonObject(document)) {
+		return failure(`${kind}-malformed`, `${kind} has an unsupported shape`, secrets);
+	}
+	if (kind === "sidecar") {
+		if (!validateSidecar(document).ok) {
+			return failure("sidecar-malformed", "sidecar has an unsupported shape", secrets);
+		}
+	} else if (!validModelsDocument(document)) {
+		return failure("models-malformed", "models has an unsupported shape", secrets);
+	}
+	return { ok: true, value: { revision, document } };
 }
 
 function canonicalJson(value: unknown): Uint8Array {
 	return new TextEncoder().encode(`${JSON.stringify(value, null, 2)}\n`);
 }
 
+function mergedModels(
+	existingProvider: JsonObject | undefined,
+	projectedProvider: PiProviderDraft,
+): unknown[] {
+	const existing = Array.isArray(existingProvider?.models)
+		? [...existingProvider.models]
+		: [];
+	const used = new Set<number>();
+	for (const projected of projectedProvider.models) {
+		let match = -1;
+		for (let index = 0; index < existing.length; index += 1) {
+			if (used.has(index)) continue;
+			const candidate = existing[index];
+			if (isJsonObject(candidate) && candidate.id === projected.id) {
+				match = index;
+				break;
+			}
+		}
+		if (match === -1) {
+			existing.push(structuredClone(projected));
+			used.add(existing.length - 1);
+		} else {
+			existing[match] = {
+				...(existing[match] as JsonObject),
+				...structuredClone(projected),
+			};
+			used.add(match);
+		}
+	}
+	return existing;
+}
+
 function providerBytes(
 	preview: PreviewPayload,
 	draft: ModelManagerDraft,
+	current: JsonObject | undefined,
 ): ModelManagerResult<Uint8Array> {
+	const secrets = secretList(draft);
 	const secret = draft.secret;
 	if (!secret) {
 		return failure(
 			"provider-secret-required",
 			"A new provider requires a key for the native provider commit",
+			secrets,
 		);
 	}
-	const providers = structuredClone(preview.providerDrafts);
-	const target = providers.find((provider) => provider.name === draft.fields.providerAlias);
-	if (!target) return failure("provider-draft-missing", "Provider draft is missing");
-	if (providers.some((provider) => provider !== target && provider.apiKey === "")) {
-		return failure(
-			"opaque-provider-bytes-required",
-			"Existing provider bytes are required before adding or replacing a key",
-		);
+	const target = preview.providerDrafts.find(
+		(provider) => provider.name === draft.fields.providerAlias,
+	);
+	if (!target) {
+		return failure("provider-draft-missing", "Provider draft is missing", secrets);
 	}
-	target.apiKey = secret;
-	return { ok: true, value: canonicalJson({ providers }) };
+	const document = current ?? { providers: [] };
+	const providers = [...(document.providers as JsonObject[])];
+	const index = providers.findIndex((provider) => provider.name === target.name);
+	const existing = index === -1 ? undefined : providers[index];
+	const updated: JsonObject = {
+		...existing,
+		...structuredClone(target),
+		models: mergedModels(existing, target),
+		apiKey: secret,
+	};
+	if (index === -1) providers.push(updated);
+	else providers[index] = updated;
+	return {
+		ok: true,
+		value: canonicalJson({ ...document, providers }),
+	};
 }
 
 export async function commitDraft(
@@ -358,9 +508,11 @@ export async function commitDraft(
 	io: CommitDraftIo,
 ): Promise<ModelManagerResult<{ committed: string[] }>> {
 	const secrets = secretList(draft);
+	const target = recordForDraft(io.snapshot, draft);
+	if (!target.ok) return target;
 	if (io.impact?.referenced) {
 		const confirmation = confirmCascade(io.impact, {
-			recordId: io.impact.recordId,
+			recordId: target.value.id,
 			ack: io.confirmed,
 		});
 		if (!confirmation.ok) {
@@ -374,28 +526,49 @@ export async function commitDraft(
 
 	const preview = buildPreview(io.snapshot, draft);
 	if (!preview.ok) return preview;
-	const sidecarBytes = serializeSidecar(preview.value.sidecarAfter);
+	if (!draft.secret && draft.kind !== "edit") {
+		return failure(
+			"provider-secret-required",
+			"A new provider requires a key for the native provider commit",
+			secrets,
+		);
+	}
+
+	const modelsPath = join(dirname(io.sidecarPath), "models.json");
+	const [sidecarCurrent, modelsCurrent] = await Promise.all([
+		readCurrentJson(io.sidecarPath, "sidecar", secrets),
+		readCurrentJson(modelsPath, "models", secrets),
+	]);
+	if (!sidecarCurrent.ok) return sidecarCurrent;
+	if (!modelsCurrent.ok) return modelsCurrent;
+
+	const sidecarAfter = sidecarCurrent.value.document
+		? {
+			...sidecarCurrent.value.document,
+			models: preview.value.sidecarAfter.models,
+		} as ModelManagerSidecar
+		: preview.value.sidecarAfter;
+	const sidecarBytes = serializeSidecar(sidecarAfter);
 	if (!sidecarBytes.ok) {
 		return failure("sidecar-invalid", sidecarBytes.error.message, secrets);
 	}
 	const writes: CatalogTransactionInput["writes"] = [{
 		path: io.sidecarPath,
 		bytes: sidecarBytes.value,
-		expectRevision: "missing",
+		expectRevision: sidecarCurrent.value.revision,
 	}];
 	if (draft.secret) {
-		const modelsBytes = providerBytes(preview.value, draft);
+		const modelsBytes = providerBytes(
+			preview.value,
+			draft,
+			modelsCurrent.value.document,
+		);
 		if (!modelsBytes.ok) return modelsBytes;
 		writes.push({
-			path: join(dirname(io.sidecarPath), "models.json"),
+			path: modelsPath,
 			bytes: modelsBytes.value,
-			expectRevision: "missing",
+			expectRevision: modelsCurrent.value.revision,
 		});
-	} else if (draft.kind !== "edit") {
-		return failure(
-			"provider-secret-required",
-			"A new provider requires a key for the native provider commit",
-		);
 	}
 
 	try {
@@ -404,7 +577,7 @@ export async function commitDraft(
 			return failure(
 				committed.code ?? committed.error?.code ?? `transaction-${committed.phase}-failed`,
 				committed.message,
-				secrets,
+				[...secrets, io.sidecarPath, modelsPath],
 			);
 		}
 		return { ok: true, value: { committed: committed.committed } };
