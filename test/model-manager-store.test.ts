@@ -8,7 +8,12 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import {
+	basename,
+	join,
+	relative,
+	resolve,
+} from "node:path";
 import { test } from "node:test";
 import {
 	commitCatalogTransaction,
@@ -45,9 +50,15 @@ test("readRevision returns content hash and missing for absent file", async () =
 		const bytes = Buffer.from("catalog", "utf8");
 		await writeFile(path, bytes);
 
-		assert.deepEqual(await readRevision(path), { path, revision: revision(bytes) });
-		assert.deepEqual(await readRevision(join(dir, "missing.json")), {
-			path: join(dir, "missing.json"),
+		const relativePath = join(relative(process.cwd(), dir), "nested", "..", "models.json");
+		assert.deepEqual(await readRevision(relativePath), {
+			path: resolve(relativePath),
+			revision: revision(bytes),
+		});
+
+		const missingPath = join(relative(process.cwd(), dir), "nested", "..", "missing.json");
+		assert.deepEqual(await readRevision(missingPath), {
+			path: resolve(missingPath),
 			revision: "missing",
 		});
 	});
@@ -89,25 +100,46 @@ test("withFileLocks second request waits and releases lockfiles in finally", asy
 	});
 });
 
-test("withFileLocks times out while another request holds the lock", async () => {
+test("commitCatalogTransaction converts lock timeout into a prepare result", async () => {
 	await withTempDir(async (dir) => {
 		const path = join(dir, "models.json");
 		let releaseHeld!: () => void;
-		const held = withFileLocks([path], async () => new Promise<void>((resolve) => {
-			releaseHeld = resolve;
+		const held = withFileLocks([path], async () => new Promise<void>((resolveHeld) => {
+			releaseHeld = resolveHeld;
 		}));
-		await new Promise((resolve) => setTimeout(resolve, 30));
+		await new Promise((resolvePromise) => setTimeout(resolvePromise, 30));
 
-		await assert.rejects(
-			withFileLocks([path], async () => undefined),
-			(error: Error) => {
-				assert.match(error.message, /timed out waiting for file lock/i);
-				assert.equal(error.message.includes(path), false);
-				return true;
-			},
-		);
+		const result = await commitCatalogTransaction({
+			writes: [write(path, "replacement", "missing")],
+		});
+
+		assert.equal(result.ok, false);
+		if (result.ok) return;
+		assert.equal(result.phase, "prepare");
+		assert.match(result.message, /^prepare failed \(Error\)$/);
+		assertNoSecret(result, "provider-api-secret");
+		assert.equal(result.message.includes(path), false);
 		releaseHeld();
 		await held;
+	});
+});
+
+test("commitCatalogTransaction converts lock mkdir errors into a prepare result", async () => {
+	await withTempDir(async (dir) => {
+		const parent = join(dir, "not-a-directory");
+		await writeFile(parent, "file");
+		const path = join(parent, "models.json");
+
+		const result = await commitCatalogTransaction({
+			writes: [write(path, "replacement", "missing")],
+		});
+
+		assert.equal(result.ok, false);
+		if (result.ok) return;
+		assert.equal(result.phase, "prepare");
+		assert.match(result.message, /^prepare failed \(Error\)$/);
+		assert.equal(result.message.includes(path), false);
+		assertNoSecret(result, "provider-api-secret");
 	});
 });
 
@@ -152,20 +184,24 @@ test("commitCatalogTransaction rolls back earlier writes when a later write fail
 		const result = await commitCatalogTransaction({ writes }, async (path: string, bytes: Uint8Array) => {
 			const text = Buffer.from(bytes).toString();
 			calls.push(`${path}:${text}`);
-			if (path === secondPath && text === "second-new") throw new Error("injected commit failure");
+			if (path === secondPath && text === "second-new") {
+				await writeFile(path, bytes);
+				throw new Error("injected commit failure after partial write");
+			}
 			await writeFile(path, bytes);
 		});
 
 		assert.equal(result.ok, false);
 		if (result.ok) return;
 		assert.equal(result.phase, "commit");
-		assert.deepEqual(result.rolledBack, [firstPath]);
+		assert.deepEqual(result.rolledBack, [secondPath, firstPath]);
 		assert.equal(result.rollbackFailure, undefined);
 		assert.deepEqual(await readFile(firstPath), firstOriginal);
 		assert.deepEqual(await readFile(secondPath), secondOriginal);
 		assert.deepEqual(calls, [
 			`${firstPath}:first-new`,
 			`${secondPath}:second-new`,
+			`${secondPath}:second-original`,
 			`${firstPath}:first-original`,
 		]);
 		assertNoSecret(result, "first-original");
@@ -183,7 +219,10 @@ test("commitCatalogTransaction reports rollback failure distinctly", async () =>
 			{ writes: [write(firstPath, secret, revision(Buffer.from("first-original"))), write(secondPath, "second-new", revision(Buffer.from("second-original")))] },
 			async (path: string, bytes: Uint8Array) => {
 				const text = Buffer.from(bytes).toString();
-				if (path === secondPath || text === "first-original")
+				if (
+					(path === secondPath && text === "second-new") ||
+					(path === firstPath && text === "first-original")
+				)
 					throw new Error(`injected failure ${secret}`);
 				await writeFile(path, bytes);
 			},
@@ -192,7 +231,7 @@ test("commitCatalogTransaction reports rollback failure distinctly", async () =>
 		assert.equal(result.ok, false);
 		if (result.ok) return;
 		assert.equal(result.phase, "commit");
-		assert.deepEqual(result.rolledBack, []);
+		assert.deepEqual(result.rolledBack, [secondPath]);
 		assert.deepEqual(result.rollbackFailure, [firstPath]);
 		assertNoSecret(result, secret);
 		assert.deepEqual(await readFile(firstPath), Buffer.from(secret));
@@ -216,10 +255,43 @@ test("commitCatalogTransaction rejects failover paths as not owner", async () =>
 			assert.equal(result.ok, false);
 			if (result.ok) continue;
 			assert.equal(result.phase, "prepare");
-			assert.match(result.message, /not-owner/);
+			assert.equal(result.error?.code, "not-owner");
+			assert.equal(result.error?.message.includes(path), false);
+			assert.equal(JSON.stringify(result.error).includes(path), false);
 			assert.equal(result.message.includes(path), false);
 		}
 		assert.deepEqual(calls, []);
+	});
+});
+
+test("commitCatalogTransaction rejects duplicate normalized paths before writing", async () => {
+	await withTempDir(async (dir) => {
+		const path = join(dir, "models.json");
+		const duplicatePath = join(dir, "nested", "..", "models.json");
+		const original = Buffer.from("original", "utf8");
+		await writeFile(path, original);
+		const writes: string[] = [];
+
+		const result = await commitCatalogTransaction(
+			{
+				writes: [
+					write(path, "first", revision(original)),
+					write(duplicatePath, "second", revision(original)),
+				],
+			},
+			async (target: string, bytes: Uint8Array) => {
+				writes.push(target);
+				await writeFile(target, bytes);
+			},
+		);
+
+		assert.equal(result.ok, false);
+		if (result.ok) return;
+		assert.equal(result.phase, "prepare");
+		assert.equal(result.error?.code, "duplicate-path");
+		assert.match(result.message, /duplicate/i);
+		assert.deepEqual(writes, []);
+		assert.deepEqual(await readFile(path), original);
 	});
 });
 

@@ -7,6 +7,7 @@ import {
 	unlink,
 } from "node:fs/promises";
 import { basename, dirname, resolve, sep } from "node:path";
+import type { ModelManagerError } from "./model-manager-types.ts";
 
 const LOCK_TIMEOUT_MS = 2_000;
 const LOCK_RETRY_MS = 20;
@@ -32,6 +33,7 @@ export type TransactionResult =
 			ok: false;
 			phase: "prepare" | "commit";
 			code?: string;
+			error?: ModelManagerError;
 			conflicts?: Array<{
 				path: string;
 				expectRevision: string;
@@ -62,11 +64,12 @@ function revisionFor(bytes: Uint8Array): string {
 }
 
 export async function readRevision(path: string): Promise<FileRevision> {
+	const normalized = normalizedPath(path);
 	try {
-		return { path, revision: revisionFor(await readFile(normalizedPath(path))) };
+		return { path: normalized, revision: revisionFor(await readFile(normalized)) };
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-			return { path, revision: "missing" };
+			return { path: normalized, revision: "missing" };
 		}
 		throw error;
 	}
@@ -92,8 +95,10 @@ async function acquireLock(path: string): Promise<{ path: string; token: string 
 	await mkdir(dirname(lock), { recursive: true });
 
 	for (;;) {
+		let created = false;
 		try {
 			const handle = await open(lock, "wx", 0o600);
+			created = true;
 			try {
 				await handle.writeFile(token, "utf8");
 				await handle.sync();
@@ -102,6 +107,10 @@ async function acquireLock(path: string): Promise<{ path: string; token: string 
 			}
 			return { path: lock, token };
 		} catch (error) {
+			if (created) {
+				await releaseLock(lock, token);
+				throw error;
+			}
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 			if (Date.now() >= deadline)
 				throw new Error("Timed out waiting for file lock");
@@ -220,15 +229,34 @@ export async function commitCatalogTransaction(
 	}));
 	const notOwned = writes.some((entry) => !isCatalogPath(entry.path));
 	if (notOwned) {
-		return {
-			ok: false,
-			phase: "prepare",
+		const error: ModelManagerError = {
 			code: "not-owner",
 			message: "not-owner: target is outside Model Manager catalog ownership",
 		};
+		return {
+			ok: false,
+			phase: "prepare",
+			code: error.code,
+			error,
+			message: error.message,
+		};
+	}
+	if (new Set(writes.map((entry) => entry.path)).size !== writes.length) {
+		const error: ModelManagerError = {
+			code: "duplicate-path",
+			message: "duplicate normalized write path",
+		};
+		return {
+			ok: false,
+			phase: "prepare",
+			code: error.code,
+			error,
+			message: "prepare failed (duplicate write path)",
+		};
 	}
 
-	return withFileLocks(
+	try {
+		return await withFileLocks(
 		writes.map((entry) => entry.path),
 		async () => {
 			const conflicts: Array<{
@@ -294,12 +322,14 @@ export async function commitCatalogTransaction(
 				};
 
 			const committed: string[] = [];
+			const attempted: string[] = [];
 			for (const entry of writes) {
+				attempted.push(entry.path);
 				try {
 					await write(entry.path, entry.bytes);
 					committed.push(entry.path);
 				} catch (error) {
-					const rollback = await rollbackWrites(originals, committed, write);
+					const rollback = await rollbackWrites(originals, attempted, write);
 					const message =
 						rollback.rollbackFailure.length === 0
 							? `commit failed (${safeErrorName(error)}); earlier writes rolled back`
@@ -317,5 +347,12 @@ export async function commitCatalogTransaction(
 			}
 			return { ok: true, committed };
 		},
-	);
+		);
+	} catch (error) {
+		return {
+			ok: false,
+			phase: "prepare",
+			message: `prepare failed (${safeErrorName(error)})`,
+		};
+	}
 }
