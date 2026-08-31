@@ -108,7 +108,14 @@ async function acquireLock(path: string): Promise<{ path: string; token: string 
 			return { path: lock, token };
 		} catch (error) {
 			if (created) {
-				await releaseLock(lock, token);
+				try {
+					await unlink(lock);
+				} catch (cleanupError) {
+					throw new Error(
+						`lock setup failed (${safeErrorName(error)}); cleanup failed (${safeErrorName(cleanupError)})`,
+						{ cause: error },
+					);
+				}
 				throw error;
 			}
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;

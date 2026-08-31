@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
 	mkdtemp,
+	open,
 	readFile,
 	readdir,
 	rm,
@@ -94,6 +95,57 @@ test("withFileLocks second request waits and releases lockfiles in finally", asy
 		assert.equal(await first, "first");
 		assert.equal(await second, "second");
 		assert.deepEqual(exited, ["first", "second"]);
+
+		const files = await readdir(dir, { recursive: true });
+		assert.deepEqual(files.filter((file) => basename(String(file)).endsWith(".lock")), []);
+	});
+});
+
+test("withFileLocks times out while another request holds the lock", async () => {
+	await withTempDir(async (dir) => {
+		const path = join(dir, "models.json");
+		let releaseHeld!: () => void;
+		const held = withFileLocks([path], async () => new Promise<void>((resolveHeld) => {
+			releaseHeld = resolveHeld;
+		}));
+		await new Promise((resolvePromise) => setTimeout(resolvePromise, 30));
+
+		await assert.rejects(
+			withFileLocks([path], async () => undefined),
+			(error: Error) => {
+				assert.match(error.message, /timed out waiting for file lock/i);
+				assert.equal(error.message.includes(path), false);
+				return true;
+			},
+		);
+		releaseHeld();
+		await held;
+	});
+});
+
+test("withFileLocks removes a lock created before setup failure", async () => {
+	await withTempDir(async (dir) => {
+		const path = join(dir, "models.json");
+		const probeHandle = await open(join(dir, "probe"), "w");
+		const prototype = Object.getPrototypeOf(probeHandle) as {
+			writeFile: typeof probeHandle.writeFile;
+		};
+		const originalWriteFile = prototype.writeFile;
+		const setupError = new Error("injected lock setup failure");
+		prototype.writeFile = (() => Promise.reject(setupError)) as typeof prototype.writeFile;
+
+		try {
+			await assert.rejects(
+				withFileLocks([path], async () => undefined),
+				(error: Error) => {
+					assert.equal(error, setupError);
+					return true;
+				},
+			);
+		} finally {
+			prototype.writeFile = originalWriteFile;
+			await probeHandle.close();
+		}
 
 		const files = await readdir(dir, { recursive: true });
 		assert.deepEqual(files.filter((file) => basename(String(file)).endsWith(".lock")), []);
