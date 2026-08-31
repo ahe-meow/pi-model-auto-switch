@@ -129,11 +129,13 @@ test("parseEnvironmentKeys reads from provided env object only", () => {
 });
 
 test("parseEnvironmentKeys rejects missing env vars as whole batch", () => {
+	const variableName = "MODEL_MANAGER_INPUT_MISSING";
+	const blankVariableName = "MODEL_MANAGER_INPUT_BLANK";
 	const missingValue = "env-missing-secret-value";
 	const result = parseEnvironmentKeys(
-		["MODEL_MANAGER_INPUT_MISSING", "MODEL_MANAGER_INPUT_BLANK", "MODEL_MANAGER_INPUT_PRESENT"],
+		[variableName, blankVariableName, "MODEL_MANAGER_INPUT_PRESENT"],
 		{
-			MODEL_MANAGER_INPUT_BLANK: " \t ",
+			[blankVariableName]: " \t ",
 			MODEL_MANAGER_INPUT_PRESENT: missingValue,
 		},
 	);
@@ -145,5 +147,10 @@ test("parseEnvironmentKeys rejects missing env vars as whole batch", () => {
 	assert.match(result.rejected[1]?.reason ?? "", /blank|empty/i);
 	for (const rejection of result.rejected) {
 		assert.doesNotMatch(rejection.reason, /env-missing-secret-value/);
+		assert.doesNotMatch(rejection.reason, new RegExp(variableName));
+		assert.doesNotMatch(rejection.reason, new RegExp(blankVariableName));
 	}
+	assert.doesNotMatch(JSON.stringify(result), new RegExp(variableName));
+	assert.doesNotMatch(JSON.stringify(result), new RegExp(blankVariableName));
+	assert.doesNotMatch(JSON.stringify(result), /env-missing-secret-value/);
 });

@@ -118,14 +118,14 @@ export function parseEnvironmentKeys(
 		if (value === undefined) {
 			missingOrBlank.push({
 				line,
-				reason: describeLine(line, `missing environment variable ${name}`),
+				reason: describeLine(line, "missing environment variable"),
 			});
 			continue;
 		}
 		if (normalizeKey(value).length === 0) {
 			missingOrBlank.push({
 				line,
-				reason: describeLine(line, `blank environment variable ${name}`),
+				reason: describeLine(line, "blank environment variable"),
 			});
 			continue;
 		}
