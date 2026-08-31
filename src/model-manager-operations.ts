@@ -40,6 +40,7 @@ export interface RecordDraftFields {
 export interface ModelManagerDraft {
 	kind: "create" | "edit" | "clone";
 	recordId?: string;
+	readonly sourceRecordId?: string;
 	fields: RecordDraftFields;
 	advanced: Record<string, unknown>;
 	secret?: string;
@@ -143,7 +144,10 @@ function failure<T>(
 ): ModelManagerResult<T> {
 	return {
 		ok: false,
-		error: { code, message: redactSecrets(message, secrets) },
+		error: {
+			code: redactSecrets(code, secrets),
+			message: redactSecrets(message, secrets),
+		},
 	};
 }
 
@@ -184,6 +188,7 @@ export function editDraft(
 		value: {
 			kind: "edit",
 			recordId,
+			sourceRecordId: recordId,
 			fields: copyFields({ ...copied.fields, ...structuredClone(fields) }),
 			advanced: copied.advanced,
 		},
@@ -268,6 +273,21 @@ function recordForDraft(
 ): ModelManagerResult<ModelManagerRecord> {
 	if (draft.kind === "edit") {
 		const recordId = draft.recordId;
+		const sourceRecordId = draft.sourceRecordId;
+		if (!sourceRecordId) {
+			return failure(
+				"malformed-draft",
+				"Edit draft is missing its source record identity",
+				secretList(draft),
+			);
+		}
+		if (sourceRecordId !== recordId) {
+			return failure(
+				"immutable-identity",
+				"Provider alias, provider name, and model ID cannot be changed by edit",
+				secretList(draft),
+			);
+		}
 		const existing = recordId ? snapshot.byId.get(recordId) : undefined;
 		if (!recordId || !existing) {
 			return failure(
@@ -399,6 +419,7 @@ function validModelsDocument(value: JsonObject): boolean {
 		typeof provider.name === "string" &&
 		provider.name.trim().length > 0 &&
 		typeof provider.apiKey === "string" &&
+		(!Object.hasOwn(provider, "baseUrl") || typeof provider.baseUrl === "string") &&
 		Array.isArray(provider.models) &&
 		provider.models.every((model) =>
 			isJsonObject(model) &&

@@ -576,6 +576,72 @@ test("direct malformed edit drafts cannot preview or commit another provider sec
 	}
 });
 
+test("edit drafts cannot be rebound to another snapshot record", async () => {
+	await withTempDir(async (dir) => {
+		const other: ModelManagerRecord = {
+			...source,
+			id: "other-id",
+			providerAlias: "mm-provider-b-other-fingerprint",
+			providerName: "Provider B",
+			modelId: "model-b",
+		};
+		const catalog = snapshot([source, other]);
+		const draft = assertOk(editDraft(catalog, source.id, { label: "Edited" }));
+		draft.recordId = other.id;
+		draft.fields.providerAlias = other.providerAlias;
+		draft.fields.providerName = other.providerName;
+		draft.fields.modelId = other.modelId;
+		draft.secret = "rebound-draft-secret";
+		const sidecarPath = join(dir, "model-manager.json");
+		let commits = 0;
+
+		const result = await commitDraft(draft, {
+			snapshot: catalog,
+			sidecarPath,
+			commit: async () => {
+				commits += 1;
+				return { ok: true, committed: [] };
+			},
+			impact: null,
+			confirmed: true,
+		});
+
+		assertError(result, "immutable-identity");
+		assert.equal(commits, 0);
+		assert.equal(JSON.stringify(result).includes(draft.secret), false);
+	});
+});
+
+test("commitDraft rejects models providers with non-string baseUrl", async () => {
+	await withTempDir(async (dir) => {
+		const sidecarPath = join(dir, "model-manager.json");
+		const modelsPath = join(dir, "models.json");
+		await writeFile(modelsPath, `${JSON.stringify({
+			providers: [{
+				name: source.providerAlias,
+				apiKey: "opaque-native-reference",
+				baseUrl: 42,
+				models: [{ id: source.modelId }],
+			}],
+		})}\n`);
+		let commits = 0;
+
+		const result = await commitDraft(newDraft("base-url-secret"), {
+			snapshot: snapshot([]),
+			sidecarPath,
+			commit: async () => {
+				commits += 1;
+				return { ok: true, committed: [] };
+			},
+			impact: null,
+			confirmed: true,
+		});
+
+		assertError(result, "models-malformed");
+		assert.equal(commits, 0);
+	});
+});
+
 test("commitDraft rejects malformed existing catalog files without committing", async () => {
 	for (const malformed of ["sidecar", "models"] as const) {
 		await withTempDir(async (dir) => {
@@ -691,23 +757,33 @@ test("commitDraft writes sidecar and provider config through commit callback", a
 	});
 });
 
-test("commitDraft redacts secret from commit failures", async () => {
+test("commitDraft redacts untrusted commit failure code and messages", async () => {
 	const secret = "failure-secret-must-be-redacted";
+	const sidecarPath = join("/tmp", `sidecar-${secret}`, "model-manager.json");
+	const modelsPath = join(dirname(sidecarPath), "models.json");
 	const result = await commitDraft(newDraft(secret), {
 		snapshot: snapshot([]),
-		sidecarPath: "/unused/model-manager.json",
+		sidecarPath,
 		commit: async () => ({
 			ok: false,
 			phase: "commit",
-			message: `write failed while handling ${secret}`,
+			code: `code-${secret}-${sidecarPath}`,
+			error: {
+				code: `error-code-${secret}-${modelsPath}`,
+				message: `error-message-${secret}-${sidecarPath}`,
+			},
+			message: `write failed for ${secret} at ${modelsPath}`,
 		}),
 		impact: null,
 		confirmed: true,
 	});
 
 	assert.equal(result.ok, false);
-	assert.equal(JSON.stringify(result).includes(secret), false);
-	assert.equal(JSON.stringify(result).includes("[redacted]"), true);
+	const serialized = JSON.stringify(result);
+	assert.equal(serialized.includes(secret), false);
+	assert.equal(serialized.includes(sidecarPath), false);
+	assert.equal(serialized.includes(modelsPath), false);
+	assert.equal(serialized.includes("[redacted]"), true);
 });
 
 test("cancelDraft returns without side effects", async () => {
