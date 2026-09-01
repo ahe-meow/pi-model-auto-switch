@@ -238,3 +238,23 @@ node --loader ./test/typescript-loader.mjs --test test/*.test.ts
 node ./node_modules/typescript/lib/tsc.js --noEmit --pretty false
 git diff --check
 ```
+
+## Model Manager Layers
+
+The Model Manager path is split into small ownership boundaries:
+
+- `model-manager-types`: sidecar/catalog types, multiplier validation, stable IDs, aliases, cloning, and grouping as pure helpers.
+- `model-manager-input`: in-memory Raw and Environment key parsing with whole-batch rejection.
+- `model-manager-sidecar`: sidecar bytes, validation, canonical serialization, revisions, and blocked states.
+- `model-manager-catalog`: read-only Pi provider adaptation and the sanitized catalog snapshot.
+- `model-manager-store`: normalized revisions, fixed dictionary-order file locks, CAS checks, atomic writes, and rollback.
+- `model-manager-impact`: read-only chain/generated-block/state reference analysis and cascade confirmation.
+- `model-manager-operations`: create/edit/clone drafts, secret-free previews, and transaction submission.
+- `model-manager-tui`: the three-screen renderers and pure reducer; it does not perform I/O.
+- `model-manager-bridge`: explicit Failover chain registration, virtual-model gating, and the delete notification seam.
+
+A catalog transaction has three stages. `prepare` acquires normalized target locks in dictionary order, validates ownership and duplicate paths, rereads revisions, checks CAS, and caches original bytes. `commit` writes the prepared catalog files through atomic replacement. On failure, `rollback` restores earlier bytes or removes newly created files; a rollback failure is reported separately and is never hidden as an ordinary validation error. Locks release in reverse order in every exit path.
+
+A CAS mismatch is a prepare conflict. It reports the affected path revisions and performs zero writes, so an external update is never overwritten. Preview and cancel also perform zero writes.
+
+Failover remains the owner of `model-failover.json`, `failover-state.json`, and generated `providers.failover` content. Model Manager owns its sidecar and native catalog transaction but does not write Failover files directly. After read-only impact analysis and `confirmCascade`, deletion notification goes through `registerModelManagerBridge`/`notifyModelManagerDelete`; the Failover runtime forwards it through its existing serialized `chainOperation` queue to the optional delete coordinator callback.

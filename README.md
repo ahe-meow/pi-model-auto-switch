@@ -45,7 +45,7 @@ This path is fixed for the user, even when `PI_CODING_AGENT_DIR` points elsewher
 
 Failover creates its own `ModelRuntime` for every Pi session, including child and subagent sessions. It reads the shared `models.json` and authentication state directly, so child-session lifecycle hooks and version-specific `pi-subagents` patches are not required. On `session_start`, it reloads and applies the authoritative v8 chain configuration, then restores session history and installs Footer/status context. Runtime failover itself remains usable before `session_start`; an already-open editor is not live-watched, so close and reopen it or trigger `session_start` to observe an external config revision.
 
-Authentication remains owned by Pi. The extension reads `models.json` through its owned `ModelRuntime`; it never edits `models.json` directly and never stores API keys or tokens. Outer virtual request credentials and header transforms are not forwarded to real targets; each target runtime supplies its own authentication and native headers.
+Authentication remains owned by Pi. The Failover runtime reads `models.json` through its owned `ModelRuntime` and never edits it; the separate Model Manager commit path writes native provider data only through its catalog transaction. Neither path stores API keys or tokens outside the native provider write boundary. Outer virtual request credentials and header transforms are not forwarded to real targets; each target runtime supplies its own authentication and native headers.
 
 ## `/failover`
 
@@ -111,3 +111,15 @@ git diff --check
 ```
 
 The tests cover configuration safety and migration, shared-state coordination, chain-scope inheritance and target overrides, authorization boundaries, request-field negotiation, session hashing, TUI behavior, context-preserving tool results, error policy, cooldown traversal, and exhaustion. Live provider behavior and visual terminal interaction still require a Pi session.
+
+## Model Manager
+
+Model Manager maintains the real provider/model catalog alongside the Failover configuration. Each API key maps to its own native provider alias. Records keep stable IDs, labels, optional `remoteGroup`, multiplier, advanced fields, and unknown fields; `multiplier` is storage-only and does not affect runtime ordering, budgets, or routing.
+
+`/failover` has three screens in fixed order: `Model Manager`, `Failover Chains`, and `History`. The current empty `/failover` entry opens the Model Manager first screen with an empty, read-only initial state. Its renderer and reducer are mounted, but catalog CRUD is not wired into that screen yet. Failover Chains and History remain owned by the existing Failover editor and history panel. Model Manager deletion uses the current `confirmCascade` plus `notifyModelManagerDelete` bridge seam; it does not write Failover files or invent a separate delete API.
+
+Raw and Environment key input is batch-atomic: a blank, malformed, duplicate, command-style, missing, or blank environment value rejects the entire batch and creates no accepted entries. Rejection text contains line/rule information only and never key material. Environment parsing reads only the supplied in-memory environment object.
+
+Blocked sidecars (`malformed`, `invalid`, `future`, or `unreadable`) stop catalog use and preserve the original bytes for recovery. The UI exposes a fixed raw-bytes-preserved hint; repair the file and reopen `/failover`. A missing sidecar reports compatibility import paths instead of fabricating bytes.
+
+Secrets stay in memory or the native provider commit path. API keys never enter the sidecar, preview output, TUI state/rendering, or error messages. Provider previews retain the required empty `apiKey` schema field; only a confirmed native commit injects the actual key.
