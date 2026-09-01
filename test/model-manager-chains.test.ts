@@ -26,11 +26,14 @@ const bridgeModule = (await import("../src/model-manager-bridge.ts")) as typeof 
 	clearModelManagerBridge?: () => void;
 };
 
-const existingIndexExports = new Set([
+const expectedIndexExports = new Set([
 	"FAILOVER_CONFIG_PATH",
 	"MODELS_JSON_PATH",
 	"registerFailoverExtension",
 	"default",
+	// Explicit Task9 additive contract; this is not a runtime export snapshot.
+	"renderManagerScreen",
+	"modelManagerCommand",
 ]);
 
 type CommandHandler = (args: string, ctx: unknown) => unknown | Promise<unknown>;
@@ -49,12 +52,16 @@ function emptyTargetRuntime(): TargetRuntime {
 
 async function createExtensionHarness(
 	coordinator?: (recordId: string, impact: CatalogImpact) => Promise<void>,
+	sharedState = createMemorySharedState(),
 ): Promise<{
 	commands: Array<{ name: string; handler: CommandHandler }>;
+	handlers: Map<string, (event: unknown, ctx: unknown) => unknown>;
 }> {
 	const commands: Array<{ name: string; handler: CommandHandler }> = [];
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
 	const pi = {
-		on: () => undefined,
+		on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) =>
+			handlers.set(event, handler),
 		registerCommand: (name: string, options: { handler: CommandHandler }) =>
 			commands.push({ name, handler: options.handler }),
 		registerProvider: () => undefined,
@@ -62,10 +69,10 @@ async function createExtensionHarness(
 	} as unknown as import("@earendil-works/pi-coding-agent").ExtensionAPI;
 	await index.registerFailoverExtension(pi, {
 		targetRuntime: emptyTargetRuntime(),
-		sharedState: createMemorySharedState(),
+		sharedState,
 		...(coordinator ? { modelManagerDeleteCoordinator: coordinator } : {}),
 	});
-	return { commands };
+	return { commands, handlers };
 }
 
 function renderContext(rendered: { value: string }): unknown {
@@ -158,8 +165,12 @@ test("selectCatalogRecordsForChains filters to sidecar records only", () => {
 		unknown: { nested: { value: "original" } },
 	});
 	const sidecarB = record({ id: "sidecar-b", modelId: "model-b" });
-	const providerOnly = record({ id: "provider-only", modelId: "orphan" });
-	const current = snapshot([sidecarA, sidecarB], [sidecarA, sidecarB, providerOnly]);
+	const orphan = record({ id: "orphan", modelId: "orphan-model" });
+	const providerOnly = record({ id: "provider-only", modelId: "provider-model" });
+	const current = snapshot(
+		[sidecarA, sidecarB, orphan],
+		[sidecarA, sidecarB, providerOnly],
+	);
 	const beforeRecords = structuredClone(current.records);
 	const beforeById = [...current.byId.entries()];
 
@@ -169,8 +180,11 @@ test("selectCatalogRecordsForChains filters to sidecar records only", () => {
 	assert.notStrictEqual(selected[0], sidecarA);
 	assert.notStrictEqual(selected[0]?.unknown, sidecarA.unknown);
 	assert.deepEqual(selected, [sidecarA, sidecarB]);
+	assert.equal(current.byId.get(orphan.id), undefined);
+	assert.strictEqual(current.byId.get(providerOnly.id), providerOnly);
 	assert.deepEqual(current.records, beforeRecords);
 	assert.deepEqual([...current.byId.entries()], beforeById);
+	assert.equal(selected.some((entry) => entry.id === orphan.id), false);
 	assert.equal(selected.some((entry) => entry.id === providerOnly.id), false);
 	const equivalentClone = structuredClone(sidecarA);
 	assert.deepEqual(
@@ -280,6 +294,84 @@ test("/failover handler opens the Model Manager screen and keeps history panel",
 	assert.match(historyRendered.value, /Failover History/);
 });
 
+test("queued config apply after shutdown cannot re-register chains", async () => {
+	await writeFile(index.FAILOVER_CONFIG_PATH, '{"version":8,"models":[]}\n');
+	const baseSharedState = createMemorySharedState();
+	let releaseRegistration!: () => void;
+	const registrationGate = new Promise<void>((resolve) => {
+		releaseRegistration = resolve;
+	});
+	let registrationStarted!: () => void;
+	const registrationStartedPromise = new Promise<void>((resolve) => {
+		registrationStarted = resolve;
+	});
+	let blockRegistration = false;
+	const sharedState = {
+		status: () => baseSharedState.status(),
+		snapshot: () => baseSharedState.snapshot(),
+		reconcileRegistration: async (
+			input: Parameters<typeof baseSharedState.reconcileRegistration>[0],
+		) => {
+			if (blockRegistration) {
+				registrationStarted();
+				await registrationGate;
+			}
+			return baseSharedState.reconcileRegistration(input);
+		},
+		claim: (input: Parameters<typeof baseSharedState.claim>[0]) =>
+			baseSharedState.claim(input),
+		settle: (input: Parameters<typeof baseSharedState.settle>[0]) =>
+			baseSharedState.settle(input),
+		updateSettings: (
+			target: Parameters<typeof baseSharedState.updateSettings>[0],
+			patch: Parameters<typeof baseSharedState.updateSettings>[1],
+		) => baseSharedState.updateSettings(target, patch),
+		resetTargets: (targets: Parameters<typeof baseSharedState.resetTargets>[0]) =>
+			baseSharedState.resetTargets(targets),
+	};
+	const harness = await createExtensionHarness(undefined, sharedState);
+	const sessionStart = harness.handlers.get("session_start");
+	const sessionShutdown = harness.handlers.get("session_shutdown");
+	assert.ok(sessionStart);
+	assert.ok(sessionShutdown);
+
+	await writeFile(
+		index.FAILOVER_CONFIG_PATH,
+		JSON.stringify({
+			version: 8,
+			models: [
+				{ id: "queued-chain", name: "Queued Chain", enabled: false, chain: [] },
+			],
+		}) + "\n",
+	);
+	blockRegistration = true;
+	const refresh = sessionStart({}, renderContext({ value: "" }));
+	await registrationStartedPromise;
+	assert.equal(
+		buildVirtualModel("queued-chain", [record({ providerAlias: "safe" })]),
+		null,
+	);
+
+	sessionShutdown({}, renderContext({ value: "" }));
+	assert.equal(
+		buildVirtualModel("queued-chain", [record({ providerAlias: "safe" })]),
+		null,
+	);
+	releaseRegistration();
+	await refresh;
+	assert.equal(
+		buildVirtualModel("queued-chain", [record({ providerAlias: "safe" })]),
+		null,
+	);
+
+	blockRegistration = false;
+	await sessionStart({}, renderContext({ value: "" }));
+	assert.deepEqual(
+		buildVirtualModel("queued-chain", [record({ providerAlias: "safe" })]),
+		{ id: "mm-queued-chain", provider: "safe" },
+	);
+});
+
 test("index wires delete coordinator through the runtime chain queue", async () => {
 	const events: string[] = [];
 	let releaseFirst!: () => void;
@@ -386,7 +478,7 @@ test("bridge delete propagates coordinator callback errors", async () => {
 
 test("index exports model manager api as a superset of previous exports", () => {
 	const exported = new Set(Object.keys(index));
-	for (const name of existingIndexExports) assert.equal(exported.has(name), true, name);
+	for (const name of expectedIndexExports) assert.equal(exported.has(name), true, name);
 	for (const name of [
 		"buildVirtualModel",
 		"notifyModelManagerDelete",

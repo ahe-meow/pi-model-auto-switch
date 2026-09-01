@@ -161,6 +161,7 @@ interface RuntimeState {
 	sessionPersistable: boolean;
 	chainOperation: Promise<void>;
 	chainRegistrations: Array<() => void>;
+	chainRegistrationsActive: boolean;
 	modelManagerBridgeCleanup: (() => void) | undefined;
 	refreshConfig: () => Promise<boolean>;
 	refreshProvider: () => void;
@@ -583,6 +584,8 @@ function serializeChainOperation<T>(
 
 function syncRegisteredFailoverChains(runtime: RuntimeState): void {
 	for (const cleanup of runtime.chainRegistrations) cleanup();
+	runtime.chainRegistrations = [];
+	if (!runtime.chainRegistrationsActive) return;
 	runtime.chainRegistrations = runtime.config.models.map((model) =>
 		registerChain(model.id),
 	);
@@ -682,6 +685,7 @@ function initialRuntime(
 		sessionPersistable: false,
 		chainOperation: Promise.resolve(),
 		chainRegistrations: [],
+		chainRegistrationsActive: true,
 		modelManagerBridgeCleanup: undefined,
 		refreshConfig: async () => true,
 		refreshProvider: () => undefined,
@@ -1728,6 +1732,12 @@ export async function registerFailoverExtension(
 	);
 
 	pi.on("session_start", async (_event, ctx) => {
+		runtime.chainRegistrationsActive = true;
+		syncRegisteredFailoverChains(runtime);
+		registerRuntimeModelManagerBridge(
+			runtime,
+			options.modelManagerDeleteCoordinator,
+		);
 		runtime.history = restoreHistory(ctx.sessionManager.getEntries());
 		runtime.lastTransition = runtime.history[0];
 		runtime.currentTarget = undefined;
@@ -1741,6 +1751,7 @@ export async function registerFailoverExtension(
 		await refreshOwnedTargetRuntime(runtime);
 	});
 	pi.on("session_shutdown", () => {
+		runtime.chainRegistrationsActive = false;
 		runtime.modelManagerBridgeCleanup?.();
 		runtime.modelManagerBridgeCleanup = undefined;
 		for (const cleanup of runtime.chainRegistrations) cleanup();
