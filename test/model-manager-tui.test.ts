@@ -710,3 +710,114 @@ test("reducer sanitizes unsafe pending impact before returning or rendering", ()
 	});
 	assert.match(sanitized.message ?? "", /ready/);
 });
+
+test("pending impact keeps legal scanner syntax and strips path-shaped identities", () => {
+	const unsafeImpact = {
+		recordId: "provider/model",
+		chains: [
+			{
+				file: "/mnt/sdcard/AI Workplace/foo/models.json",
+				chainId: "provider/model",
+				kind: "model-entry",
+			},
+			{
+				file: "/safe/chains.json",
+				chainId: "/private/hunter2",
+				kind: "generated-block",
+			},
+		],
+		state: [
+			{
+				file: "/safe/state.json",
+				key: "registrations./agent/project.targets[0]",
+			},
+		],
+		referenced: true,
+	} as CatalogImpact;
+	const projected = applyTuiAction(state({ pendingImpact: unsafeImpact }), {
+		type: "switch-tab",
+		tab: "history",
+	});
+
+	assert.deepEqual(projected.pendingImpact, {
+		recordId: "provider/model",
+		chains: [
+			{ file: "models.json", chainId: "provider/model", kind: "model-entry" },
+			{ file: "chains.json", chainId: "[redacted]", kind: "generated-block" },
+		],
+		state: [
+			{ file: "state.json", key: "registrations./agent/project.targets[0]" },
+		],
+		referenced: true,
+	});
+	assert.equal(JSON.stringify(projected).includes("/private/hunter2"), false);
+});
+
+test("known pending impact secrets stay redacted in reducer state", () => {
+	const secret = "hunter2";
+	const projected = applyTuiAction(
+		state({
+			pendingDraft: { ...draft, secret } as ModelManagerDraft,
+			pendingImpact: {
+				recordId: `provider/${secret}`,
+				chains: [],
+				state: [
+					{
+						file: "/safe/state.json",
+						key: `registrations.safe.targets[0]/${secret}`,
+					},
+				],
+				referenced: true,
+			},
+		}),
+		{ type: "confirm-cascade", ack: true },
+	);
+
+	assert.equal(JSON.stringify(projected).includes(secret), false);
+	assert.equal(projected.pendingImpact?.recordId, "[redacted]");
+	assert.equal(projected.pendingImpact?.state[0]?.key, "[redacted]");
+});
+
+test("reducer uses pending impact only as safe confirmation state", () => {
+	const secret = "raw-impact-secret";
+	const projected = applyTuiAction(
+		state({
+			pendingDraft: { ...draft, secret } as ModelManagerDraft,
+			pendingImpact: {
+				recordId: `/private/${secret}`,
+				chains: [
+					{
+						file: `/private/${secret}/models.json`,
+						chainId: `/private/${secret}`,
+						kind: "model-entry",
+					},
+				],
+				state: [],
+				referenced: true,
+			},
+		}),
+		{ type: "confirm-cascade", ack: true },
+	);
+	assert.match(projected.message ?? "", /ready/);
+	assert.equal(JSON.stringify(projected).includes(secret), false);
+	assert.doesNotMatch(JSON.stringify(projected), /\/private\//);
+
+	const submitting = applyTuiAction(projected, { type: "commit-draft" });
+	assert.match(submitting.message ?? "", /submitting/i);
+	assert.equal(JSON.stringify(submitting).includes(secret), false);
+	assert.doesNotMatch(JSON.stringify(submitting), /\/private\//);
+});
+
+test("blocked raw bytes remain opaque and are never rendered as text", () => {
+	const rawBytes = new Uint8Array([0x68, 0x75, 0x6e, 0x74, 0x65, 0x72, 0x32]);
+	const projected = applyTuiAction(
+		state({ blocked: { reason: "malformed", message: "private", rawBytes } }),
+		{ type: "switch-tab", tab: "model-manager" },
+	);
+
+	assert.ok(projected.blocked?.rawBytes instanceof Uint8Array);
+	assert.deepEqual([...projected.blocked?.rawBytes ?? []], [...rawBytes]);
+	const rendered = renderManagerScreen(projected);
+	assert.doesNotMatch(rendered, /104,117,110,116,101,114,50|hunter2/);
+	assert.match(rendered, /raw bytes preserved/);
+});

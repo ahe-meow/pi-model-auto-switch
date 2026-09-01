@@ -36,6 +36,17 @@ export type SafeTransactionResult =
 			conflicts: SafeTransactionConflict[];
 	  };
 
+export interface SafeImpact {
+	recordId: string;
+	chains: Array<{
+		file: string;
+		chainId: string;
+		kind: "model-entry" | "generated-block";
+	}>;
+	state: Array<{ file: string; key: string }>;
+	referenced: boolean;
+}
+
 export type SafeTuiDraft = Omit<ModelManagerDraft, "secret">;
 
 export interface TuiState {
@@ -45,7 +56,7 @@ export interface TuiState {
 	conflict: SafeTransactionResult | null;
 	message: string | null;
 	pendingDraft: SafeTuiDraft | null;
-	pendingImpact: CatalogImpact | null;
+	pendingImpact: SafeImpact | null;
 	failoverSummary: FailoverSummary | null;
 	history: string[];
 }
@@ -80,6 +91,7 @@ const BLOCKED_REASONS: readonly string[] = [
 ];
 const REDACTED_MESSAGE = "[redacted]";
 const SAFE_IDENTITY = /^[A-Za-z0-9._:/@ -]+$/;
+const SAFE_REFERENCE_KEY = /.+/s;
 const SAFE_DISPLAY = /^[A-Za-z0-9][A-Za-z0-9 ._:/@(),'!?-]*$/;
 const SAFE_JSON_BASENAME = /^[A-Za-z0-9][A-Za-z0-9._-]*\.json$/i;
 const SAFE_REVISION = /^(?:missing|[a-f0-9]{16,64})$/i;
@@ -118,8 +130,39 @@ function safeDisplay(value: unknown, secrets: readonly string[] = []): string {
 	return safeBoundedText(value, SAFE_DISPLAY, secrets);
 }
 
+function hasControlCharacter(value: string): boolean {
+	return [...value].some((character) => {
+		const code = character.codePointAt(0) ?? 0;
+		return code <= 0x1f || (code >= 0x7f && code <= 0x9f);
+	});
+}
+
+function hasUnsafePath(value: string): boolean {
+	return (
+		value.startsWith("/") ||
+		value.startsWith("\\") ||
+		/^[A-Za-z]:[\\/]/.test(value) ||
+		value.split(/[\\/]/).some((segment) => segment === "..")
+	);
+}
+
 function safeIdentity(value: unknown, secrets: readonly string[] = []): string {
-	return safeBoundedText(value, SAFE_IDENTITY, secrets);
+	return typeof value === "string" &&
+		!hasUnsafePath(value) &&
+		!hasControlCharacter(value)
+		? safeBoundedText(value, SAFE_IDENTITY, secrets)
+		: REDACTED_MESSAGE;
+}
+
+function safeReferenceKey(
+	value: unknown,
+	secrets: readonly string[] = [],
+): string {
+	return typeof value === "string" &&
+		!hasUnsafePath(value) &&
+		!hasControlCharacter(value)
+		? safeBoundedText(value, SAFE_REFERENCE_KEY, secrets)
+		: REDACTED_MESSAGE;
 }
 
 function safePath(value: unknown, secrets: readonly string[] = []): string {
@@ -375,9 +418,9 @@ function sanitizeFailoverSummary(
 function sanitizeImpactForState(
 	impact: CatalogImpact | null,
 	secrets: readonly string[],
-): CatalogImpact | null {
+): SafeImpact | null {
 	if (!isObjectRecord(impact)) return null;
-	const chains: CatalogImpact["chains"] = [];
+	const chains: SafeImpact["chains"] = [];
 	if (Array.isArray(impact.chains)) {
 		for (const entry of impact.chains) {
 			if (!isObjectRecord(entry)) continue;
@@ -393,13 +436,13 @@ function sanitizeImpactForState(
 			});
 		}
 	}
-	const stateReferences: CatalogImpact["state"] = [];
+	const stateReferences: SafeImpact["state"] = [];
 	if (Array.isArray(impact.state)) {
 		for (const entry of impact.state) {
 			if (!isObjectRecord(entry)) continue;
 			stateReferences.push({
 				file: safePath(entry.file, secrets),
-				key: safeIdentity(entry.key, secrets),
+				key: safeReferenceKey(entry.key, secrets),
 			});
 		}
 	}
