@@ -32,7 +32,7 @@ export type SafeTransactionResult =
 	| {
 			ok: false;
 			phase: "prepare" | "commit";
-			status: "failed";
+			status: "conflict";
 			conflicts: SafeTransactionConflict[];
 	  };
 
@@ -73,82 +73,147 @@ const BLOCKED_REASONS: readonly string[] = [
 	"unreadable",
 ];
 const REDACTED_MESSAGE = "[redacted]";
-const SENSITIVE_MARKER = /(?:secret|api[_-]?key|access[_-]?token|password|bearer|sk-[a-z0-9])/i;
-const SAFE_ID = /^[a-z][a-z0-9]*(?:[-_./][a-z0-9]+)*$/i;
-const SAFE_PATH = /^(?:[a-z0-9._-]+\/)*[a-z0-9._-]+$/i;
-const SAFE_REVISION = /^(?:missing|expected-\d+|actual-\d+|[a-f0-9]{8,64})$/i;
-
-type SafeTextKind = "display" | "id" | "model" | "path" | "revision";
+const SAFE_IDENTITY = /^[A-Za-z0-9._:/@ -]+$/;
+const SAFE_DISPLAY = /^[A-Za-z0-9][A-Za-z0-9 ._:/@(),'!?-]*$/;
+const SAFE_JSON_BASENAME = /^[A-Za-z0-9][A-Za-z0-9._-]*\.json$/i;
+const SAFE_REVISION = /^[a-f0-9]{16,64}$/i;
+const SECRET_FIELD_NAME = /(?:secret|api[_-]?key|token|password|bearer|credential|authorization|private[_-]?key)/i;
+const MAX_SAFE_COUNT = 100_000;
 
 function compareText(a: string, b: string): number {
 	return a < b ? -1 : a > b ? 1 : 0;
 }
 
-function knownSecrets(state: TuiState): readonly string[] {
-	const secret = state.pendingDraft?.secret;
-	return typeof secret === "string" && secret.length > 0 ? [secret] : [];
+function safeBoundedText(value: unknown, pattern: RegExp): string {
+	return typeof value === "string" && value.length > 0 && value.length <= 128 && pattern.test(value)
+		? value
+		: REDACTED_MESSAGE;
 }
 
-function looksLikeOpaqueValue(value: string, _kind: SafeTextKind): boolean {
-	const chunks = value.split(/[-_./]/).filter(Boolean);
-	const longChunks = chunks.filter((chunk) => chunk.length >= 4).length;
-	return (
-		(value.length >= 16 && /[a-z]/i.test(value) && /\d/.test(value)) ||
-		(!(_kind === "model" && value.includes("/")) &&
-			value.length >= 18 && chunks.length >= 3 && longChunks >= 2)
-	);
+function safeDisplay(value: unknown): string {
+	return safeBoundedText(value, SAFE_DISPLAY);
 }
 
-function safeText(
-	value: unknown,
-	secrets: readonly string[] = [],
-	kind: SafeTextKind = "display",
-): string {
-	if (typeof value !== "string" || value.length === 0 || value.length > 128) {
-		return REDACTED_MESSAGE;
-	}
-	if (secrets.some((secret) => secret.length > 0 && value.includes(secret))) {
-		return REDACTED_MESSAGE;
-	}
-	if (SENSITIVE_MARKER.test(value) || looksLikeOpaqueValue(value, kind)) {
-		return REDACTED_MESSAGE;
-	}
-	const pattern =
-		kind === "id" || kind === "model"
-			? SAFE_ID
-			: kind === "path"
-				? SAFE_PATH
-				: kind === "revision"
-					? SAFE_REVISION
-					: /^[A-Za-z0-9][A-Za-z0-9 ._:/(),'!?-]*$/;
-	return pattern.test(value) ? value : REDACTED_MESSAGE;
+function safeIdentity(value: unknown): string {
+	return safeBoundedText(value, SAFE_IDENTITY);
 }
 
-function safeMessage(value: unknown, secrets: readonly string[]): string {
+function safePath(value: unknown): string {
+	if (typeof value !== "string") return REDACTED_MESSAGE;
+	const basename = value.replace(/\\/g, "/").split("/").at(-1) ?? "";
+	return basename.length <= 128 && SAFE_JSON_BASENAME.test(basename)
+		? basename
+		: REDACTED_MESSAGE;
+}
+
+function safeRevision(value: unknown): string {
+	return typeof value === "string" && SAFE_REVISION.test(value)
+		? value
+		: REDACTED_MESSAGE;
+}
+
+function safeCount(value: unknown): string {
+	return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= MAX_SAFE_COUNT
+		? String(value)
+		: REDACTED_MESSAGE;
+}
+
+function safeMessage(value: unknown): string {
 	if (typeof value !== "string") return REDACTED_MESSAGE;
 	const staticMessages = new Set([
 		"Transaction committed",
 		"Submitting draft",
+		"No draft to submit",
+		"Record selected",
+		"Delete requested; impact analysis pending",
 		"Cascade confirmation declined",
-		"Cascade confirmed; no draft to commit",
+		"Cascade confirmation ignored; draft and impact required",
 		"commit-draft: ready after cascade confirmation",
 		"已取消，未写入",
 	]);
 	if (staticMessages.has(value)) return value;
-	let match = /^(Selected record): (.+)$/.exec(value);
-	if (match) return `${match[1]}: ${safeText(match[2], secrets, "id")}`;
-	match = /^(Delete requested for) (.+)(; impact analysis pending)$/.exec(value);
-	if (match) {
-		return `${match[1]} ${safeText(match[2], secrets, "id")}${match[3]}`;
-	}
-	if (/^(Raw|Environment) input accepted \(\d+ key\(s\)\)$/.test(value)) {
-		return value;
-	}
+	const match = /^(Raw|Environment) input accepted \((\d{1,6}) key\(s\)\)$/.exec(value);
+	if (match && Number(match[2]) <= MAX_SAFE_COUNT) return value;
 	if (/^(Raw|Environment) input rejected: invalid batch; sensitive values omitted$/.test(value)) {
 		return value;
 	}
 	if (/^Transaction (prepare|commit) failed$/.test(value)) return value;
 	return REDACTED_MESSAGE;
+}
+
+function safeHistoryEntry(value: unknown): string {
+	if (
+		value === "Transaction committed" ||
+		(typeof value === "string" && /^Transaction (prepare|commit) failed$/.test(value))
+	) {
+		return safeMessage(value);
+	}
+	const message = safeMessage(value);
+	return /^(Raw|Environment) input /.test(message) ? message : REDACTED_MESSAGE;
+}
+
+type SanitizedDraftValue =
+	| string
+	| number
+	| boolean
+	| null
+	| undefined
+	| SanitizedDraftValue[]
+	| { [key: string]: SanitizedDraftValue };
+
+function sanitizeAdvancedValue(
+	value: unknown,
+	seen = new WeakSet<object>(),
+): SanitizedDraftValue {
+	if (
+		value === null ||
+		typeof value === "string" ||
+		typeof value === "number" ||
+		typeof value === "boolean" ||
+		value === undefined
+	) {
+		return value;
+	}
+	if (typeof value !== "object" || seen.has(value)) return undefined;
+	seen.add(value);
+	if (Array.isArray(value)) {
+		const sanitized = value.map((item) => sanitizeAdvancedValue(item, seen));
+		seen.delete(value);
+		return sanitized;
+	}
+	const sanitized: { [key: string]: SanitizedDraftValue } = {};
+	for (const [key, item] of Object.entries(value)) {
+		if (SECRET_FIELD_NAME.test(key)) continue;
+		const next = sanitizeAdvancedValue(item, seen);
+		if (next !== undefined) sanitized[key] = next;
+	}
+	seen.delete(value);
+	return sanitized;
+}
+
+export function sanitizeDraftForState(
+	draft: ModelManagerDraft | null,
+): ModelManagerDraft | null {
+	if (!draft) return null;
+	const fields: ModelManagerDraft["fields"] = {
+		providerAlias: draft.fields.providerAlias,
+		providerName: draft.fields.providerName,
+		modelId: draft.fields.modelId,
+	};
+	if (draft.fields.label !== undefined) fields.label = draft.fields.label;
+	if (draft.fields.remoteGroup !== undefined) fields.remoteGroup = draft.fields.remoteGroup;
+	if (draft.fields.groupOwner !== undefined) fields.groupOwner = draft.fields.groupOwner;
+	if (draft.fields.multiplier !== undefined) fields.multiplier = draft.fields.multiplier;
+	const advanced = sanitizeAdvancedValue(draft.advanced);
+	const sanitized: ModelManagerDraft = {
+		kind: draft.kind,
+		fields,
+		advanced: advanced && typeof advanced === "object" && !Array.isArray(advanced)
+			? advanced as Record<string, unknown>
+			: {},
+	};
+	if (draft.recordId !== undefined) sanitized.recordId = draft.recordId;
+	return sanitized;
 }
 
 function renderTabs(active: ManagerTab): string {
@@ -158,29 +223,25 @@ function renderTabs(active: ManagerTab): string {
 }
 
 function renderMessage(state: TuiState, lines: string[]): void {
-	if (state.message) lines.push(`Message: ${safeMessage(state.message, knownSecrets(state))}`);
+	if (state.message) lines.push(`Message: ${safeMessage(state.message)}`);
 }
 
 function renderTransactionResult(
 	result: SafeTransactionResult,
 	lines: string[],
-	secrets: readonly string[],
 ): void {
 	if (result.ok) {
-		const count = Number.isSafeInteger(result.committedCount) && result.committedCount >= 0
-			? result.committedCount
-			: 0;
-		lines.push(`Transaction committed: ${count} file(s)`);
+		lines.push(`Transaction committed: ${safeCount(result.committedCount)} file(s)`);
 		return;
 	}
 
 	const phase = result.phase === "commit" ? "commit" : "prepare";
 	lines.push(`Transaction failed during ${phase}`);
-	lines.push("Status: failed");
+	lines.push("Status: conflict");
 	if (!Array.isArray(result.conflicts)) return;
 	for (const [index, conflict] of result.conflicts.entries()) {
 		lines.push(
-			`Conflict ${index + 1} ${safeText(conflict?.path, secrets, "path")} expect=${safeText(conflict?.expectRevision, secrets, "revision")} actual=${safeText(conflict?.actualRevision, secrets, "revision")}`,
+			`Conflict ${index + 1} ${safePath(conflict?.path)} expect=${safeRevision(conflict?.expectRevision)} actual=${safeRevision(conflict?.actualRevision)}`,
 		);
 	}
 }
@@ -197,14 +258,13 @@ function renderBlocked(
 
 export function renderManagerScreen(state: TuiState): string {
 	const lines = [renderTabs(state.tab), "Model Manager"];
-	const secrets = knownSecrets(state);
 	if (state.snapshot) {
 		for (const group of groupRecordsForDisplay(state.snapshot.records)) {
-			lines.push(`Group: ${safeText(group.title, secrets, "id")}`);
+			lines.push(`Group: ${safeIdentity(group.title)}`);
 			for (const record of group.items) {
 				const label = record.label ?? record.modelId;
 				lines.push(
-					`- ${safeText(label, secrets)} (${safeText(record.id, secrets, "id")}) ${safeText(record.providerAlias, secrets, "id")}`,
+					`- ${safeDisplay(label)} (${safeIdentity(record.id)}) ${safeIdentity(record.providerAlias)}`,
 				);
 			}
 		}
@@ -212,7 +272,7 @@ export function renderManagerScreen(state: TuiState): string {
 		lines.push("No catalog snapshot");
 	}
 	if (state.blocked) renderBlocked(state.blocked, lines);
-	if (state.conflict) renderTransactionResult(state.conflict, lines, secrets);
+	if (state.conflict) renderTransactionResult(state.conflict, lines);
 	renderMessage(state, lines);
 	return lines.join("\n");
 }
@@ -221,11 +281,10 @@ export function renderFailoverScreen(state: TuiState): string {
 	const lines = [renderTabs(state.tab), "Failover Chains"];
 	const summary = state.failoverSummary;
 	if (summary) {
-		lines.push(`Chains: ${summary.chainCount} chain(s)`);
-		const secrets = knownSecrets(state);
+		lines.push(`Chains: ${safeCount(summary.chainCount)} chain(s)`);
 		if (Array.isArray(summary.entries)) for (const entry of summary.entries) {
 			lines.push(
-				`- ${safeText(entry?.chainId, secrets, "id")}: ${safeText(entry?.model, secrets, "model")}`,
+				`- ${safeIdentity(entry?.chainId)}: ${safeIdentity(entry?.model)}`,
 			);
 		}
 	} else {
@@ -237,12 +296,11 @@ export function renderFailoverScreen(state: TuiState): string {
 
 export function renderHistoryScreen(state: TuiState): string {
 	const lines = [renderTabs(state.tab), "History"];
-	const secrets = knownSecrets(state);
 	if (state.history.length === 0) {
 		lines.push("No history");
 	} else {
 		for (const [index, entry] of state.history.slice().reverse().entries()) {
-			lines.push(`${index + 1}. ${safeText(entry, secrets)}`);
+			lines.push(`${index + 1}. ${safeHistoryEntry(entry)}`);
 		}
 	}
 	renderMessage(state, lines);
@@ -291,73 +349,82 @@ function exhaustive(action: never): never {
 }
 
 export function applyTuiAction(state: TuiState, action: TuiAction): TuiState {
+	const current: TuiState = {
+		...state,
+		pendingDraft: sanitizeDraftForState(state.pendingDraft),
+	};
 	switch (action.type) {
 		case "switch-tab":
-			return TAB_ORDER.includes(action.tab) ? { ...state, tab: action.tab } : state;
+			return TAB_ORDER.includes(action.tab) ? { ...current, tab: action.tab } : current;
 		case "select-record":
-			return { ...state, message: `Selected record: ${safeText(action.recordId)}` };
+			return { ...current, message: "Record selected" };
 		case "raw-input-submit": {
 			const result = parseRawKeys(action.text);
 			return {
-				...state,
+				...current,
 				message: parserMessage("Raw input", result.accepted, result.entries.length),
 			};
 		}
 		case "environment-submit": {
-			const result = parseEnvironmentKeys(action.names, process.env);
+			const result = parseEnvironmentKeys(action.names, {});
 			return {
-				...state,
+				...current,
 				message: parserMessage("Environment input", result.accepted, result.entries.length),
 			};
 		}
 		case "request-delete":
 			return {
-				...state,
+				...current,
 				pendingImpact: null,
-				message: `Delete requested for ${safeText(action.recordId)}; impact analysis pending`,
+				message: "Delete requested; impact analysis pending",
 			};
 		case "confirm-cascade":
 			return {
-				...state,
-				message: action.ack
-					? state.pendingDraft
+				...current,
+				message: !action.ack
+					? "Cascade confirmation declined"
+					: current.pendingDraft && current.pendingImpact
 						? "commit-draft: ready after cascade confirmation"
-						: "Cascade confirmed; no draft to commit"
-					: "Cascade confirmation declined",
+						: "Cascade confirmation ignored; draft and impact required",
 			};
 		case "commit-draft":
-			return { ...state, message: "Submitting draft" };
+			return {
+				...current,
+				message: current.pendingDraft ? "Submitting draft" : "No draft to submit",
+			};
 		case "cancel-draft":
 			return {
-				...state,
+				...current,
 				pendingDraft: null,
 				pendingImpact: null,
 				message: "已取消，未写入",
 			};
 		case "transaction-result": {
-			const conflict: SafeTransactionResult = action.result.ok
-				? {
-						ok: true,
-						committedCount: Array.isArray(action.result.committed)
-							? action.result.committed.length
-							: 0,
-				  }
-				: {
-						ok: false,
-						phase: action.result.phase === "commit" ? "commit" : "prepare",
-						status: "failed",
-						conflicts: Array.isArray(action.result.conflicts)
-							? action.result.conflicts.map((entry) => ({
-									path: safeText(entry.path, [], "path"),
-									expectRevision: safeText(entry.expectRevision, [], "revision"),
-									actualRevision: safeText(entry.actualRevision, [], "revision"),
-								  }))
-							: [],
-				  };
+			if (action.result.ok) {
+				return {
+					...current,
+					conflict: null,
+					pendingDraft: null,
+					pendingImpact: null,
+					message: "Transaction committed",
+				};
+			}
+			const conflict: SafeTransactionResult = {
+				ok: false,
+				phase: action.result.phase === "commit" ? "commit" : "prepare",
+				status: "conflict",
+				conflicts: Array.isArray(action.result.conflicts)
+					? action.result.conflicts.map((entry) => ({
+							path: safePath(entry.path),
+							expectRevision: safeRevision(entry.expectRevision),
+							actualRevision: safeRevision(entry.actualRevision),
+						  }))
+					: [],
+			};
 			return {
-				...state,
+				...current,
 				conflict,
-				message: conflict.ok ? "Transaction committed" : `Transaction ${conflict.phase} failed`,
+				message: `Transaction ${conflict.phase} failed`,
 			};
 		}
 		default:
