@@ -1669,3 +1669,20 @@ export default async function modelFailoverExtension(
 ): Promise<void> {
 	await registerFailoverExtension(pi);
 }
+
+export {
+	buildVirtualModel,
+	notifyModelManagerDelete,
+	registerFailoverChain,
+	registerModelManagerBridge,
+	selectCatalogRecordsForChains,
+} from "./model-manager-bridge.ts";
+import { renderManagerScreen } from "./model-manager-tui.ts";
+export { renderManagerScreen };
+export type { ModelManagerBridge } from "./model-manager-bridge.ts";
+
+export const modelManagerCommand = Object.freeze({
+	name: "failover",
+	initialScreen: "Model Manager",
+	render: renderManagerScreen,
+});
