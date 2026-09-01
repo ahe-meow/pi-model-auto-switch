@@ -290,6 +290,16 @@ test("applyTuiAction handles parser, delete, and confirmation semantics without 
 	assert.doesNotMatch(declined.message ?? "", /ready|write/i);
 });
 
+test("request-delete clears stale pending draft and impact", () => {
+	const requested = applyTuiAction(
+		state({ pendingDraft: draft, pendingImpact: impact }),
+		{ type: "request-delete", recordId: "next" },
+	);
+	assert.equal(requested.pendingDraft, null);
+	assert.equal(requested.pendingImpact, null);
+	assert.equal(requested.message, "Delete requested; impact analysis pending");
+});
+
 test("applyTuiAction keeps invalid batches safe and never includes the submitted key", () => {
 	const secret = "tui-secret-value";
 	const raw = applyTuiAction(state(), {
@@ -442,7 +452,7 @@ test("all three screens omit low-entropy secrets from untrusted state shapes", (
 });
 
 test("transaction-result stores only a safe conflict projection", () => {
-	const secret = "opaque-canary-8f42c17b";
+	const secret = "opaque-canary-value";
 	const result: TransactionResult = {
 		ok: false,
 		phase: "prepare",

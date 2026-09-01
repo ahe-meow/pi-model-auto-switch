@@ -696,6 +696,7 @@ export function applyTuiAction(state: TuiState, action: TuiAction): TuiState {
 		case "request-delete":
 			return {
 				...current,
+				pendingDraft: null,
 				pendingImpact: null,
 				message: "Delete requested; impact analysis pending",
 			};
