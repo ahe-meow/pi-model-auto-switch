@@ -19,6 +19,11 @@ import {
 	type GeneratedConfigV8LoadResult,
 } from "./generated-config.ts";
 import type { ConfigSourceRevision } from "./json-file.ts";
+import type { CatalogImpact } from "./model-manager-impact.ts";
+import {
+	registerFailoverChain as registerChain,
+	registerModelManagerBridge as installModelManagerBridge,
+} from "./model-manager-bridge.ts";
 import {
 	FAILOVER_PROVIDER_ID,
 	type TargetCatalogMetadata,
@@ -51,6 +56,7 @@ import {
 	type FailoverTuiActions,
 	type FailoverTuiView,
 } from "./tui.ts";
+import { renderManagerScreen, type TuiState } from "./model-manager-tui.ts";
 import {
 	modelKey,
 	REASONING_EFFORTS,
@@ -129,7 +135,13 @@ export interface TargetRuntime {
 export interface RegisterFailoverExtensionOptions {
 	targetRuntime?: TargetRuntime;
 	sharedState?: SharedStateAdapter;
+	modelManagerDeleteCoordinator?: ModelManagerDeleteCoordinator;
 }
+
+export type ModelManagerDeleteCoordinator = (
+	recordId: string,
+	impact: CatalogImpact,
+) => Promise<void>;
 
 interface RuntimeState {
 	config: GeneratedFailoverConfigV8;
@@ -148,6 +160,8 @@ interface RuntimeState {
 	sessionContext: ExtensionContext | undefined;
 	sessionPersistable: boolean;
 	chainOperation: Promise<void>;
+	chainRegistrations: Array<() => void>;
+	modelManagerBridgeCleanup: (() => void) | undefined;
 	refreshConfig: () => Promise<boolean>;
 	refreshProvider: () => void;
 }
@@ -486,6 +500,7 @@ function applyConfig(
 		copy,
 		runtime.targetRuntime,
 	);
+	syncRegisteredFailoverChains(runtime);
 	clearStaleConfigWarnings(runtime);
 }
 
@@ -566,6 +581,34 @@ function serializeChainOperation<T>(
 	return current;
 }
 
+function syncRegisteredFailoverChains(runtime: RuntimeState): void {
+	for (const cleanup of runtime.chainRegistrations) cleanup();
+	runtime.chainRegistrations = runtime.config.models.map((model) =>
+		registerChain(model.id),
+	);
+}
+
+export function runModelManagerDelete(
+	coordinator: ModelManagerDeleteCoordinator | undefined,
+	recordId: string,
+	impact: CatalogImpact,
+): Promise<void> {
+	return coordinator?.(recordId, impact) ?? Promise.resolve();
+}
+
+function registerRuntimeModelManagerBridge(
+	runtime: RuntimeState,
+	coordinator: ModelManagerDeleteCoordinator | undefined,
+): void {
+	runtime.modelManagerBridgeCleanup?.();
+	runtime.modelManagerBridgeCleanup = installModelManagerBridge({
+		onDeleteRecord: (recordId, impact) =>
+			serializeChainOperation(runtime, () =>
+				runModelManagerDelete(coordinator, recordId, impact),
+			),
+	});
+}
+
 async function reconcileApplyAndRefreshInternal(
 	runtime: RuntimeState,
 	config: GeneratedFailoverConfigV8,
@@ -638,6 +681,8 @@ function initialRuntime(
 		sessionContext: undefined,
 		sessionPersistable: false,
 		chainOperation: Promise.resolve(),
+		chainRegistrations: [],
+		modelManagerBridgeCleanup: undefined,
 		refreshConfig: async () => true,
 		refreshProvider: () => undefined,
 	};
@@ -906,6 +951,7 @@ function blockChain(
 	runtime.providerState.config = { models: [] };
 	runtime.providerState.metadata = [];
 	runtime.providerState.availableTargetKeys = new Set();
+	syncRegisteredFailoverChains(runtime);
 	if (refreshProvider) runtime.refreshProvider();
 }
 
@@ -1491,6 +1537,34 @@ function createDelegate(runtime: RuntimeState): Delegate {
 	};
 }
 
+function emptyModelManagerState(): TuiState {
+	return {
+		tab: "model-manager",
+		snapshot: null,
+		blocked: null,
+		conflict: null,
+		message: null,
+		pendingDraft: null,
+		pendingImpact: null,
+		failoverSummary: null,
+		history: [],
+	};
+}
+
+async function openModelManager(ctx: ExtensionContext): Promise<void> {
+	await ctx.ui.custom<void>((tui, _theme, _keybindings, done) => {
+		const state = emptyModelManagerState();
+		return {
+			render: (_width: number) => renderManagerScreen(state).split("\n"),
+			invalidate: () => undefined,
+				handleInput: (data: string) => {
+					if (data === "q" || data === "\u001b") done();
+					else tui.requestRender();
+				},
+		};
+	});
+}
+
 function registerFailoverCommand(
 	pi: ExtensionAPI,
 	runtime: RuntimeState,
@@ -1519,6 +1593,10 @@ function registerFailoverCommand(
 						},
 					};
 				});
+				return;
+			}
+			if (subcommand === "") {
+				await openModelManager(ctx);
 				return;
 			}
 			await refreshSessionConfig(runtime);
@@ -1590,7 +1668,7 @@ function resolveRegistrationOptions(
 ): RegisterFailoverExtensionOptions {
 	const options = isTargetRuntime(targetRuntimeOrOptions)
 		? { targetRuntime: targetRuntimeOrOptions }
-		: { ...(targetRuntimeOrOptions ?? {}) };
+		: { ...targetRuntimeOrOptions };
 	if (isSharedStateAdapter(sharedStateOrOptions))
 		options.sharedState = sharedStateOrOptions;
 	else if (sharedStateOrOptions?.sharedState)
@@ -1644,6 +1722,11 @@ export async function registerFailoverExtension(
 	pi.registerProvider(provider as never);
 	runtime.refreshProvider = () => pi.registerProvider(provider as never);
 
+	registerRuntimeModelManagerBridge(
+		runtime,
+		options.modelManagerDeleteCoordinator,
+	);
+
 	pi.on("session_start", async (_event, ctx) => {
 		runtime.history = restoreHistory(ctx.sessionManager.getEntries());
 		runtime.lastTransition = runtime.history[0];
@@ -1658,6 +1741,10 @@ export async function registerFailoverExtension(
 		await refreshOwnedTargetRuntime(runtime);
 	});
 	pi.on("session_shutdown", () => {
+		runtime.modelManagerBridgeCleanup?.();
+		runtime.modelManagerBridgeCleanup = undefined;
+		for (const cleanup of runtime.chainRegistrations) cleanup();
+		runtime.chainRegistrations = [];
 		runtime.sessionContext = undefined;
 		runtime.sessionPersistable = false;
 	});
@@ -1677,7 +1764,7 @@ export {
 	registerModelManagerBridge,
 	selectCatalogRecordsForChains,
 } from "./model-manager-bridge.ts";
-import { renderManagerScreen } from "./model-manager-tui.ts";
+
 export { renderManagerScreen };
 export type { ModelManagerBridge } from "./model-manager-bridge.ts";
 
