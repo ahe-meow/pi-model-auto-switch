@@ -170,7 +170,9 @@ The main chain list and each detail target chain keep a 20-row viewport with a v
 
 The TUI allows the user to select, reorder, add, and remove chain targets. From chain detail, `Enter` opens target override settings for the selected target; `t` opens separate `Chain Settings: generated-model-id`; `p` is inert. Target override fields are error behavior, max retries, no-progress timeout, reasoning effort, and four independent model-parameter toggles, each of which can be `inherit`. In chain detail, `e` toggles global enablement for the selected real target; in the main list, `e` toggles generated-chain enablement. TUI write actions execute serially so rapid keypresses operate on the latest ordered list. Chain changes auto-save to `getAgentDir()/model-failover.json`; scope and override changes auto-save to the fixed shared state file.
 
-The Footer omits the `Failover:` prefix and shows the active real target plus the mapped reasoning value. A target switch updates the Footer and current-session history with source, target, and sanitized reason. No separate transition popup is emitted. Chain exhaustion is returned as a terminal failure summary containing attempted targets and safe reasons.
+The empty `/failover` branch is now a catalog-backed Model Manager runtime. It reads `MODELS_JSON_PATH` and the adjacent `model-manager.json` sidecar with `readModelCatalog`, keeps the real snapshot and blocked state in `TuiState`, and selects the existing `renderManagerScreen`, `renderFailoverScreen`, or `renderHistoryScreen` from the fixed tab order. `1`/`2`/`3` and Tab dispatch tab actions; `r` and `v` collect Raw/Environment submissions and dispatch parser actions; `c` dispatches cancel; `d` performs read-only impact analysis; `y`/`n` dispatch cascade confirmation; and delete completion dispatches the existing transaction-result action. The loop is intentionally a release-sized shell: Raw/Environment submissions report reducer results but do not yet create records, and create/edit/clone forms remain outside this release. The existing `history` subcommand and non-empty Failover editor remain separate.
+
+Deletion is the one write path wired from this screen. `commitDeleteDraft` re-reads the current sidecar, requires an exact record/impact/ack match, applies `{ remove: [recordId] }`, serializes the sidecar, and uses the existing catalog transaction for revision-checked commit. It notifies the registered Model Manager bridge only after the sidecar commit succeeds. The bridge is already serialized through Failover's `chainOperation`; Model Manager never writes `model-failover.json`, `failover-state.json`, or generated provider content.
 
 Reset and recovery actions operate on shared target state. Direct restore does not run a test request.
 
@@ -228,7 +230,7 @@ Transition history is bounded to 100 entries for the selected session. Persisted
 - [x] Global target enablement, cooldown, failures, `nextEligibleAt`, cumulative cooldown, and manual recovery remain outside chain-scope policy; legacy `lease` input is stripped on write.
 - [x] Historical error tool results remain request context and do not synthesize a provider failure; Pi tool execution stays outside provider classification.
 - [x] Credential material is redacted, provider text is bounded, C0/C1 controls are removed, and unsafe history entries are rejected.
-- [x] Final full custom-loader verification passed 209/209; `git diff --check` passed; primary LSP diagnostics reported 0 findings across the 7 core files.
+- [x] The historical Failover v8 baseline recorded in the earlier report was 209/209; that number is not a current full-suite result. The current Model Manager release acceptance is the explicit ten-file suite, with its latest result recorded in the development report.
 - [x] `node ./node_modules/typescript/lib/tsc.js --noEmit --pretty false` passed. An isolated live `failover/orc-peon` smoke passed through real Pi/provider authentication with exit code 0, exact marker `REAL_FAILOVER_SMOKE_OK`, empty stderr, and no 401, 403, or model-unavailable result; it did not force a first-target failure or verify an automatic switch.
 
 Verification commands:
@@ -249,7 +251,7 @@ The Model Manager path is split into small ownership boundaries:
 - `model-manager-catalog`: read-only Pi provider adaptation and the sanitized catalog snapshot.
 - `model-manager-store`: normalized revisions, fixed dictionary-order file locks, CAS checks, atomic writes, and rollback.
 - `model-manager-impact`: read-only chain/generated-block/state reference analysis and cascade confirmation.
-- `model-manager-operations`: create/edit/clone drafts, secret-free previews, and transaction submission.
+- `model-manager-operations`: create/edit/clone drafts, secret-free previews, transaction submission, and the confirmed sidecar-only delete coordinator.
 - `model-manager-tui`: the three-screen renderers and pure reducer; it does not perform I/O.
 - `model-manager-bridge`: explicit Failover chain registration, virtual-model gating, and the delete notification seam.
 

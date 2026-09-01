@@ -1,4 +1,4 @@
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -19,11 +19,19 @@ import {
 	type GeneratedConfigV8LoadResult,
 } from "./generated-config.ts";
 import type { ConfigSourceRevision } from "./json-file.ts";
-import type { CatalogImpact } from "./model-manager-impact.ts";
+import {
+	analyzeDeletionImpact,
+	type CatalogImpact,
+} from "./model-manager-impact.ts";
+import {
+	commitDeleteDraft,
+	type ModelManagerDraft,
+} from "./model-manager-operations.ts";
 import {
 	registerFailoverChain as registerChain,
 	registerModelManagerBridge as installModelManagerBridge,
 } from "./model-manager-bridge.ts";
+import { readModelCatalog } from "./model-manager-catalog.ts";
 import {
 	FAILOVER_PROVIDER_ID,
 	type TargetCatalogMetadata,
@@ -39,6 +47,7 @@ import {
 } from "./provider.ts";
 import {
 	createFileSharedState,
+	FAILOVER_STATE_PATH,
 	type Inheritable,
 	type LegacyTargetCandidate,
 	type ReconcileRegistrationResult,
@@ -56,7 +65,16 @@ import {
 	type FailoverTuiActions,
 	type FailoverTuiView,
 } from "./tui.ts";
-import { renderManagerScreen, type TuiState } from "./model-manager-tui.ts";
+import {
+	applyTuiAction,
+	renderFailoverScreen,
+	renderHistoryScreen,
+	renderManagerScreen,
+	TAB_ORDER,
+	type FailoverSummary,
+	type TuiAction,
+	type TuiState,
+} from "./model-manager-tui.ts";
 import {
 	modelKey,
 	REASONING_EFFORTS,
@@ -70,6 +88,10 @@ import {
 
 export const FAILOVER_CONFIG_PATH = join(getAgentDir(), "model-failover.json");
 export const MODELS_JSON_PATH = join(getAgentDir(), "models.json");
+export const MODEL_MANAGER_SIDECAR_PATH = join(
+	dirname(MODELS_JSON_PATH),
+	"model-manager.json",
+);
 
 const AGENT_DIRECTORY = resolve(getAgentDir());
 const FAILOVER_TRANSITION_ENTRY_TYPE = "pi-model-failover/transition-v1";
@@ -1555,16 +1577,190 @@ function emptyModelManagerState(): TuiState {
 	};
 }
 
-async function openModelManager(ctx: ExtensionContext): Promise<void> {
+function failoverSummary(runtime: RuntimeState): FailoverSummary {
+	const entries = runtime.config.models.map((model) => ({
+		chainId: model.id,
+		model: model.name,
+	}));
+	return { chainCount: entries.length, entries };
+}
+
+function deleteDraftForRecord(record: {
+	id: string;
+	providerAlias: string;
+	providerName: string;
+	modelId: string;
+}): ModelManagerDraft {
+	return {
+		kind: "edit",
+		recordId: record.id,
+		fields: {
+			providerAlias: record.providerAlias,
+			providerName: record.providerName,
+			modelId: record.modelId,
+		},
+		advanced: {},
+	};
+}
+
+function managerTransactionResult(
+	result: Awaited<ReturnType<typeof commitDeleteDraft>>,
+): import("./model-manager-store.ts").TransactionResult {
+	if (result.ok) return { ok: true, committed: result.value.committed };
+	return {
+		ok: false,
+		phase:
+			"code" in result.error && result.error.code === "transaction-commit-failed"
+				? "commit"
+				: "prepare",
+		code: "code" in result.error ? result.error.code : "delete-failed",
+		message: "Model Manager delete failed",
+	};
+}
+
+function managerScreen(state: TuiState): string {
+	if (state.tab === "failover-chains") return renderFailoverScreen(state);
+	if (state.tab === "history") return renderHistoryScreen(state);
+	return renderManagerScreen(state);
+}
+
+async function readModelManagerState(
+	runtime: RuntimeState,
+	state: TuiState,
+): Promise<TuiState> {
+	const catalog = await readModelCatalog(
+		MODELS_JSON_PATH,
+		MODEL_MANAGER_SIDECAR_PATH,
+	);
+	return {
+		...state,
+		snapshot: catalog.ok ? catalog.value : null,
+		blocked:
+			!catalog.ok && "reason" in catalog.error ? catalog.error : null,
+		failoverSummary: failoverSummary(runtime),
+	};
+}
+
+async function openModelManager(
+	ctx: ExtensionContext,
+	runtime: RuntimeState,
+): Promise<void> {
+	await refreshSessionConfig(runtime, false);
+	await refreshSharedSnapshot(runtime);
+	let state = await readModelManagerState(runtime, emptyModelManagerState());
+	let selectedIndex = 0;
+	let selectedRecordId = state.snapshot?.records[0]?.id;
+	let inputMode: "raw" | "environment" | undefined;
+	let inputBuffer = "";
+	let pendingImpact: CatalogImpact | undefined;
+
+	const dispatch = (action: TuiAction): void => {
+		state = applyTuiAction(state, action);
+	};
+	const requestDelete = async (): Promise<void> => {
+		const snapshot = state.snapshot;
+		const record = snapshot?.records.find((entry) => entry.id === selectedRecordId);
+		if (!snapshot || !record) return;
+		dispatch({ type: "request-delete", recordId: record.id });
+		const impact = await analyzeDeletionImpact(snapshot, record.id, {
+			chainsPath: FAILOVER_CONFIG_PATH,
+			statePath: FAILOVER_STATE_PATH,
+		});
+		if (!impact.ok) return;
+		pendingImpact = impact.value;
+		state = {
+			...state,
+			pendingDraft: deleteDraftForRecord(record),
+			pendingImpact: impact.value,
+		};
+	};
+	const confirmDelete = async (ack: boolean): Promise<void> => {
+		dispatch({ type: "confirm-cascade", ack });
+		if (!ack || !pendingImpact || !selectedRecordId || !state.snapshot) return;
+		dispatch({ type: "commit-draft" });
+		const result = await commitDeleteDraft(selectedRecordId, {
+			snapshot: state.snapshot,
+			sidecarPath: MODEL_MANAGER_SIDECAR_PATH,
+			impact: pendingImpact,
+			confirmation: { recordId: selectedRecordId, ack: true },
+		});
+		dispatch({ type: "transaction-result", result: managerTransactionResult(result) });
+		if (result.ok) {
+			pendingImpact = undefined;
+			selectedIndex = 0;
+			state = await readModelManagerState(runtime, state);
+			selectedRecordId = state.snapshot?.records[0]?.id;
+		}
+	};
+
 	await ctx.ui.custom<void>((tui, _theme, _keybindings, done) => {
-		const state = emptyModelManagerState();
+		const submitInput = (): void => {
+			if (inputMode === "raw") {
+				dispatch({ type: "raw-input-submit", text: inputBuffer });
+			} else if (inputMode === "environment") {
+				dispatch({
+					type: "environment-submit",
+					names: inputBuffer
+						.split(/[\n,]/)
+						.map((name) => name.trim())
+						.filter(Boolean),
+					env: process.env,
+				});
+			}
+			inputMode = undefined;
+			inputBuffer = "";
+		};
 		return {
-			render: (_width: number) => renderManagerScreen(state).split("\n"),
+			render: (_width: number) => managerScreen(state).split("\n"),
 			invalidate: () => undefined,
-				handleInput: (data: string) => {
-					if (data === "q" || data === "\u001b") done();
-					else tui.requestRender();
-				},
+			handleInput: (data: string) => {
+				if (inputMode) {
+					if (data === "\r" || data === "\n") submitInput();
+					else if (data === "\u007f" || data === "\b")
+						inputBuffer = inputBuffer.slice(0, -1);
+					else if (data >= " " && data !== "\u007f") inputBuffer += data;
+					tui.requestRender();
+					return;
+				}
+				if (data === "q" || data === "\u001b") {
+					done();
+					return;
+				}
+				if (data === "1" || data === "2" || data === "3") {
+					dispatch({
+						type: "switch-tab",
+						tab: TAB_ORDER[Number(data) - 1]!,
+					});
+				} else if (data === "\t") {
+					const index = TAB_ORDER.indexOf(state.tab);
+					dispatch({ type: "switch-tab", tab: TAB_ORDER[(index + 1) % TAB_ORDER.length]! });
+				} else if (data === "r") {
+					inputMode = "raw";
+				} else if (data === "v") {
+					inputMode = "environment";
+				} else if (data === "c") {
+					dispatch({ type: "cancel-draft" });
+					pendingImpact = undefined;
+				} else if (data === "j" || data === "k") {
+					const records = state.snapshot?.records ?? [];
+					if (records.length > 0) {
+						selectedIndex = Math.max(
+							0,
+							Math.min(records.length - 1, selectedIndex + (data === "j" ? 1 : -1)),
+						);
+						selectedRecordId = records[selectedIndex]?.id;
+						if (selectedRecordId)
+							dispatch({ type: "select-record", recordId: selectedRecordId });
+					}
+				} else if (data === "d") {
+					void requestDelete().then(() => tui.requestRender());
+				} else if (data === "y") {
+					void confirmDelete(true).then(() => tui.requestRender());
+				} else if (data === "n") {
+					void confirmDelete(false).then(() => tui.requestRender());
+				}
+				tui.requestRender();
+			},
 		};
 	});
 }
@@ -1600,7 +1796,7 @@ function registerFailoverCommand(
 				return;
 			}
 			if (subcommand === "") {
-				await openModelManager(ctx);
+				await openModelManager(ctx, runtime);
 				return;
 			}
 			await refreshSessionConfig(runtime);

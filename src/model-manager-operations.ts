@@ -7,13 +7,16 @@ import {
 	type ModelManagerCatalogSnapshot,
 	type PiProviderDraft,
 } from "./model-manager-catalog.ts";
+import { confirmCascade, type CatalogImpact } from "./model-manager-impact.ts";
+import { notifyModelManagerDelete } from "./model-manager-bridge.ts";
 import {
-	confirmCascade,
-	type CatalogImpact,
-} from "./model-manager-impact.ts";
-import { serializeSidecar, validateSidecar } from "./model-manager-sidecar.ts";
+	readSidecar,
+	serializeSidecar,
+	validateSidecar,
+} from "./model-manager-sidecar.ts";
 import {
 	readRevision,
+	commitCatalogTransaction,
 	type CatalogTransactionInput,
 	type TransactionResult,
 } from "./model-manager-store.ts";
@@ -92,7 +95,8 @@ function stripSecretFields(
 	value: unknown,
 	secrets: readonly string[] = [],
 ): DraftValue {
-	if (Array.isArray(value)) return value.map((child) => stripSecretFields(child, secrets));
+	if (Array.isArray(value))
+		return value.map((child) => stripSecretFields(child, secrets));
 	if (value === null || value === undefined) return value;
 	if (typeof value === "string") return redactSecrets(value, secrets);
 	if (typeof value === "number" || typeof value === "boolean") return value;
@@ -111,7 +115,9 @@ function copyFields(fields: RecordDraftFields): RecordDraftFields {
 		providerName: fields.providerName,
 		modelId: fields.modelId,
 		...(fields.label === undefined ? {} : { label: fields.label }),
-		...(fields.remoteGroup === undefined ? {} : { remoteGroup: fields.remoteGroup }),
+		...(fields.remoteGroup === undefined
+			? {}
+			: { remoteGroup: fields.remoteGroup }),
 		...(fields.groupOwner === undefined ? {} : { groupOwner: fields.groupOwner }),
 		...(fields.multiplier === undefined ? {} : { multiplier: fields.multiplier }),
 	};
@@ -121,7 +127,10 @@ function copyAdvanced(
 	advanced: Record<string, unknown>,
 	secrets: readonly string[] = [],
 ): Record<string, unknown> {
-	return stripSecretFields(structuredClone(advanced), secrets) as Record<string, unknown>;
+	return stripSecretFields(structuredClone(advanced), secrets) as Record<
+		string,
+		unknown
+	>;
 }
 
 function splitRecord(record: ModelManagerRecord): {
@@ -137,7 +146,10 @@ function splitRecord(record: ModelManagerRecord): {
 	return { fields, advanced: copyAdvanced(advanced) };
 }
 
-export function redactSecrets(text: string, secrets: readonly string[] = []): string {
+export function redactSecrets(
+	text: string,
+	secrets: readonly string[] = [],
+): string {
 	let safe = text;
 	for (const secret of secrets) {
 		if (secret.length > 0) safe = safe.split(secret).join("[redacted]");
@@ -167,7 +179,11 @@ export function createDraft(
 	fields: RecordDraftFields,
 	advanced: Record<string, unknown> = {},
 ): ModelManagerDraft {
-	return { kind: "create", fields: copyFields(fields), advanced: copyAdvanced(advanced) };
+	return {
+		kind: "create",
+		fields: copyFields(fields),
+		advanced: copyAdvanced(advanced),
+	};
 }
 
 export function editDraft(
@@ -248,7 +264,11 @@ export function cloneDraft(
 		...snapshot.records.map((entry) => entry.providerAlias),
 		...snapshot.providers.map((provider) => provider.name),
 	]);
-	const providerAlias = createProviderAlias(providerName, fingerprint, takenAliases);
+	const providerAlias = createProviderAlias(
+		providerName,
+		fingerprint,
+		takenAliases,
+	);
 	const fields: RecordDraftFields = {
 		...copied.fields,
 		...structuredClone(overrides),
@@ -259,7 +279,10 @@ export function cloneDraft(
 	delete fields.remoteGroup;
 	delete fields.groupOwner;
 	if (remoteGroup !== undefined) fields.remoteGroup = remoteGroup;
-	if (Object.hasOwn(overrides, "groupOwner") && overrides.groupOwner !== undefined) {
+	if (
+		Object.hasOwn(overrides, "groupOwner") &&
+		overrides.groupOwner !== undefined
+	) {
 		fields.groupOwner = overrides.groupOwner;
 	}
 	const id = createStableId(
@@ -324,11 +347,13 @@ function recordForDraft(
 			},
 		};
 	}
-	const id = draft.recordId ?? createStableId(
-		draft.fields.providerAlias,
-		draft.fields.modelId,
-		new Set(snapshot.records.map((entry) => entry.id)),
-	);
+	const id =
+		draft.recordId ??
+		createStableId(
+			draft.fields.providerAlias,
+			draft.fields.modelId,
+			new Set(snapshot.records.map((entry) => entry.id)),
+		);
 	return {
 		ok: true,
 		value: {
@@ -344,17 +369,23 @@ function previewProviders(
 	record: ModelManagerRecord,
 	draft: ModelManagerDraft,
 ): { sidecarAfter: ModelManagerSidecar; providerDrafts: PiProviderDraft[] } {
-	const applied = applyCatalogDraft(snapshot, draft.kind === "edit"
-		? { edit: [{ id: record.id, fields: record }] }
-		: { add: [record] });
-	const target = applied.records.find((entry) => entry.id === record.id) ?? record;
+	const applied = applyCatalogDraft(
+		snapshot,
+		draft.kind === "edit"
+			? { edit: [{ id: record.id, fields: record }] }
+			: { add: [record] },
+	);
+	const target =
+		applied.records.find((entry) => entry.id === record.id) ?? record;
 	const targetProvider = toPiProviderAlias(target);
 	const providerDrafts = applied.providers.map((provider) => ({
 		...(provider.name === targetProvider.name ? targetProvider : {}),
 		...provider,
 		apiKey: "",
 	}));
-	if (!providerDrafts.some((provider) => provider.name === targetProvider.name)) {
+	if (
+		!providerDrafts.some((provider) => provider.name === targetProvider.name)
+	) {
 		providerDrafts.push(targetProvider);
 	}
 	return {
@@ -420,18 +451,21 @@ function revisionFor(bytes: Uint8Array): string {
 
 function validModelsDocument(value: JsonObject): boolean {
 	if (!Array.isArray(value.providers)) return false;
-	return value.providers.every((provider) =>
-		isJsonObject(provider) &&
-		typeof provider.name === "string" &&
-		provider.name.trim().length > 0 &&
-		typeof provider.apiKey === "string" &&
-		(!Object.hasOwn(provider, "baseUrl") || typeof provider.baseUrl === "string") &&
-		Array.isArray(provider.models) &&
-		provider.models.every((model) =>
-			isJsonObject(model) &&
-			typeof model.id === "string" &&
-			model.id.trim().length > 0
-		)
+	return value.providers.every(
+		(provider) =>
+			isJsonObject(provider) &&
+			typeof provider.name === "string" &&
+			provider.name.trim().length > 0 &&
+			typeof provider.apiKey === "string" &&
+			(!Object.hasOwn(provider, "baseUrl") ||
+				typeof provider.baseUrl === "string") &&
+			Array.isArray(provider.models) &&
+			provider.models.every(
+				(model) =>
+					isJsonObject(model) &&
+					typeof model.id === "string" &&
+					model.id.trim().length > 0,
+			),
 	);
 }
 
@@ -464,19 +498,33 @@ async function readCurrentJson(
 
 	let document: unknown;
 	try {
-		document = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+		document = JSON.parse(
+			new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+		);
 	} catch {
 		return failure(`${kind}-malformed`, `${kind} is not valid JSON`, secrets);
 	}
 	if (!isJsonObject(document)) {
-		return failure(`${kind}-malformed`, `${kind} has an unsupported shape`, secrets);
+		return failure(
+			`${kind}-malformed`,
+			`${kind} has an unsupported shape`,
+			secrets,
+		);
 	}
 	if (kind === "sidecar") {
 		if (hasSecretKey(document) || !validateSidecar(document).ok) {
-			return failure("sidecar-malformed", "sidecar has an unsupported shape", secrets);
+			return failure(
+				"sidecar-malformed",
+				"sidecar has an unsupported shape",
+				secrets,
+			);
 		}
 	} else if (!validModelsDocument(document)) {
-		return failure("models-malformed", "models has an unsupported shape", secrets);
+		return failure(
+			"models-malformed",
+			"models has an unsupported shape",
+			secrets,
+		);
 	}
 	return { ok: true, value: { revision, document, bytes } };
 }
@@ -543,22 +591,27 @@ function providerBytes(
 		(provider) => provider.name === draft.fields.providerAlias,
 	);
 	if (!target) {
-		return failure("provider-draft-missing", "Provider draft is missing", secrets);
+		return failure(
+			"provider-draft-missing",
+			"Provider draft is missing",
+			secrets,
+		);
 	}
 	const document = current ?? { providers: [] };
 	const providers = [...(document.providers as JsonObject[])];
 	const index = providers.findIndex((provider) => provider.name === target.name);
 	const existing = index === -1 ? undefined : providers[index];
-	const updated: JsonObject = index === -1
-		? {
-			...structuredClone(target),
-			models: mergedModels(undefined, target, draft, applyDraftLabel),
-		}
-		: {
-			...structuredClone(existing),
-			name: target.name,
-			models: mergedModels(existing, target, draft, applyDraftLabel),
-		};
+	const updated: JsonObject =
+		index === -1
+			? {
+					...structuredClone(target),
+					models: mergedModels(undefined, target, draft, applyDraftLabel),
+				}
+			: {
+					...structuredClone(existing),
+					name: target.name,
+					models: mergedModels(existing, target, draft, applyDraftLabel),
+				};
 	updated.apiKey = secret;
 	if (index === -1) providers.push(updated);
 	else providers[index] = updated;
@@ -581,11 +634,7 @@ export async function commitDraft(
 			ack: io.confirmed,
 		});
 		if (!confirmation.ok) {
-			return failure(
-				"cascade-not-confirmed",
-				confirmation.error.message,
-				secrets,
-			);
+			return failure("cascade-not-confirmed", confirmation.error.message, secrets);
 		}
 	}
 
@@ -614,25 +663,29 @@ export async function commitDraft(
 	}
 
 	const sidecarAfter = sidecarCurrent.value.document
-		? {
-			...sidecarCurrent.value.document,
-			models: preview.value.sidecarAfter.models,
-		} as ModelManagerSidecar
+		? ({
+				...sidecarCurrent.value.document,
+				models: preview.value.sidecarAfter.models,
+			} as ModelManagerSidecar)
 		: preview.value.sidecarAfter;
 	const sidecarBytes = serializeSidecar(sidecarAfter);
 	if (!sidecarBytes.ok) {
 		return failure("sidecar-invalid", sidecarBytes.error.message, secrets);
 	}
-	const writes: CatalogTransactionInput["writes"] = [{
-		path: io.sidecarPath,
-		bytes: sidecarBytes.value,
-		expectRevision: sidecarCurrent.value.revision,
-	}];
+	const writes: CatalogTransactionInput["writes"] = [
+		{
+			path: io.sidecarPath,
+			bytes: sidecarBytes.value,
+			expectRevision: sidecarCurrent.value.revision,
+		},
+	];
 	if (draft.secret) {
-		const sourceRecord = draft.kind === "edit" && draft.recordId
-			? io.snapshot.byId.get(draft.recordId)
-			: undefined;
-		const applyDraftLabel = draft.kind !== "edit" || draft.fields.label !== sourceRecord?.label;
+		const sourceRecord =
+			draft.kind === "edit" && draft.recordId
+				? io.snapshot.byId.get(draft.recordId)
+				: undefined;
+		const applyDraftLabel =
+			draft.kind !== "edit" || draft.fields.label !== sourceRecord?.label;
 		const modelsBytes = providerBytes(
 			preview.value,
 			draft,
@@ -656,21 +709,98 @@ export async function commitDraft(
 	try {
 		const committed = await io.commit({ writes });
 		if (!committed.ok) {
-			const transactionCode = committed.phase === "prepare"
-				? "transaction-prepare-failed"
-				: committed.phase === "commit"
-					? "transaction-commit-failed"
-					: "transaction-failed";
-			return failure(
-				transactionCode,
-				committed.message,
-				[...secrets, io.sidecarPath, modelsPath],
-			);
+			const transactionCode =
+				committed.phase === "prepare"
+					? "transaction-prepare-failed"
+					: committed.phase === "commit"
+						? "transaction-commit-failed"
+						: "transaction-failed";
+			return failure(transactionCode, committed.message, [
+				...secrets,
+				io.sidecarPath,
+				modelsPath,
+			]);
 		}
 		return { ok: true, value: { committed: committed.committed } };
 	} catch {
 		return failure("commit-failed", "Catalog commit failed", secrets);
 	}
+}
+
+export interface CommitDeleteDraftIo {
+	snapshot: ModelManagerCatalogSnapshot;
+	sidecarPath: string;
+	impact: CatalogImpact;
+	confirmation: { recordId: string; ack: boolean };
+	commit?: (input: CatalogTransactionInput) => Promise<TransactionResult>;
+}
+
+export async function commitDeleteDraft(
+	recordId: string,
+	io: CommitDeleteDraftIo,
+): Promise<ModelManagerResult<{ committed: string[] }>> {
+	const record = io.snapshot.byId.get(recordId);
+	if (!record) {
+		return failure(
+			"record-not-found",
+			"The requested catalog record is not present in the snapshot",
+		);
+	}
+	if (io.impact.recordId !== recordId) {
+		return failure(
+			"cascade-not-confirmed",
+			"Cascade confirmation does not match the requested record",
+		);
+	}
+	const confirmation = confirmCascade(io.impact, io.confirmation);
+	if (!confirmation.ok) return confirmation;
+
+	const current = await readSidecar(io.sidecarPath);
+	if (!current.ok) return current;
+	if (!current.value.sidecar.models.some((entry) => entry.id === recordId)) {
+		return failure(
+			"record-not-found",
+			"The requested catalog record is not present in the current sidecar",
+		);
+	}
+	const currentSnapshot: ModelManagerCatalogSnapshot = {
+		...io.snapshot,
+		records: current.value.sidecar.models.map(cloneRecord),
+		byId: new Map(
+			current.value.sidecar.models.map((entry) => [entry.id, entry]),
+		),
+	};
+	const after = applyCatalogDraft(currentSnapshot, { remove: [recordId] });
+	const sidecarAfter: ModelManagerSidecar = {
+		...current.value.sidecar,
+		models: after.records.map(cloneRecord),
+	};
+	const bytes = serializeSidecar(sidecarAfter);
+	if (!bytes.ok) return bytes;
+	const commit = await (io.commit ?? commitCatalogTransaction)({
+		writes: [
+			{
+				path: io.sidecarPath,
+				bytes: bytes.value,
+				expectRevision: current.value.revision,
+			},
+		],
+	});
+	if (!commit.ok) {
+		return failure(
+			`transaction-${commit.phase}-failed`,
+			commit.message,
+		);
+	}
+	try {
+		await notifyModelManagerDelete(recordId, io.impact);
+	} catch {
+		return failure(
+			"delete-notification-failed",
+			"Model Manager delete notification failed",
+		);
+	}
+	return { ok: true, value: { committed: commit.committed } };
 }
 
 export function cancelDraft(draft: ModelManagerDraft): { cancelled: true } {

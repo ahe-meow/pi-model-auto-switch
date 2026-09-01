@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import {
 	mkdtemp,
+	mkdir,
 	readFile,
 	rm,
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { test } from "node:test";
+import { dirname, join } from "node:path";
+import { after, afterEach, test } from "node:test";
 import {
 	readModelCatalog,
 	type ModelManagerCatalogSnapshot,
@@ -28,6 +29,7 @@ import {
 import {
 	buildPreview,
 	cloneDraft,
+	commitDeleteDraft,
 } from "../src/model-manager-operations.ts";
 import {
 	serializeSidecar,
@@ -42,11 +44,103 @@ import {
 	renderManagerScreen,
 	type TuiState,
 } from "../src/model-manager-tui.ts";
+import type { TargetRuntime } from "../src/index.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
 import type {
 	ModelManagerRecord,
 	ModelManagerResult,
 	ModelManagerSidecar,
 } from "../src/model-manager-types.ts";
+
+const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+const testAgentDir = await mkdtemp(join(tmpdir(), "model-manager-release-agent-"));
+let index: typeof import("../src/index.ts") | undefined;
+
+async function getIndex(): Promise<typeof import("../src/index.ts")> {
+	if (!index) {
+		process.env.PI_CODING_AGENT_DIR = testAgentDir;
+		index = await import(
+			new URL("../src/index.ts?model-manager-release", import.meta.url).href,
+		);
+	}
+	const loaded = index;
+	if (!loaded) throw new Error("release index did not load");
+	return loaded;
+}
+
+type CommandHandler = (args: string, ctx: unknown) => unknown | Promise<unknown>;
+
+function emptyTargetRuntime(): TargetRuntime {
+	return {
+		initialAvailabilityKnown: true,
+		getModel: () => undefined,
+		getAvailableSnapshot: () => [],
+		hasConfiguredAuth: () => false,
+		refresh: async () => undefined,
+		completeSimple: async () => ({}) as never,
+		streamSimple: () => ({}) as never,
+	};
+}
+
+async function createExtensionHarness(
+	coordinator?: (recordId: string, impact: CatalogImpact) => Promise<void>,
+): Promise<Array<{ name: string; handler: CommandHandler }>> {
+	const commands: Array<{ name: string; handler: CommandHandler }> = [];
+	const pi = {
+		on: () => undefined,
+		registerCommand: (name: string, options: { handler: CommandHandler }) =>
+			commands.push({ name, handler: options.handler }),
+		registerProvider: () => undefined,
+		appendEntry: () => undefined,
+	} as unknown as ExtensionAPI;
+	const currentIndex = await getIndex();
+	await currentIndex.registerFailoverExtension(pi, {
+		targetRuntime: emptyTargetRuntime(),
+		...(coordinator ? { modelManagerDeleteCoordinator: coordinator } : {}),
+	});
+	return commands;
+}
+
+function renderContext(rendered: { value: string }): unknown {
+	return {
+		mode: "tui",
+		cwd: testAgentDir,
+		sessionManager: {
+			getEntries: () => [],
+			getSessionFile: () => undefined,
+		},
+		ui: {
+			notify: () => undefined,
+			setStatus: () => undefined,
+			custom: async (create: Function) => {
+				const component = create(
+					{ requestRender: () => undefined },
+					{ fg: (_color: string, text: string) => text },
+					{},
+					() => undefined,
+				) as { render(width: number): string | string[] };
+				const output = component.render(120);
+				rendered.value = Array.isArray(output) ? output.join("\n") : output;
+			},
+		},
+	};
+}
+
+afterEach(async () => {
+	clearModelManagerBridge();
+	if (index) {
+		await rm(index.FAILOVER_CONFIG_PATH, { force: true });
+		await rm(index.MODELS_JSON_PATH, { force: true });
+		await rm(index.MODEL_MANAGER_SIDECAR_PATH, { force: true });
+	}
+});
+
+after(async () => {
+	if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+	await rm(testAgentDir, { force: true, recursive: true });
+});
 
 const sourceRecord: ModelManagerRecord = {
 	id: "source-record",
@@ -267,6 +361,181 @@ test("delete confirmation then notifies bridge with exact impact and no failover
 		assert.strictEqual(received?.impact, impact);
 		assert.deepEqual(await readFile(chainsPath), before[0]);
 		assert.deepEqual(await readFile(statePath), before[1]);
+	});
+});
+
+test("/failover empty handler loads actual catalog records into the manager screen", async () => {
+	const currentIndex = await getIndex();
+	await mkdir(dirname(currentIndex.MODELS_JSON_PATH), { recursive: true });
+	const sidecarPath = currentIndex.MODEL_MANAGER_SIDECAR_PATH;
+	const modelsBytes = Buffer.from(
+		`${JSON.stringify({
+			providers: [
+				{
+					name: sourceRecord.providerAlias,
+					apiKey: "opaque-native-reference",
+					models: [{ id: sourceRecord.modelId, name: sourceRecord.label }],
+				},
+			],
+		})}\n`,
+	);
+	const sidecarBytes = Buffer.from(
+		`${JSON.stringify({ version: 1, models: [sourceRecord] })}\n`,
+	);
+	await writeFile(currentIndex.MODELS_JSON_PATH, modelsBytes);
+	await writeFile(sidecarPath, sidecarBytes);
+	try {
+		const commands = await createExtensionHarness();
+		const command = commands.find((entry) => entry.name === "failover");
+		assert.ok(command);
+		const rendered = { value: "" };
+		await command.handler("", renderContext(rendered));
+		assert.match(rendered.value, /> Model Manager/);
+		assert.match(rendered.value, /Failover Chains/);
+		assert.match(rendered.value, /History/);
+		assert.match(rendered.value, /Release model/);
+		assert.match(rendered.value, /mm-provider-release-old-fingerprint/);
+	} finally {
+		await rm(currentIndex.MODELS_JSON_PATH, { force: true });
+		await rm(sidecarPath, { force: true });
+	}
+});
+
+test("delete coordinator has a real zero-write rejection and confirmed sidecar commit", async () => {
+	await withTempDir(async (dir) => {
+		const modelsPath = join(dir, "models.json");
+		const sidecarPath = join(dir, "model-manager.json");
+		const chainsPath = join(dir, "model-failover.json");
+		const statePath = join(dir, "failover-state.json");
+		const modelsBytes = Buffer.from(
+			`${JSON.stringify({
+				providers: [
+					{
+						name: sourceRecord.providerAlias,
+						apiKey: "opaque-native-reference",
+						models: [{ id: sourceRecord.modelId, name: sourceRecord.label }],
+					},
+				],
+			})}\n`,
+		);
+		const sidecarBytes = Buffer.from(
+			`${JSON.stringify({ version: 1, models: [sourceRecord] })}\n`,
+		);
+		const chainBytes = Buffer.from(
+			JSON.stringify({ chains: { primary: [{ provider: sourceRecord.providerAlias, modelId: sourceRecord.modelId }] } }) +
+			"\n",
+		);
+		const stateBytes = Buffer.from(
+			JSON.stringify({ targets: { [`${sourceRecord.providerAlias}/${sourceRecord.modelId}`]: {} } }) +
+			"\n",
+		);
+		await writeFile(modelsPath, modelsBytes);
+		await writeFile(sidecarPath, sidecarBytes);
+		await writeFile(chainsPath, chainBytes);
+		await writeFile(statePath, stateBytes);
+
+		const catalog = await readModelCatalog(modelsPath, sidecarPath);
+		const current = assertOk(catalog);
+		const impact = assertOk(
+			await analyzeDeletionImpact(current, sourceRecord.id, {
+				chainsPath,
+				statePath,
+			}),
+		);
+		const before = {
+			models: await readFile(modelsPath),
+			sidecar: await readFile(sidecarPath),
+			chains: await readFile(chainsPath),
+			state: await readFile(statePath),
+		};
+		let notifications = 0;
+		let receivedImpact: CatalogImpact | undefined;
+		await createExtensionHarness(async (_recordId, received) => {
+			notifications += 1;
+			receivedImpact = received;
+		});
+
+		const rejected = await commitDeleteDraft(sourceRecord.id, {
+			snapshot: current,
+			sidecarPath,
+			impact,
+			confirmation: { recordId: sourceRecord.id, ack: false },
+		});
+		assert.equal(rejected.ok, false);
+		if (!rejected.ok) {
+			assert.equal(
+				"code" in rejected.error ? rejected.error.code : undefined,
+				"cascade-not-confirmed",
+			);
+		}
+		assert.deepEqual(await readFile(sidecarPath), before.sidecar);
+		assert.equal(notifications, 0);
+
+		const mismatch = await commitDeleteDraft(sourceRecord.id, {
+			snapshot: current,
+			sidecarPath,
+			impact,
+			confirmation: { recordId: "wrong-record", ack: true },
+		});
+		assert.equal(mismatch.ok, false);
+		assert.deepEqual(await readFile(sidecarPath), before.sidecar);
+		assert.equal(notifications, 0);
+
+		const committed = await commitDeleteDraft(sourceRecord.id, {
+			snapshot: current,
+			sidecarPath,
+			impact,
+			confirmation: { recordId: sourceRecord.id, ack: true },
+		});
+		assert.equal(committed.ok, true);
+		const afterCatalog = assertOk(await readModelCatalog(modelsPath, sidecarPath));
+		assert.equal(afterCatalog.byId.has(sourceRecord.id), false);
+		assert.deepEqual(await readFile(modelsPath), before.models);
+		assert.deepEqual(await readFile(chainsPath), before.chains);
+		assert.deepEqual(await readFile(statePath), before.state);
+		assert.equal(notifications, 1);
+		assert.strictEqual(receivedImpact, impact);
+	});
+});
+test("delete notification failures return a safe result", async () => {
+	await withTempDir(async (dir) => {
+		const sidecarPath = join(dir, "model-manager.json");
+		await writeFile(
+			sidecarPath,
+			Buffer.from(`${JSON.stringify({ version: 1, models: [sourceRecord] })}\n`),
+		);
+		const cleanup = registerModelManagerBridge({
+			onDeleteRecord: async () => {
+				throw new Error("provider-secret-from-coordinator");
+			},
+		});
+		try {
+			const result = await commitDeleteDraft(sourceRecord.id, {
+				snapshot: snapshot(),
+				sidecarPath,
+				impact: {
+					recordId: sourceRecord.id,
+					chains: [],
+					state: [],
+					referenced: false,
+				},
+				confirmation: { recordId: sourceRecord.id, ack: true },
+			});
+			assert.equal(result.ok, false);
+			if (!result.ok) {
+				assert.equal(
+					"code" in result.error ? result.error.code : undefined,
+					"delete-notification-failed",
+				);
+				assert.equal(result.error.message.includes("provider-secret"), false);
+			}
+		} finally {
+			cleanup();
+		}
+		const afterSidecar = assertOk(
+			validateSidecar(JSON.parse(await readFile(sidecarPath, "utf8"))),
+		);
+		assert.deepEqual(afterSidecar.models, []);
 	});
 });
 
