@@ -44,6 +44,7 @@ import {
 	renderManagerScreen,
 	type TuiState,
 } from "../src/model-manager-tui.ts";
+import { createMemorySharedState } from "../src/shared-state.ts";
 import type { TargetRuntime } from "../src/index.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -70,6 +71,18 @@ async function getIndex(): Promise<typeof import("../src/index.ts")> {
 }
 
 type CommandHandler = (args: string, ctx: unknown) => unknown | Promise<unknown>;
+type ManagerComponent = {
+	render(width: number): string | string[];
+	handleInput(data: string): void;
+};
+type ExtensionHarness = {
+	commands: Array<{ name: string; handler: CommandHandler }>;
+	shutdown: () => Promise<void>;
+};
+type RenderedScreen = {
+	value: string;
+	component?: ManagerComponent;
+};
 
 function emptyTargetRuntime(): TargetRuntime {
 	return {
@@ -85,10 +98,13 @@ function emptyTargetRuntime(): TargetRuntime {
 
 async function createExtensionHarness(
 	coordinator?: (recordId: string, impact: CatalogImpact) => Promise<void>,
-): Promise<Array<{ name: string; handler: CommandHandler }>> {
+	analyzeImpact: typeof analyzeDeletionImpact = analyzeDeletionImpact,
+): Promise<ExtensionHarness> {
 	const commands: Array<{ name: string; handler: CommandHandler }> = [];
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
 	const pi = {
-		on: () => undefined,
+		on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) =>
+			handlers.set(event, handler),
 		registerCommand: (name: string, options: { handler: CommandHandler }) =>
 			commands.push({ name, handler: options.handler }),
 		registerProvider: () => undefined,
@@ -97,12 +113,33 @@ async function createExtensionHarness(
 	const currentIndex = await getIndex();
 	await currentIndex.registerFailoverExtension(pi, {
 		targetRuntime: emptyTargetRuntime(),
+		sharedState: createMemorySharedState(),
+		modelManagerAnalyzeDeletionImpact: analyzeImpact,
 		...(coordinator ? { modelManagerDeleteCoordinator: coordinator } : {}),
 	});
-	return commands;
+	let active = true;
+	return {
+		commands,
+		shutdown: async () => {
+			if (!active) return;
+			active = false;
+			await handlers.get("session_shutdown")?.({}, {});
+		},
+	};
 }
 
-function renderContext(rendered: { value: string }): unknown {
+function renderContext(
+	rendered: RenderedScreen,
+	notifications: string[] = [],
+	onRender: () => void = () => undefined,
+): unknown {
+	let component: ManagerComponent | undefined;
+	const refresh = (): void => {
+		if (!component) return;
+		const output = component.render(120);
+		rendered.value = Array.isArray(output) ? output.join("\n") : output;
+		onRender();
+	};
 	return {
 		mode: "tui",
 		cwd: testAgentDir,
@@ -111,20 +148,23 @@ function renderContext(rendered: { value: string }): unknown {
 			getSessionFile: () => undefined,
 		},
 		ui: {
-			notify: () => undefined,
+			notify: (message: string) => notifications.push(message),
 			setStatus: () => undefined,
 			custom: async (create: Function) => {
-				const component = create(
-					{ requestRender: () => undefined },
+				component = create(
+					{ requestRender: refresh },
 					{ fg: (_color: string, text: string) => text },
 					{},
 					() => undefined,
-				) as { render(width: number): string | string[] };
-				const output = component.render(120);
-				rendered.value = Array.isArray(output) ? output.join("\n") : output;
+				) as ManagerComponent;
+				rendered.component = component;
+				refresh();
 			},
 		},
 	};
+}
+function tick(): Promise<void> {
+	return new Promise((resolve) => setImmediate(resolve));
 }
 
 afterEach(async () => {
@@ -188,6 +228,182 @@ async function withTempDir(run: (dir: string) => Promise<void>): Promise<void> {
 		await rm(dir, { recursive: true, force: true });
 	}
 }
+
+test("missing and unreadable blocked catalogs show only safe recovery guidance", () => {
+	const base = {
+		tab: "model-manager" as const,
+		snapshot: null,
+		conflict: null,
+		message: null,
+		pendingDraft: null,
+		pendingImpact: null,
+		failoverSummary: null,
+		history: [],
+	};
+	const missing = renderManagerScreen({
+		...base,
+		blocked: {
+			reason: "missing",
+			message: "/private/secret/missing details",
+			compatibilityImport: {
+				available: true,
+				sourcePaths: ["/private/secret/auth.json", "models.json"],
+			},
+		},
+	});
+	assert.match(missing, /Catalog blocked: missing/);
+	assert.match(missing, /Compatibility import available: auth\.json, models\.json/);
+	assert.doesNotMatch(missing, /raw bytes preserved/);
+	assert.doesNotMatch(missing, /private|secret|missing details/);
+
+	const unreadable = renderManagerScreen({
+		...base,
+		blocked: {
+			reason: "unreadable",
+			message: "/private/secret/unreadable details",
+		},
+	});
+	assert.match(unreadable, /Catalog blocked: unreadable/);
+	assert.match(unreadable, /Recovery: repair the sidecar, then reopen \/failover/);
+	assert.doesNotMatch(unreadable, /raw bytes preserved/);
+	assert.doesNotMatch(unreadable, /private|secret|unreadable details/);
+});
+
+test("cancelled delete analysis cannot resurrect a pending commit", async () => {
+	const currentIndex = await getIndex();
+	await mkdir(dirname(currentIndex.MODELS_JSON_PATH), { recursive: true });
+	await writeFile(
+		currentIndex.MODELS_JSON_PATH,
+		JSON.stringify({ providers: [{ name: sourceRecord.providerAlias, apiKey: "opaque", models: [{ id: sourceRecord.modelId, name: sourceRecord.label }] }] }),
+	);
+	await writeFile(
+		currentIndex.MODEL_MANAGER_SIDECAR_PATH,
+		`${JSON.stringify({ version: 1, models: [sourceRecord] })}\n`,
+	);
+	const impact: CatalogImpact = {
+		recordId: sourceRecord.id,
+		chains: [],
+		state: [],
+		referenced: false,
+	};
+	let analysisStarted!: () => void;
+	const started = new Promise<void>((resolve) => {
+		analysisStarted = resolve;
+	});
+	let resolveAnalysis!: (result: ModelManagerResult<CatalogImpact>) => void;
+	const delayedAnalysis = new Promise<ModelManagerResult<CatalogImpact>>((resolve) => {
+		resolveAnalysis = resolve;
+	});
+	let analysisFinished!: () => void;
+	const finished = new Promise<void>((resolve) => {
+		analysisFinished = resolve;
+	});
+	const harness = await createExtensionHarness(
+		async () => undefined,
+		async () => {
+			analysisStarted();
+			const result = await delayedAnalysis;
+			analysisFinished();
+			return result;
+		},
+	);
+	try {
+		const command = harness.commands.find((entry) => entry.name === "failover");
+		assert.ok(command);
+		const rendered: RenderedScreen = { value: "" };
+		await command.handler("", renderContext(rendered));
+		assert.ok(rendered.component);
+		rendered.component.handleInput("d");
+		await started;
+		rendered.component.handleInput("c");
+		resolveAnalysis({ ok: true, value: impact });
+		await finished;
+		rendered.component.handleInput("y");
+		await tick();
+		rendered.component.handleInput("d");
+		await tick();
+		rendered.component.handleInput("n");
+		await tick();
+		rendered.component.handleInput("y");
+		await tick();
+		await tick();
+		const current = assertOk(
+			await readModelCatalog(
+				currentIndex.MODELS_JSON_PATH,
+				currentIndex.MODEL_MANAGER_SIDECAR_PATH,
+			),
+		);
+		assert.equal(current.byId.has(sourceRecord.id), true);
+	} finally {
+		await harness.shutdown();
+	}
+});
+
+test("production delete handler refreshes after a committed notification failure", async () => {
+	const currentIndex = await getIndex();
+	await mkdir(dirname(currentIndex.MODELS_JSON_PATH), { recursive: true });
+	await writeFile(
+		currentIndex.MODELS_JSON_PATH,
+		JSON.stringify({ providers: [{ name: sourceRecord.providerAlias, apiKey: "opaque", models: [{ id: sourceRecord.modelId, name: sourceRecord.label }] }] }),
+	);
+	await writeFile(
+		currentIndex.MODEL_MANAGER_SIDECAR_PATH,
+		`${JSON.stringify({ version: 1, models: [sourceRecord] })}\n`,
+	);
+	const impact: CatalogImpact = {
+		recordId: sourceRecord.id,
+		chains: [],
+		state: [],
+		referenced: false,
+	};
+	let notificationStarted!: () => void;
+	const notification = new Promise<void>((resolve) => {
+		notificationStarted = resolve;
+	});
+	const notifications: string[] = [];
+	let renderedWarning!: () => void;
+	const warningRendered = new Promise<void>((resolve) => {
+		renderedWarning = resolve;
+	});
+	const harness = await createExtensionHarness(
+		async () => {
+			notificationStarted();
+			throw new Error("provider-secret-from-coordinator");
+		},
+		async () => ({ ok: true, value: impact }),
+	);
+	try {
+		const command = harness.commands.find((entry) => entry.name === "failover");
+		assert.ok(command);
+		const rendered: RenderedScreen = { value: "" };
+		await command.handler(
+			"",
+			renderContext(rendered, notifications, () => {
+				if (rendered.value.includes("Delete committed; failover notification failed"))
+					renderedWarning();
+			}),
+		);
+		assert.ok(rendered.component);
+		rendered.component.handleInput("d");
+		await tick();
+		rendered.component.handleInput("y");
+		await notification;
+		await warningRendered;
+		const current = assertOk(
+			await readModelCatalog(
+				currentIndex.MODELS_JSON_PATH,
+				currentIndex.MODEL_MANAGER_SIDECAR_PATH,
+			),
+		);
+		assert.equal(current.byId.has(sourceRecord.id), false);
+		assert.doesNotMatch(rendered.value, /Release model/);
+		assert.match(rendered.value, /Delete committed; failover notification failed/);
+		assert.ok(notifications.some((message) => /notification failed/.test(message)));
+		assert.doesNotMatch(notifications.join("\n"), /provider-secret/);
+	} finally {
+		await harness.shutdown();
+	}
+});
 
 test("sidecar unknown fields survive validate serialize validate round trip", () => {
 	const sidecar: ModelManagerSidecar = {
@@ -384,9 +600,9 @@ test("/failover empty handler loads actual catalog records into the manager scre
 	);
 	await writeFile(currentIndex.MODELS_JSON_PATH, modelsBytes);
 	await writeFile(sidecarPath, sidecarBytes);
+	const harness = await createExtensionHarness();
 	try {
-		const commands = await createExtensionHarness();
-		const command = commands.find((entry) => entry.name === "failover");
+		const command = harness.commands.find((entry) => entry.name === "failover");
 		assert.ok(command);
 		const rendered = { value: "" };
 		await command.handler("", renderContext(rendered));
@@ -396,6 +612,7 @@ test("/failover empty handler loads actual catalog records into the manager scre
 		assert.match(rendered.value, /Release model/);
 		assert.match(rendered.value, /mm-provider-release-old-fingerprint/);
 	} finally {
+		await harness.shutdown();
 		await rm(currentIndex.MODELS_JSON_PATH, { force: true });
 		await rm(sidecarPath, { force: true });
 	}
@@ -450,53 +667,57 @@ test("delete coordinator has a real zero-write rejection and confirmed sidecar c
 		};
 		let notifications = 0;
 		let receivedImpact: CatalogImpact | undefined;
-		await createExtensionHarness(async (_recordId, received) => {
+		const harness = await createExtensionHarness(async (_recordId, received) => {
 			notifications += 1;
 			receivedImpact = received;
 		});
+		try {
+			const rejected = await commitDeleteDraft(sourceRecord.id, {
+				snapshot: current,
+				sidecarPath,
+				impact,
+				confirmation: { recordId: sourceRecord.id, ack: false },
+			});
+			assert.equal(rejected.ok, false);
+			if (!rejected.ok) {
+				assert.equal(
+					"code" in rejected.error ? rejected.error.code : undefined,
+					"cascade-not-confirmed",
+				);
+			}
+			assert.deepEqual(await readFile(sidecarPath), before.sidecar);
+			assert.equal(notifications, 0);
 
-		const rejected = await commitDeleteDraft(sourceRecord.id, {
-			snapshot: current,
-			sidecarPath,
-			impact,
-			confirmation: { recordId: sourceRecord.id, ack: false },
-		});
-		assert.equal(rejected.ok, false);
-		if (!rejected.ok) {
-			assert.equal(
-				"code" in rejected.error ? rejected.error.code : undefined,
-				"cascade-not-confirmed",
-			);
+			const mismatch = await commitDeleteDraft(sourceRecord.id, {
+				snapshot: current,
+				sidecarPath,
+				impact,
+				confirmation: { recordId: "wrong-record", ack: true },
+			});
+			assert.equal(mismatch.ok, false);
+			assert.deepEqual(await readFile(sidecarPath), before.sidecar);
+			assert.equal(notifications, 0);
+
+			const committed = await commitDeleteDraft(sourceRecord.id, {
+				snapshot: current,
+				sidecarPath,
+				impact,
+				confirmation: { recordId: sourceRecord.id, ack: true },
+			});
+			assert.equal(committed.ok, true);
+			const afterCatalog = assertOk(await readModelCatalog(modelsPath, sidecarPath));
+			assert.equal(afterCatalog.byId.has(sourceRecord.id), false);
+			assert.deepEqual(await readFile(modelsPath), before.models);
+			assert.deepEqual(await readFile(chainsPath), before.chains);
+			assert.deepEqual(await readFile(statePath), before.state);
+			assert.equal(notifications, 1);
+			assert.strictEqual(receivedImpact, impact);
+		} finally {
+			await harness.shutdown();
 		}
-		assert.deepEqual(await readFile(sidecarPath), before.sidecar);
-		assert.equal(notifications, 0);
-
-		const mismatch = await commitDeleteDraft(sourceRecord.id, {
-			snapshot: current,
-			sidecarPath,
-			impact,
-			confirmation: { recordId: "wrong-record", ack: true },
-		});
-		assert.equal(mismatch.ok, false);
-		assert.deepEqual(await readFile(sidecarPath), before.sidecar);
-		assert.equal(notifications, 0);
-
-		const committed = await commitDeleteDraft(sourceRecord.id, {
-			snapshot: current,
-			sidecarPath,
-			impact,
-			confirmation: { recordId: sourceRecord.id, ack: true },
-		});
-		assert.equal(committed.ok, true);
-		const afterCatalog = assertOk(await readModelCatalog(modelsPath, sidecarPath));
-		assert.equal(afterCatalog.byId.has(sourceRecord.id), false);
-		assert.deepEqual(await readFile(modelsPath), before.models);
-		assert.deepEqual(await readFile(chainsPath), before.chains);
-		assert.deepEqual(await readFile(statePath), before.state);
-		assert.equal(notifications, 1);
-		assert.strictEqual(receivedImpact, impact);
 	});
 });
+
 test("delete notification failures return a safe result", async () => {
 	await withTempDir(async (dir) => {
 		const sidecarPath = join(dir, "model-manager.json");

@@ -212,6 +212,7 @@ function safeMessage(
 		"Cascade confirmation ignored; draft and impact required",
 		"commit-draft: ready after cascade confirmation",
 		"已取消，未写入",
+		"Delete committed; failover notification failed",
 	]);
 	if (staticMessages.has(value)) return value;
 	const match = /^(Raw|Environment) input accepted \((\d{1,6}) key\(s\)\)$/.exec(
@@ -528,13 +529,29 @@ function renderTransactionResult(
 function renderBlocked(
 	blocked: ModelManagerBlockedState,
 	lines: string[],
+	secrets: readonly string[],
 ): void {
-	const reason = BLOCKED_REASONS.includes(blocked.reason)
-		? blocked.reason
+	const safeBlocked = sanitizeBlockedForState(blocked, secrets);
+	if (!safeBlocked) return;
+	const reason = BLOCKED_REASONS.includes(safeBlocked.reason)
+		? safeBlocked.reason
 		: "unknown";
 	lines.push(`Catalog blocked: ${reason}`);
 	lines.push("Details withheld to protect sensitive input.");
-	lines.push("原始字节已保留 / raw bytes preserved");
+	if (safeBlocked.rawBytes instanceof Uint8Array) {
+		lines.push("原始字节已保留 / raw bytes preserved");
+		return;
+	}
+	const sourcePaths = safeBlocked.compatibilityImport?.available
+		? safeBlocked.compatibilityImport.sourcePaths
+				.map((path) => safePath(path, secrets))
+				.filter((path) => path !== REDACTED_MESSAGE)
+		: [];
+	if (sourcePaths.length > 0) {
+		lines.push(`Compatibility import available: ${sourcePaths.join(", ")}`);
+		return;
+	}
+	lines.push("Recovery: repair the sidecar, then reopen /failover");
 }
 
 export function renderManagerScreen(state: TuiState): string {
@@ -553,7 +570,7 @@ export function renderManagerScreen(state: TuiState): string {
 	} else {
 		lines.push("No catalog snapshot");
 	}
-	if (state.blocked) renderBlocked(state.blocked, lines);
+	if (state.blocked) renderBlocked(state.blocked, lines, secrets);
 	if (state.conflict) renderTransactionResult(state.conflict, lines, secrets);
 	renderMessage(state, lines, secrets);
 	return lines.join("\n");

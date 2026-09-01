@@ -31,7 +31,11 @@ import {
 	registerFailoverChain as registerChain,
 	registerModelManagerBridge as installModelManagerBridge,
 } from "./model-manager-bridge.ts";
-import { readModelCatalog } from "./model-manager-catalog.ts";
+import {
+	readModelCatalog,
+	type ModelManagerCatalogSnapshot,
+} from "./model-manager-catalog.ts";
+
 import {
 	FAILOVER_PROVIDER_ID,
 	type TargetCatalogMetadata,
@@ -158,6 +162,8 @@ export interface RegisterFailoverExtensionOptions {
 	targetRuntime?: TargetRuntime;
 	sharedState?: SharedStateAdapter;
 	modelManagerDeleteCoordinator?: ModelManagerDeleteCoordinator;
+	modelManagerAnalyzeDeletionImpact?: typeof analyzeDeletionImpact;
+	modelManagerEnvironment?: Readonly<Record<string, string | undefined>>;
 }
 
 export type ModelManagerDeleteCoordinator = (
@@ -1603,6 +1609,23 @@ function deleteDraftForRecord(record: {
 	};
 }
 
+function sameCatalogSnapshot(
+	a: ModelManagerCatalogSnapshot | null,
+	b: ModelManagerCatalogSnapshot | null,
+): boolean {
+	return Boolean(
+		a &&
+		b &&
+		a.records.length === b.records.length &&
+		a.records.every(
+			(record, index) => JSON.stringify(record) === JSON.stringify(b.records[index]),
+		),
+	);
+}
+
+const DELETE_NOTIFICATION_WARNING =
+	"Delete committed; failover notification failed";
+
 function managerTransactionResult(
 	result: Awaited<ReturnType<typeof commitDeleteDraft>>,
 ): import("./model-manager-store.ts").TransactionResult {
@@ -1644,6 +1667,8 @@ async function readModelManagerState(
 async function openModelManager(
 	ctx: ExtensionContext,
 	runtime: RuntimeState,
+	analyzeImpact: typeof analyzeDeletionImpact,
+	environment: Readonly<Record<string, string | undefined>>,
 ): Promise<void> {
 	await refreshSessionConfig(runtime, false);
 	await refreshSharedSnapshot(runtime);
@@ -1653,19 +1678,35 @@ async function openModelManager(
 	let inputMode: "raw" | "environment" | undefined;
 	let inputBuffer = "";
 	let pendingImpact: CatalogImpact | undefined;
+	let deleteGeneration = 0;
+	let requestRender: () => void = () => undefined;
+
+	const invalidateDelete = (): void => {
+		deleteGeneration += 1;
+		pendingImpact = undefined;
+	};
 
 	const dispatch = (action: TuiAction): void => {
 		state = applyTuiAction(state, action);
 	};
 	const requestDelete = async (): Promise<void> => {
+		const token = ++deleteGeneration;
+		pendingImpact = undefined;
 		const snapshot = state.snapshot;
 		const record = snapshot?.records.find((entry) => entry.id === selectedRecordId);
 		if (!snapshot || !record) return;
-		dispatch({ type: "request-delete", recordId: record.id });
-		const impact = await analyzeDeletionImpact(snapshot, record.id, {
+		const recordId = record.id;
+		dispatch({ type: "request-delete", recordId });
+		const impact = await analyzeImpact(snapshot, recordId, {
 			chainsPath: FAILOVER_CONFIG_PATH,
 			statePath: FAILOVER_STATE_PATH,
 		});
+		if (
+			token !== deleteGeneration ||
+			selectedRecordId !== recordId ||
+			!sameCatalogSnapshot(snapshot, state.snapshot)
+		)
+			return;
 		if (!impact.ok) return;
 		pendingImpact = impact.value;
 		state = {
@@ -1673,27 +1714,62 @@ async function openModelManager(
 			pendingDraft: deleteDraftForRecord(record),
 			pendingImpact: impact.value,
 		};
+		requestRender();
 	};
 	const confirmDelete = async (ack: boolean): Promise<void> => {
+		const token = deleteGeneration;
+		const recordId = selectedRecordId;
+		const snapshot = state.snapshot;
+		const impact = pendingImpact;
 		dispatch({ type: "confirm-cascade", ack });
-		if (!ack || !pendingImpact || !selectedRecordId || !state.snapshot) return;
-		dispatch({ type: "commit-draft" });
-		const result = await commitDeleteDraft(selectedRecordId, {
-			snapshot: state.snapshot,
-			sidecarPath: MODEL_MANAGER_SIDECAR_PATH,
-			impact: pendingImpact,
-			confirmation: { recordId: selectedRecordId, ack: true },
-		});
-		dispatch({ type: "transaction-result", result: managerTransactionResult(result) });
-		if (result.ok) {
-			pendingImpact = undefined;
-			selectedIndex = 0;
-			state = await readModelManagerState(runtime, state);
-			selectedRecordId = state.snapshot?.records[0]?.id;
+		if (!ack) {
+			invalidateDelete();
+			dispatch({ type: "cancel-draft" });
+			return;
 		}
+		if (!impact || !recordId || !snapshot) return;
+		if (
+			token !== deleteGeneration ||
+			selectedRecordId !== recordId ||
+			pendingImpact !== impact ||
+			!sameCatalogSnapshot(snapshot, state.snapshot)
+		)
+			return;
+		dispatch({ type: "commit-draft" });
+		const result = await commitDeleteDraft(recordId, {
+			snapshot,
+			sidecarPath: MODEL_MANAGER_SIDECAR_PATH,
+			impact,
+			confirmation: { recordId, ack: true },
+		});
+		if (token !== deleteGeneration || selectedRecordId !== recordId) return;
+		const notificationFailed =
+			!result.ok &&
+			"code" in result.error &&
+			result.error.code === "delete-notification-failed";
+		if (!result.ok && !notificationFailed) {
+			dispatch({ type: "transaction-result", result: managerTransactionResult(result) });
+			requestRender();
+			return;
+		}
+		pendingImpact = undefined;
+		selectedIndex = 0;
+		state = await readModelManagerState(runtime, {
+			...state,
+			pendingDraft: null,
+			pendingImpact: null,
+			conflict: notificationFailed ? null : state.conflict,
+		});
+		selectedRecordId = state.snapshot?.records[0]?.id;
+		if (notificationFailed) {
+			state = { ...state, message: DELETE_NOTIFICATION_WARNING };
+			notify(ctx, DELETE_NOTIFICATION_WARNING, "warning");
+		}
+		requestRender();
 	};
 
 	await ctx.ui.custom<void>((tui, _theme, _keybindings, done) => {
+		requestRender = () => tui.requestRender();
 		const submitInput = (): void => {
 			if (inputMode === "raw") {
 				dispatch({ type: "raw-input-submit", text: inputBuffer });
@@ -1704,7 +1780,7 @@ async function openModelManager(
 						.split(/[\n,]/)
 						.map((name) => name.trim())
 						.filter(Boolean),
-					env: process.env,
+					env: environment,
 				});
 			}
 			inputMode = undefined;
@@ -1739,9 +1815,11 @@ async function openModelManager(
 				} else if (data === "v") {
 					inputMode = "environment";
 				} else if (data === "c") {
+					invalidateDelete();
 					dispatch({ type: "cancel-draft" });
-					pendingImpact = undefined;
 				} else if (data === "j" || data === "k") {
+					invalidateDelete();
+					state = { ...state, pendingDraft: null, pendingImpact: null };
 					const records = state.snapshot?.records ?? [];
 					if (records.length > 0) {
 						selectedIndex = Math.max(
@@ -1768,6 +1846,7 @@ async function openModelManager(
 function registerFailoverCommand(
 	pi: ExtensionAPI,
 	runtime: RuntimeState,
+	options: RegisterFailoverExtensionOptions,
 ): void {
 	pi.registerCommand("failover", {
 		description: "Configure Pi model failover",
@@ -1796,7 +1875,13 @@ function registerFailoverCommand(
 				return;
 			}
 			if (subcommand === "") {
-				await openModelManager(ctx, runtime);
+				const environment = options.modelManagerEnvironment ?? {};
+				await openModelManager(
+					ctx,
+					runtime,
+					options.modelManagerAnalyzeDeletionImpact ?? analyzeDeletionImpact,
+					environment,
+				);
 				return;
 			}
 			await refreshSessionConfig(runtime);
@@ -1955,7 +2040,7 @@ export async function registerFailoverExtension(
 		runtime.sessionContext = undefined;
 		runtime.sessionPersistable = false;
 	});
-	registerFailoverCommand(pi, runtime);
+	registerFailoverCommand(pi, runtime, options);
 }
 
 export default async function modelFailoverExtension(
