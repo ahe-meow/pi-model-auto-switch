@@ -16,7 +16,9 @@ import {
 import type { TransactionResult } from "../src/model-manager-store.ts";
 import type { ModelManagerRecord } from "../src/model-manager-types.ts";
 
-const record = (overrides: Partial<ModelManagerRecord> = {}): ModelManagerRecord => ({
+const record = (
+	overrides: Partial<ModelManagerRecord> = {},
+): ModelManagerRecord => ({
 	id: "record-a",
 	providerAlias: "provider-a",
 	providerName: "Provider A",
@@ -24,7 +26,9 @@ const record = (overrides: Partial<ModelManagerRecord> = {}): ModelManagerRecord
 	...overrides,
 });
 
-function snapshot(records: readonly ModelManagerRecord[] = [record()]): ModelManagerCatalogSnapshot {
+function snapshot(
+	records: readonly ModelManagerRecord[] = [record()],
+): ModelManagerCatalogSnapshot {
 	const copied = [...records];
 	return {
 		records: copied,
@@ -68,9 +72,14 @@ function state(overrides: Partial<TuiState> = {}): TuiState {
 }
 
 test("TAB_ORDER and manager tabs stay in the fixed order with an active marker", () => {
-	assert.deepEqual([...TAB_ORDER], ["model-manager", "failover-chains", "history"]);
+	assert.deepEqual(
+		[...TAB_ORDER],
+		["model-manager", "failover-chains", "history"],
+	);
 	const rendered = renderManagerScreen(state());
-	assert.ok(rendered.indexOf("Model Manager") < rendered.indexOf("Failover Chains"));
+	assert.ok(
+		rendered.indexOf("Model Manager") < rendered.indexOf("Failover Chains"),
+	);
 	assert.ok(rendered.indexOf("Failover Chains") < rendered.indexOf("History"));
 	assert.match(rendered, /> Model Manager/);
 	assert.doesNotMatch(rendered, /> Failover Chains/);
@@ -78,18 +87,55 @@ test("TAB_ORDER and manager tabs stay in the fixed order with an active marker",
 
 test("groupRecordsForDisplay groups by remote group or provider alias and stably sorts copies", () => {
 	const records = [
-		record({ id: "z", providerAlias: "provider-z", modelId: "same", label: "Same" }),
-		record({ id: "b", providerAlias: "provider-a", modelId: "z-model", label: "Z", remoteGroup: "shared" }),
-		record({ id: "a", providerAlias: "provider-a", modelId: "a-model", label: "A", remoteGroup: "shared" }),
-		record({ id: "c", providerAlias: "provider-a", modelId: "a-model", label: "A", remoteGroup: "shared" }),
-		record({ id: "y", providerAlias: "provider-y", modelId: "same", label: "Same" }),
+		record({
+			id: "z",
+			providerAlias: "provider-z",
+			modelId: "same",
+			label: "Same",
+		}),
+		record({
+			id: "b",
+			providerAlias: "provider-a",
+			modelId: "z-model",
+			label: "Z",
+			remoteGroup: "shared",
+		}),
+		record({
+			id: "a",
+			providerAlias: "provider-a",
+			modelId: "a-model",
+			label: "A",
+			remoteGroup: "shared",
+		}),
+		record({
+			id: "c",
+			providerAlias: "provider-a",
+			modelId: "a-model",
+			label: "A",
+			remoteGroup: "shared",
+		}),
+		record({
+			id: "y",
+			providerAlias: "provider-y",
+			modelId: "same",
+			label: "Same",
+		}),
 	];
 	const before = structuredClone(records);
 	const groups = groupRecordsForDisplay(records);
 
-	assert.deepEqual(groups.map(({ title }) => title), ["provider-y", "provider-z", "shared"]);
-	assert.deepEqual(groups.find(({ title }) => title === "shared")?.items.map(({ id }) => id), ["a", "c", "b"]);
-	assert.deepEqual(groups.find(({ title }) => title === "provider-y")?.items.map(({ id }) => id), ["y"]);
+	assert.deepEqual(
+		groups.map(({ title }) => title),
+		["provider-y", "provider-z", "shared"],
+	);
+	assert.deepEqual(
+		groups.find(({ title }) => title === "shared")?.items.map(({ id }) => id),
+		["a", "c", "b"],
+	);
+	assert.deepEqual(
+		groups.find(({ title }) => title === "provider-y")?.items.map(({ id }) => id),
+		["y"],
+	);
 	assert.deepEqual(records, before);
 });
 
@@ -104,7 +150,10 @@ test("manager renders blocked hints and basename-only conflict projections", () 
 	assert.match(renderManagerScreen(blocked), /malformed/);
 	assert.match(renderManagerScreen(blocked), /原始字节已保留/);
 	assert.match(renderManagerScreen(blocked), /raw bytes preserved/);
-	assert.doesNotMatch(renderManagerScreen(blocked), /private blocked explanation/);
+	assert.doesNotMatch(
+		renderManagerScreen(blocked),
+		/private blocked explanation/,
+	);
 
 	const result: TransactionResult = {
 		ok: false,
@@ -124,7 +173,10 @@ test("manager renders blocked hints and basename-only conflict projections", () 
 		],
 		message: "prepare conflict",
 	};
-	const updated = applyTuiAction(state(), { type: "transaction-result", result });
+	const updated = applyTuiAction(state(), {
+		type: "transaction-result",
+		result,
+	});
 	assert.deepEqual(updated.conflict, {
 		ok: false,
 		phase: "prepare",
@@ -137,7 +189,7 @@ test("manager renders blocked hints and basename-only conflict projections", () 
 			},
 			{
 				path: "[redacted]",
-				expectRevision: "[redacted]",
+				expectRevision: "missing",
 				actualRevision: "[redacted]",
 			},
 		],
@@ -145,7 +197,10 @@ test("manager renders blocked hints and basename-only conflict projections", () 
 	const rendered = renderManagerScreen(updated);
 	assert.match(rendered, /prepare/);
 	assert.match(rendered, /Status: conflict/);
-	assert.doesNotMatch(rendered, /catalog-read-conflict|prepare conflict|AI Workplace|private|hunter2/);
+	assert.doesNotMatch(
+		rendered,
+		/catalog-read-conflict|prepare conflict|AI Workplace|private|hunter2/,
+	);
 	assert.match(rendered, /models\.json/);
 	assert.match(rendered, /expect=0123456789abcdef/);
 	assert.match(rendered, /actual=fedcba9876543210/);
@@ -169,17 +224,26 @@ test("failover and history screens render validated identities and known interna
 	assert.match(failover, /mm-provider-a-fingerprint.*Claude 3\.5 Sonnet/);
 	assert.match(failover, /backup@2026-09-01.*provider-b\/model-b/);
 	const history = renderHistoryScreen(current);
-	assert.ok(history.indexOf("Transaction committed") < history.indexOf("Raw input accepted"));
+	assert.ok(
+		history.indexOf("Transaction committed") <
+			history.indexOf("Raw input accepted"),
+	);
 });
 
 test("applyTuiAction handles parser, delete, and confirmation semantics without ambient I/O", () => {
 	let current = applyTuiAction(state(), { type: "switch-tab", tab: "history" });
 	assert.equal(current.tab, "history");
-	current = applyTuiAction(current, { type: "select-record", recordId: "hunter2" });
+	current = applyTuiAction(current, {
+		type: "select-record",
+		recordId: "hunter2",
+	});
 	assert.match(current.message ?? "", /selected/i);
 	assert.doesNotMatch(JSON.stringify(current), /hunter2/);
 
-	current = applyTuiAction(current, { type: "raw-input-submit", text: "valid-a\nvalid-b" });
+	current = applyTuiAction(current, {
+		type: "raw-input-submit",
+		text: "valid-a\nvalid-b",
+	});
 	assert.match(current.message ?? "", /accepted/i);
 	assert.equal(typeof process.env.PATH, "string");
 	current = applyTuiAction(current, {
@@ -209,7 +273,10 @@ test("applyTuiAction handles parser, delete, and confirmation semantics without 
 		state({ pendingDraft: draft }),
 		state({ pendingImpact: impact }),
 	]) {
-		const ignored = applyTuiAction(incomplete, { type: "confirm-cascade", ack: true });
+		const ignored = applyTuiAction(incomplete, {
+			type: "confirm-cascade",
+			ack: true,
+		});
 		assert.match(ignored.message ?? "", /ignored|required/i);
 		assert.doesNotMatch(ignored.message ?? "", /ready/i);
 	}
@@ -225,7 +292,10 @@ test("applyTuiAction handles parser, delete, and confirmation semantics without 
 
 test("applyTuiAction keeps invalid batches safe and never includes the submitted key", () => {
 	const secret = "tui-secret-value";
-	const raw = applyTuiAction(state(), { type: "raw-input-submit", text: `${secret}\n${secret}` });
+	const raw = applyTuiAction(state(), {
+		type: "raw-input-submit",
+		text: `${secret}\n${secret}`,
+	});
 	assert.match(raw.message ?? "", /rejected|invalid/i);
 	assert.equal(JSON.stringify(raw).includes(secret), false);
 
@@ -242,7 +312,9 @@ test("applyTuiAction commit, cancel, and transaction-result markers are pure sta
 	assert.match(missing.message ?? "", /no draft/i);
 	assert.doesNotMatch(missing.message ?? "", /submitting/i);
 
-	const submitting = applyTuiAction(state({ pendingDraft: draft }), { type: "commit-draft" });
+	const submitting = applyTuiAction(state({ pendingDraft: draft }), {
+		type: "commit-draft",
+	});
 	assert.deepEqual(submitting.pendingDraft, draft);
 	assert.match(submitting.message ?? "", /submitting/i);
 
@@ -269,19 +341,22 @@ test("applyTuiAction commit, cancel, and transaction-result markers are pure sta
 	assert.deepEqual(updated.conflict, {
 		ok: false,
 		phase: "commit",
-		status: "conflict",
+		status: "failed",
 		conflicts: [],
 	});
 	assert.match(updated.message ?? "", /commit|failed/i);
 	assert.doesNotMatch(JSON.stringify(updated), /commit-failed/);
 
-	const succeeded = applyTuiAction(state({ pendingDraft: draft, pendingImpact: impact }), {
-		type: "transaction-result",
-		result: { ok: true, committed: ["/private/hunter2/models.json"] },
-	});
+	const succeeded = applyTuiAction(
+		state({ pendingDraft: draft, pendingImpact: impact }),
+		{
+			type: "transaction-result",
+			result: { ok: true, committed: ["/private/hunter2/models.json"] },
+		},
+	);
 	assert.equal(succeeded.pendingDraft, null);
 	assert.equal(succeeded.pendingImpact, null);
-	assert.equal(succeeded.conflict, null);
+	assert.deepEqual(succeeded.conflict, { ok: true, committedCount: 1 });
 	assert.doesNotMatch(JSON.stringify(succeeded), /private|hunter2|models\.json/);
 });
 
@@ -302,11 +377,13 @@ test("all reducer actions remove secret-shaped draft fields from state", () => {
 		phase: "prepare",
 		code: secret,
 		message: secret,
-		conflicts: [{
-			path: `/private/${secret}/models.json`,
-			expectRevision: secret,
-			actualRevision: secret,
-		}],
+		conflicts: [
+			{
+				path: `/private/${secret}/models.json`,
+				expectRevision: secret,
+				actualRevision: secret,
+			},
+		],
 	};
 	const actions: TuiAction[] = [
 		{ type: "switch-tab", tab: "history" },
@@ -318,7 +395,10 @@ test("all reducer actions remove secret-shaped draft fields from state", () => {
 		{ type: "commit-draft" },
 		{ type: "cancel-draft" },
 		{ type: "transaction-result", result: failure },
-		{ type: "transaction-result", result: { ok: true, committed: [`/${secret}/models.json`] } },
+		{
+			type: "transaction-result",
+			result: { ok: true, committed: [`/${secret}/models.json`] },
+		},
 	];
 	for (const action of actions) {
 		const updated = applyTuiAction(
@@ -344,7 +424,7 @@ test("all three screens omit low-entropy secrets from untrusted state shapes", (
 		snapshot: snapshot([record({ unknownField: secret })]),
 		blocked: { reason: "unreadable", message: secret },
 		message: `Selected record: ${secret}`,
-		pendingDraft: { ...draft, secret },
+		pendingDraft: { ...draft, secret } as ModelManagerDraft,
 		failoverSummary: {
 			chainCount: 0,
 			entries: [],
@@ -370,7 +450,10 @@ test("transaction-result stores only a safe conflict projection", () => {
 		message: secret,
 		conflicts: [{ path: secret, expectRevision: secret, actualRevision: secret }],
 	};
-	const updated = applyTuiAction(state(), { type: "transaction-result", result });
+	const updated = applyTuiAction(state(), {
+		type: "transaction-result",
+		result,
+	});
 
 	assert.equal(JSON.stringify(updated).includes(secret), false);
 	assert.match(updated.message ?? "", /failed/i);
@@ -397,7 +480,10 @@ test("renderers use trusted field shapes without opaque-value heuristics", () =>
 			}),
 		]),
 		message: "hunter2",
-		history: ["hunter2", "Environment input rejected: invalid batch; sensitive values omitted"],
+		history: [
+			"hunter2",
+			"Environment input rejected: invalid batch; sensitive values omitted",
+		],
 	});
 	const manager = renderManagerScreen(unsafe);
 	assert.match(manager, /Claude 3\.5 Sonnet/);
@@ -417,7 +503,139 @@ test("failover chainCount is rendered only when it is a bounded finite integer",
 	const rendered = renderFailoverScreen(hostile);
 	assert.match(rendered, /Chains: \[redacted\]/);
 	assert.doesNotMatch(rendered, /hunter2/);
-	assert.match(renderFailoverScreen(state({
-		failoverSummary: { chainCount: 100_000, entries: [] },
-	})), /Chains: 100000/);
+	assert.match(
+		renderFailoverScreen(
+			state({
+				failoverSummary: { chainCount: 100_000, entries: [] },
+			}),
+		),
+		/Chains: 100000/,
+	);
+});
+
+test("transaction projection keeps safe status, revisions, and committed count", () => {
+	const failed = applyTuiAction(state(), {
+		type: "transaction-result",
+		result: {
+			ok: false,
+			phase: "commit",
+			code: "commit-failed",
+			message: "private failure details",
+		},
+	});
+	assert.deepEqual(failed.conflict, {
+		ok: false,
+		phase: "commit",
+		status: "failed",
+		conflicts: [],
+	});
+
+	const conflict = applyTuiAction(state(), {
+		type: "transaction-result",
+		result: {
+			ok: false,
+			phase: "prepare",
+			code: "catalog-read-conflict",
+			message: "private conflict details",
+			conflicts: [
+				{
+					path: "/private/models.json",
+					expectRevision: "missing",
+					actualRevision: "0123456789abcdef",
+				},
+			],
+		},
+	});
+	assert.deepEqual(conflict.conflict, {
+		ok: false,
+		phase: "prepare",
+		status: "conflict",
+		conflicts: [
+				{
+					path: "models.json",
+					expectRevision: "missing",
+					actualRevision: "0123456789abcdef",
+				},
+			],
+	});
+
+	const committed = applyTuiAction(state({ pendingDraft: draft }), {
+		type: "transaction-result",
+		result: {
+			ok: true,
+			committed: ["/private/models.json", "/private/model-manager.json"],
+		},
+	});
+	assert.deepEqual(committed.conflict, { ok: true, committedCount: 2 });
+	assert.equal(committed.pendingDraft, null);
+	assert.match(renderManagerScreen(committed), /Transaction committed: 2 file/);
+});
+
+test("environment action reads only its optional read-only env object", () => {
+	const secret = "environment-secret-value";
+	const updated = applyTuiAction(state(), {
+		type: "environment-submit",
+		names: ["MODEL_MANAGER_TUI_TEST_KEY"],
+		env: { MODEL_MANAGER_TUI_TEST_KEY: "valid-environment-value" },
+	} as TuiAction);
+	assert.match(updated.message ?? "", /accepted/i);
+	assert.equal(JSON.stringify(updated).includes(secret), false);
+});
+
+test("known draft secrets stay out of state, conflict projections, and all screens", () => {
+	const secret = "hunter2";
+	const unsafeDraft = {
+		...draft,
+		secret,
+		fields: { ...draft.fields, label: secret, modelId: secret },
+		advanced: { safe: secret, normal: "kept" },
+	} as ModelManagerDraft;
+	const unsafe = state({
+		snapshot: snapshot([
+			record({
+				id: "secret-record",
+				providerAlias: secret,
+				modelId: secret,
+				label: secret,
+			}),
+			record({
+				id: "normal-record",
+				providerAlias: "provider-normal",
+				modelId: "gpt-4o",
+				label: "GPT-4o",
+			}),
+		]),
+		blocked: { reason: "unreadable", message: `blocked ${secret}` },
+		message: `Selected record: ${secret}`,
+		pendingDraft: unsafeDraft,
+		conflict: {
+			ok: false,
+			phase: "prepare",
+			status: "conflict",
+			conflicts: [
+				{
+					path: `/private/${secret}.json`,
+					expectRevision: secret,
+					actualRevision: "fedcba9876543210",
+				},
+			],
+		},
+		history: [`saved ${secret}`],
+	});
+	const projected = applyTuiAction(unsafe, { type: "switch-tab", tab: "history" });
+	assert.equal(JSON.stringify(projected).includes(secret), false);
+	assert.equal(projected.pendingDraft?.fields.modelId, "[redacted]");
+	assert.deepEqual(projected.pendingDraft?.advanced, {
+		safe: "[redacted]",
+		normal: "kept",
+	});
+	assert.match(renderManagerScreen(unsafe), /GPT-4o/);
+	for (const rendered of [
+		renderManagerScreen(unsafe),
+		renderFailoverScreen(unsafe),
+		renderHistoryScreen(unsafe),
+	]) {
+		assert.equal(rendered.includes(secret), false);
+		assert.doesNotMatch(rendered, /blocked hunter2|\/private\//);
+	}
 });
