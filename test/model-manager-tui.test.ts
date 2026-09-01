@@ -561,12 +561,12 @@ test("transaction projection keeps safe status, revisions, and committed count",
 		phase: "prepare",
 		status: "conflict",
 		conflicts: [
-				{
-					path: "models.json",
-					expectRevision: "missing",
-					actualRevision: "0123456789abcdef",
-				},
-			],
+			{
+				path: "models.json",
+				expectRevision: "missing",
+				actualRevision: "0123456789abcdef",
+			},
+		],
 	});
 
 	const committed = applyTuiAction(state({ pendingDraft: draft }), {
@@ -632,7 +632,10 @@ test("known draft secrets stay out of state, conflict projections, and all scree
 		},
 		history: [`saved ${secret}`],
 	});
-	const projected = applyTuiAction(unsafe, { type: "switch-tab", tab: "history" });
+	const projected = applyTuiAction(unsafe, {
+		type: "switch-tab",
+		tab: "history",
+	});
 	assert.equal(JSON.stringify(projected).includes(secret), false);
 	assert.equal(projected.pendingDraft?.fields.modelId, "[redacted]");
 	assert.deepEqual(projected.pendingDraft?.advanced, {
@@ -649,7 +652,6 @@ test("known draft secrets stay out of state, conflict projections, and all scree
 		assert.doesNotMatch(rendered, /blocked hunter2|\/private\//);
 	}
 });
-
 
 test("reducer sanitizes unsafe pending impact before returning or rendering", () => {
 	const secret = "impact-secret-9f42c17b";
@@ -674,7 +676,10 @@ test("reducer sanitizes unsafe pending impact before returning or rendering", ()
 		],
 		referenced: true,
 	} as unknown as CatalogImpact;
-	const unsafe = state({ pendingDraft: unsafeDraft, pendingImpact: unsafeImpact });
+	const unsafe = state({
+		pendingDraft: unsafeDraft,
+		pendingImpact: unsafeImpact,
+	});
 	const actions: TuiAction[] = [
 		{ type: "switch-tab", tab: "history" },
 		{ type: "select-record", recordId: "record-a" },
@@ -826,7 +831,7 @@ test("blocked raw bytes remain opaque and are never rendered as text", () => {
 	);
 
 	assert.ok(projected.blocked?.rawBytes instanceof Uint8Array);
-	assert.deepEqual([...projected.blocked?.rawBytes ?? []], [...rawBytes]);
+	assert.deepEqual([...(projected.blocked?.rawBytes ?? [])], [...rawBytes]);
 	const rendered = renderManagerScreen(projected);
 	assert.doesNotMatch(rendered, /104,117,110,116,101,114,50|hunter2/);
 	assert.match(rendered, /raw bytes preserved/);

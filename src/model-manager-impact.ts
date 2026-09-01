@@ -98,7 +98,9 @@ function compareChainReferences(a: ChainReference, b: ChainReference): number {
 	);
 }
 
-function uniqueChainReferences(references: readonly ChainReference[]): ChainReference[] {
+function uniqueChainReferences(
+	references: readonly ChainReference[],
+): ChainReference[] {
 	const seen = new Set<string>();
 	const result: ChainReference[] = [];
 	for (const reference of references) {
@@ -155,11 +157,17 @@ function scanChain(
 	}
 	if (Array.isArray(value)) {
 		for (const child of value) {
-			scanChain(child, file, record, {
-				...context,
-				mapKey: undefined,
-				mapContainer: false,
-			}, result);
+			scanChain(
+				child,
+				file,
+				record,
+				{
+					...context,
+					mapKey: undefined,
+					mapContainer: false,
+				},
+				result,
+			);
 		}
 		return;
 	}
@@ -167,13 +175,19 @@ function scanChain(
 
 	if (context.mapContainer) {
 		for (const [key, child] of Object.entries(value)) {
-			scanChain(child, file, record, {
-				chainId: key,
-				mapKey: key,
-				entryCandidate: true,
-				mapContainer: false,
-				inProviders: context.inProviders,
-			}, result);
+			scanChain(
+				child,
+				file,
+				record,
+				{
+					chainId: key,
+					mapKey: key,
+					entryCandidate: true,
+					mapContainer: false,
+					inProviders: context.inProviders,
+				},
+				result,
+			);
 		}
 		return;
 	}
@@ -237,11 +251,17 @@ function scanGenerated(
 ): void {
 	if (Array.isArray(value)) {
 		for (const child of value) {
-			scanGenerated(child, file, record, {
-				...context,
-				mapKey: undefined,
-				mapContainer: false,
-			}, result);
+			scanGenerated(
+				child,
+				file,
+				record,
+				{
+					...context,
+					mapKey: undefined,
+					mapContainer: false,
+				},
+				result,
+			);
 		}
 		return;
 	}
@@ -249,13 +269,19 @@ function scanGenerated(
 
 	if (context.mapContainer) {
 		for (const [key, child] of Object.entries(value)) {
-			scanGenerated(child, file, record, {
-				chainId: key,
-				mapKey: key,
-				entryCandidate: true,
-				mapContainer: false,
-				inProviders: context.inProviders,
-			}, result);
+			scanGenerated(
+				child,
+				file,
+				record,
+				{
+					chainId: key,
+					mapKey: key,
+					entryCandidate: true,
+					mapContainer: false,
+					inProviders: context.inProviders,
+				},
+				result,
+			);
 		}
 		return;
 	}
@@ -391,7 +417,9 @@ export function scanStateReferences(
 
 async function readJson(
 	path: string,
-): Promise<{ ok: true; value: unknown } | { ok: false; error: ModelManagerError }> {
+): Promise<
+	{ ok: true; value: unknown } | { ok: false; error: ModelManagerError }
+> {
 	try {
 		const bytes = await readFile(path);
 		const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -421,13 +449,18 @@ export async function analyzeDeletionImpact(
 		readJson(readonlyPaths.chainsPath),
 		readJson(readonlyPaths.statePath),
 	]);
-	if (!chainsRead.ok || !stateRead.ok) return { ok: false, error: { ...READ_ERROR } };
+	if (!chainsRead.ok || !stateRead.ok)
+		return { ok: false, error: { ...READ_ERROR } };
 
 	const chainReferences = uniqueChainReferences([
 		...scanModelEntries(chainsRead.value, readonlyPaths.chainsPath, record),
 		...scanGeneratedBlocks(chainsRead.value, readonlyPaths.chainsPath, record),
 	]);
-	const stateReferences = scanStateReferences(stateRead.value, readonlyPaths.statePath, record);
+	const stateReferences = scanStateReferences(
+		stateRead.value,
+		readonlyPaths.statePath,
+		record,
+	);
 	return {
 		ok: true,
 		value: {

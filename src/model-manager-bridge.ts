@@ -25,7 +25,8 @@ function isSafeProviderAlias(value: unknown): value is string {
 export function registerFailoverChain(chainId: string): () => void {
 	if (!isSafeChainId(chainId)) return () => undefined;
 	const token = Symbol(chainId);
-	const registrations = registeredFailoverChains.get(chainId) ?? new Set<symbol>();
+	const registrations =
+		registeredFailoverChains.get(chainId) ?? new Set<symbol>();
 	registrations.add(token);
 	registeredFailoverChains.set(chainId, registrations);
 	let active = true;

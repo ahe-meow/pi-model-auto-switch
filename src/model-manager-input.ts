@@ -53,17 +53,27 @@ interface InputLine {
 	raw: string;
 }
 
-function rejectionFor(line: InputLine, seen: ReadonlySet<string>): RawKeyRejection | undefined {
+function rejectionFor(
+	line: InputLine,
+	seen: ReadonlySet<string>,
+): RawKeyRejection | undefined {
 	const normalized = normalizeKey(line.raw);
-	if (normalized.length === 0) return { line: line.line, reason: describeLine(line.line, "blank") };
+	if (normalized.length === 0)
+		return { line: line.line, reason: describeLine(line.line, "blank") };
 	if (/[\x00-\x1f\x7f]/.test(normalized)) {
-		return { line: line.line, reason: describeLine(line.line, "control character") };
+		return {
+			line: line.line,
+			reason: describeLine(line.line, "control character"),
+		};
 	}
 	if (normalized.startsWith("!")) {
 		return { line: line.line, reason: describeLine(line.line, "command") };
 	}
 	if (/[^\x20-\x7e]/.test(normalized)) {
-		return { line: line.line, reason: describeLine(line.line, "non-printable character") };
+		return {
+			line: line.line,
+			reason: describeLine(line.line, "non-printable character"),
+		};
 	}
 	if (seen.has(normalized)) {
 		return { line: line.line, reason: describeLine(line.line, "duplicate") };
@@ -102,7 +112,9 @@ function splitLines(text: string): string[] {
 }
 
 export function parseRawKeys(text: string): RawKeyBatchResult {
-	return parseLines(splitLines(text).map((raw, index) => ({ line: index + 1, raw })));
+	return parseLines(
+		splitLines(text).map((raw, index) => ({ line: index + 1, raw })),
+	);
 }
 
 export function parseEnvironmentKeys(
@@ -133,7 +145,9 @@ export function parseEnvironmentKeys(
 	}
 
 	const parsed = parseLines(lines);
-	const rejected = [...missingOrBlank, ...parsed.rejected].sort((a, b) => a.line - b.line);
+	const rejected = [...missingOrBlank, ...parsed.rejected].sort(
+		(a, b) => a.line - b.line,
+	);
 	return {
 		entries: rejected.length === 0 ? parsed.entries : [],
 		rejected,

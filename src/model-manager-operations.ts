@@ -766,9 +766,7 @@ export async function commitDeleteDraft(
 	const currentSnapshot: ModelManagerCatalogSnapshot = {
 		...io.snapshot,
 		records: current.value.sidecar.models.map(cloneRecord),
-		byId: new Map(
-			current.value.sidecar.models.map((entry) => [entry.id, entry]),
-		),
+		byId: new Map(current.value.sidecar.models.map((entry) => [entry.id, entry])),
 	};
 	const after = applyCatalogDraft(currentSnapshot, { remove: [recordId] });
 	const sidecarAfter: ModelManagerSidecar = {
@@ -787,10 +785,7 @@ export async function commitDeleteDraft(
 		],
 	});
 	if (!commit.ok) {
-		return failure(
-			`transaction-${commit.phase}-failed`,
-			commit.message,
-		);
+		return failure(`transaction-${commit.phase}-failed`, commit.message);
 	}
 	try {
 		await notifyModelManagerDelete(recordId, io.impact);

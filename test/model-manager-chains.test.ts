@@ -21,7 +21,9 @@ const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 const testAgentDir = await mkdtemp(join(tmpdir(), "model-manager-index-"));
 process.env.PI_CODING_AGENT_DIR = testAgentDir;
 const index = await import("../src/index.ts");
-const bridgeModule = (await import("../src/model-manager-bridge.ts")) as typeof import("../src/model-manager-bridge.ts") & {
+const bridgeModule = (await import(
+	"../src/model-manager-bridge.ts"
+)) as typeof import("../src/model-manager-bridge.ts") & {
 	clearFailoverChains?: () => void;
 	clearModelManagerBridge?: () => void;
 };
@@ -36,7 +38,10 @@ const expectedIndexExports = new Set([
 	"modelManagerCommand",
 ]);
 
-type CommandHandler = (args: string, ctx: unknown) => unknown | Promise<unknown>;
+type CommandHandler = (
+	args: string,
+	ctx: unknown,
+) => unknown | Promise<unknown>;
 
 function emptyTargetRuntime(): TargetRuntime {
 	return {
@@ -126,7 +131,9 @@ after(async () => {
 	await rm(testAgentDir, { force: true, recursive: true });
 });
 
-function record(overrides: Partial<ModelManagerRecord> = {}): ModelManagerRecord {
+function record(
+	overrides: Partial<ModelManagerRecord> = {},
+): ModelManagerRecord {
 	return {
 		id: "record-a",
 		providerAlias: "provider-a",
@@ -157,8 +164,6 @@ const impact: CatalogImpact = {
 	referenced: true,
 };
 
-
-
 test("selectCatalogRecordsForChains filters to sidecar records only", () => {
 	const sidecarA = record({
 		id: "sidecar-a",
@@ -166,7 +171,10 @@ test("selectCatalogRecordsForChains filters to sidecar records only", () => {
 	});
 	const sidecarB = record({ id: "sidecar-b", modelId: "model-b" });
 	const orphan = record({ id: "orphan", modelId: "orphan-model" });
-	const providerOnly = record({ id: "provider-only", modelId: "provider-model" });
+	const providerOnly = record({
+		id: "provider-only",
+		modelId: "provider-model",
+	});
 	const current = snapshot(
 		[sidecarA, sidecarB, orphan],
 		[sidecarA, sidecarB, providerOnly],
@@ -184,8 +192,14 @@ test("selectCatalogRecordsForChains filters to sidecar records only", () => {
 	assert.strictEqual(current.byId.get(providerOnly.id), providerOnly);
 	assert.deepEqual(current.records, beforeRecords);
 	assert.deepEqual([...current.byId.entries()], beforeById);
-	assert.equal(selected.some((entry) => entry.id === orphan.id), false);
-	assert.equal(selected.some((entry) => entry.id === providerOnly.id), false);
+	assert.equal(
+		selected.some((entry) => entry.id === orphan.id),
+		false,
+	);
+	assert.equal(
+		selected.some((entry) => entry.id === providerOnly.id),
+		false,
+	);
 	const equivalentClone = structuredClone(sidecarA);
 	assert.deepEqual(
 		selectCatalogRecordsForChains(snapshot([sidecarA], [equivalentClone])),
@@ -382,7 +396,10 @@ test("index wires delete coordinator through the runtime chain queue", async () 
 	const firstStartedPromise = new Promise<void>((resolve) => {
 		firstStarted = resolve;
 	});
-	const coordinator = async (recordId: string, receivedImpact: CatalogImpact) => {
+	const coordinator = async (
+		recordId: string,
+		receivedImpact: CatalogImpact,
+	) => {
 		assert.strictEqual(receivedImpact, impact);
 		events.push(`start:${recordId}`);
 		if (recordId === "first") {
@@ -442,10 +459,7 @@ test("bridge delete routes through coordinator callback and leaves failover file
 		const before = await Promise.all(failoverPaths.map((path) => readFile(path)));
 		const calls: Array<{ recordId: string; impact: CatalogImpact }> = [];
 		registerModelManagerBridge({
-			onDeleteRecord: async (
-				recordId: string,
-				receivedImpact: CatalogImpact,
-			) => {
+			onDeleteRecord: async (recordId: string, receivedImpact: CatalogImpact) => {
 				calls.push({ recordId, impact: receivedImpact });
 			},
 		});
@@ -478,7 +492,8 @@ test("bridge delete propagates coordinator callback errors", async () => {
 
 test("index exports model manager api as a superset of previous exports", () => {
 	const exported = new Set(Object.keys(index));
-	for (const name of expectedIndexExports) assert.equal(exported.has(name), true, name);
+	for (const name of expectedIndexExports)
+		assert.equal(exported.has(name), true, name);
 	for (const name of [
 		"buildVirtualModel",
 		"notifyModelManagerDelete",

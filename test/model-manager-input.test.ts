@@ -24,14 +24,21 @@ test("parseRawKeys rejects empty and blank only input", () => {
 	const empty = parseRawKeys("");
 	assert.equal(empty.accepted, false);
 	assert.deepEqual(empty.entries, []);
-	assert.deepEqual(empty.rejected.map(({ line }) => line), [1]);
+	assert.deepEqual(
+		empty.rejected.map(({ line }) => line),
+		[1],
+	);
 	assert.match(empty.rejected[0]?.reason ?? "", /blank/i);
 
 	const blank = parseRawKeys("  \r\n\t  \n");
 	assert.equal(blank.accepted, false);
 	assert.deepEqual(blank.entries, []);
-	assert.deepEqual(blank.rejected.map(({ line }) => line), [1, 2]);
-	for (const rejection of blank.rejected) assert.match(rejection.reason, /blank/i);
+	assert.deepEqual(
+		blank.rejected.map(({ line }) => line),
+		[1, 2],
+	);
+	for (const rejection of blank.rejected)
+		assert.match(rejection.reason, /blank/i);
 });
 
 test("parseRawKeys rejects control characters", () => {
@@ -41,7 +48,10 @@ test("parseRawKeys rejects control characters", () => {
 
 	assert.equal(result.accepted, false);
 	assert.deepEqual(result.entries, []);
-	assert.deepEqual(result.rejected.map(({ line }) => line), [2, 3]);
+	assert.deepEqual(
+		result.rejected.map(({ line }) => line),
+		[2, 3],
+	);
 	for (const rejection of result.rejected) {
 		assert.match(rejection.reason, /control/i);
 		assert.doesNotMatch(rejection.reason, /sk-|bad/);
@@ -53,7 +63,10 @@ test("parseRawKeys rejects command style lines starting with !", () => {
 
 	assert.equal(result.accepted, false);
 	assert.deepEqual(result.entries, []);
-	assert.deepEqual(result.rejected.map(({ line }) => line), [1]);
+	assert.deepEqual(
+		result.rejected.map(({ line }) => line),
+		[1],
+	);
 	assert.match(result.rejected[0]?.reason ?? "", /command/i);
 	assert.doesNotMatch(result.rejected[0]?.reason ?? "", /command-secret-value/);
 });
@@ -66,7 +79,10 @@ test("parseRawKeys rejects illegal characters and duplicates as a whole batch", 
 
 	assert.equal(result.accepted, false);
 	assert.deepEqual(result.entries, []);
-	assert.deepEqual(result.rejected.map(({ line }) => line), [2, 3]);
+	assert.deepEqual(
+		result.rejected.map(({ line }) => line),
+		[2, 3],
+	);
 	assert.match(result.rejected[0]?.reason ?? "", /printable|character|illegal/i);
 	assert.match(result.rejected[1]?.reason ?? "", /duplicate/i);
 });
@@ -86,12 +102,13 @@ test("parseRawKeys rejections never contain secret material", () => {
 		assert.equal(serialized.includes(key), false, `leaked ${key}`);
 	}
 	for (const rejection of result.rejected) {
-		for (const key of inputKeys) assert.equal(rejection.reason.includes(key), false);
+		for (const key of inputKeys)
+			assert.equal(rejection.reason.includes(key), false);
 	}
 });
 
 test("parseRawKeys accepts valid unique keys with one alias per key", () => {
-	const result = parseRawKeys("  sk-valid-alpha  \r\n\"sk-valid-beta\"");
+	const result = parseRawKeys('  sk-valid-alpha  \r\n"sk-valid-beta"');
 
 	assert.equal(result.accepted, true);
 	assert.deepEqual(result.rejected, []);
@@ -142,7 +159,10 @@ test("parseEnvironmentKeys rejects missing env vars as whole batch", () => {
 
 	assert.equal(result.accepted, false);
 	assert.deepEqual(result.entries, []);
-	assert.deepEqual(result.rejected.map(({ line }) => line), [1, 2]);
+	assert.deepEqual(
+		result.rejected.map(({ line }) => line),
+		[1, 2],
+	);
 	assert.match(result.rejected[0]?.reason ?? "", /missing/i);
 	assert.match(result.rejected[1]?.reason ?? "", /blank|empty/i);
 	for (const rejection of result.rejected) {

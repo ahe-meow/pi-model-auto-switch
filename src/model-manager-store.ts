@@ -1,12 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import {
-	lstat,
-	mkdir,
-	open,
-	readFile,
-	rename,
-	unlink,
-} from "node:fs/promises";
+import { lstat, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { basename, dirname, resolve, sep } from "node:path";
 import type { ModelManagerError } from "./model-manager-types.ts";
 
@@ -67,7 +60,10 @@ function revisionFor(bytes: Uint8Array): string {
 export async function readRevision(path: string): Promise<FileRevision> {
 	const normalized = normalizedPath(path);
 	try {
-		return { path: normalized, revision: revisionFor(await readFile(normalized)) };
+		return {
+			path: normalized,
+			revision: revisionFor(await readFile(normalized)),
+		};
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
 			return { path: normalized, revision: "missing" };
@@ -100,12 +96,17 @@ async function cleanupCreatedLock(
 ): Promise<void> {
 	if (!identity) throw new Error("Lock ownership could not be verified");
 	const current = await lstat(path, { bigint: true });
-	if (String(current.dev) !== identity.device || String(current.ino) !== identity.inode)
+	if (
+		String(current.dev) !== identity.device ||
+		String(current.ino) !== identity.inode
+	)
 		throw new Error("Lock ownership changed before cleanup");
 	await unlink(path);
 }
 
-async function acquireLock(path: string): Promise<{ path: string; token: string }> {
+async function acquireLock(
+	path: string,
+): Promise<{ path: string; token: string }> {
 	const lock = lockPath(path);
 	const token = randomUUID();
 	const deadline = Date.now() + LOCK_TIMEOUT_MS;
@@ -144,7 +145,9 @@ async function acquireLock(path: string): Promise<{ path: string; token: string 
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 			if (Date.now() >= deadline)
 				throw new Error("Timed out waiting for file lock");
-			await new Promise((resolvePromise) => setTimeout(resolvePromise, LOCK_RETRY_MS));
+			await new Promise((resolvePromise) =>
+				setTimeout(resolvePromise, LOCK_RETRY_MS),
+			);
 		}
 	}
 }
@@ -175,7 +178,9 @@ function isCatalogPath(path: string): boolean {
 }
 
 function safeErrorName(error: unknown): string {
-	return error instanceof Error && error.name.length > 0 ? error.name : "UnknownError";
+	return error instanceof Error && error.name.length > 0
+		? error.name
+		: "UnknownError";
 }
 
 async function writeAtomically(path: string, bytes: Uint8Array): Promise<void> {
@@ -287,96 +292,97 @@ export async function commitCatalogTransaction(
 
 	try {
 		return await withFileLocks(
-		writes.map((entry) => entry.path),
-		async () => {
-			const conflicts: Array<{
-				path: string;
-				expectRevision: string;
-				actualRevision: string;
-			}> = [];
-			const actualRevisions = new Map<string, string>();
-			for (const entry of writes) {
-				try {
-					const actual = await readRevision(entry.path);
-					actualRevisions.set(entry.path, actual.revision);
-					if (actual.revision !== entry.expectRevision) {
-						conflicts.push({
-							path: entry.path,
-							expectRevision: entry.expectRevision,
-							actualRevision: actual.revision,
-						});
+			writes.map((entry) => entry.path),
+			async () => {
+				const conflicts: Array<{
+					path: string;
+					expectRevision: string;
+					actualRevision: string;
+				}> = [];
+				const actualRevisions = new Map<string, string>();
+				for (const entry of writes) {
+					try {
+						const actual = await readRevision(entry.path);
+						actualRevisions.set(entry.path, actual.revision);
+						if (actual.revision !== entry.expectRevision) {
+							conflicts.push({
+								path: entry.path,
+								expectRevision: entry.expectRevision,
+								actualRevision: actual.revision,
+							});
+						}
+					} catch (error) {
+						return {
+							ok: false,
+							phase: "prepare",
+							message: `prepare failed (${safeErrorName(error)})`,
+						} satisfies TransactionResult;
 					}
-				} catch (error) {
+				}
+				if (conflicts.length > 0)
 					return {
 						ok: false,
 						phase: "prepare",
-						message: `prepare failed (${safeErrorName(error)})`,
-					} satisfies TransactionResult;
-				}
-			}
-			if (conflicts.length > 0)
-				return {
-					ok: false,
-					phase: "prepare",
-					conflicts,
-					message: "prepare conflict: catalog changed before commit",
-				};
-
-			const originals: OriginalFile[] = [];
-			for (const entry of writes) {
-				try {
-					const original = await cacheOriginal(entry.path);
-					originals.push(original);
-					const actual = original.bytes === undefined ? "missing" : revisionFor(original.bytes);
-					if (actual !== actualRevisions.get(entry.path)) {
-						conflicts.push({
-							path: entry.path,
-							expectRevision: entry.expectRevision,
-							actualRevision: actual,
-						});
-					}
-				} catch (error) {
-					return {
-						ok: false,
-						phase: "prepare",
-						message: `prepare failed (${safeErrorName(error)})`,
-					} satisfies TransactionResult;
-				}
-			}
-			if (conflicts.length > 0)
-				return {
-					ok: false,
-					phase: "prepare",
-					conflicts,
-					message: "prepare conflict: catalog changed before commit",
-				};
-
-			const committed: string[] = [];
-			const attempted: string[] = [];
-			for (const entry of writes) {
-				attempted.push(entry.path);
-				try {
-					await write(entry.path, entry.bytes);
-					committed.push(entry.path);
-				} catch (error) {
-					const rollback = await rollbackWrites(originals, attempted, write);
-					const message =
-						rollback.rollbackFailure.length === 0
-							? `commit failed (${safeErrorName(error)}); earlier writes rolled back`
-							: `commit failed (${safeErrorName(error)}); rollback failed (${rollback.failureName ?? "UnknownError"})`;
-					return {
-						ok: false,
-						phase: "commit",
-						rolledBack: rollback.rolledBack,
-						...(rollback.rollbackFailure.length > 0
-							? { rollbackFailure: rollback.rollbackFailure }
-							: {}),
-						message,
+						conflicts,
+						message: "prepare conflict: catalog changed before commit",
 					};
+
+				const originals: OriginalFile[] = [];
+				for (const entry of writes) {
+					try {
+						const original = await cacheOriginal(entry.path);
+						originals.push(original);
+						const actual =
+							original.bytes === undefined ? "missing" : revisionFor(original.bytes);
+						if (actual !== actualRevisions.get(entry.path)) {
+							conflicts.push({
+								path: entry.path,
+								expectRevision: entry.expectRevision,
+								actualRevision: actual,
+							});
+						}
+					} catch (error) {
+						return {
+							ok: false,
+							phase: "prepare",
+							message: `prepare failed (${safeErrorName(error)})`,
+						} satisfies TransactionResult;
+					}
 				}
-			}
-			return { ok: true, committed };
-		},
+				if (conflicts.length > 0)
+					return {
+						ok: false,
+						phase: "prepare",
+						conflicts,
+						message: "prepare conflict: catalog changed before commit",
+					};
+
+				const committed: string[] = [];
+				const attempted: string[] = [];
+				for (const entry of writes) {
+					attempted.push(entry.path);
+					try {
+						await write(entry.path, entry.bytes);
+						committed.push(entry.path);
+					} catch (error) {
+						const rollback = await rollbackWrites(originals, attempted, write);
+						const message =
+							rollback.rollbackFailure.length === 0
+								? `commit failed (${safeErrorName(error)}); earlier writes rolled back`
+								: `commit failed (${safeErrorName(error)}); rollback failed (${rollback.failureName ?? "UnknownError"})`;
+						return {
+							ok: false,
+							phase: "commit",
+							rolledBack: rollback.rolledBack,
+							...(rollback.rollbackFailure.length > 0
+								? { rollbackFailure: rollback.rollbackFailure }
+								: {}),
+							message,
+						};
+					}
+				}
+				return { ok: true, committed };
+			},
 		);
 	} catch (error) {
 		return {

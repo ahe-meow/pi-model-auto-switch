@@ -68,7 +68,7 @@ export type TuiAction =
 	| {
 			type: "environment-submit";
 			names: readonly string[];
-		env?: Readonly<Record<string, string | undefined>>;
+			env?: Readonly<Record<string, string | undefined>>;
 	  }
 	| { type: "request-delete"; recordId: string }
 	| { type: "confirm-cascade"; ack: boolean }
@@ -107,9 +107,7 @@ function containsKnownSecret(
 	value: string,
 	secrets: readonly string[],
 ): boolean {
-	return secrets.some(
-		(secret) => secret.length > 0 && value.includes(secret),
-	);
+	return secrets.some((secret) => secret.length > 0 && value.includes(secret));
 }
 
 function safeBoundedText(
@@ -175,10 +173,7 @@ function safePath(value: unknown, secrets: readonly string[] = []): string {
 		: REDACTED_MESSAGE;
 }
 
-function safeRevision(
-	value: unknown,
-	secrets: readonly string[] = [],
-): string {
+function safeRevision(value: unknown, secrets: readonly string[] = []): string {
 	return typeof value === "string" &&
 		!containsKnownSecret(value, secrets) &&
 		SAFE_REVISION.test(value)
@@ -195,10 +190,7 @@ function safeCount(value: unknown): string {
 		: REDACTED_MESSAGE;
 }
 
-function safeMessage(
-	value: unknown,
-	secrets: readonly string[] = [],
-): string {
+function safeMessage(value: unknown, secrets: readonly string[] = []): string {
 	if (typeof value !== "string" || containsKnownSecret(value, secrets)) {
 		return REDACTED_MESSAGE;
 	}
@@ -242,9 +234,7 @@ function safeHistoryEntry(
 		return safeMessage(value, secrets);
 	}
 	const message = safeMessage(value, secrets);
-	return /^(Raw|Environment) input /.test(message)
-		? message
-		: REDACTED_MESSAGE;
+	return /^(Raw|Environment) input /.test(message) ? message : REDACTED_MESSAGE;
 }
 
 type SanitizedDraftValue =
@@ -261,7 +251,11 @@ function sanitizeAdvancedValue(
 	secrets: readonly string[],
 	seen = new WeakSet<object>(),
 ): SanitizedDraftValue {
-	if (value === null || typeof value === "number" || typeof value === "boolean") {
+	if (
+		value === null ||
+		typeof value === "number" ||
+		typeof value === "boolean"
+	) {
 		return value;
 	}
 	if (typeof value === "string") {
@@ -331,8 +325,7 @@ export function sanitizeDraftForState(
 	}
 	const advanced = sanitizeAdvancedValue(draft.advanced, secrets);
 	const sanitized: ModelManagerDraft = {
-		kind:
-			draft.kind === "edit" || draft.kind === "clone" ? draft.kind : "create",
+		kind: draft.kind === "edit" || draft.kind === "clone" ? draft.kind : "create",
 		fields,
 		advanced:
 			advanced && typeof advanced === "object" && !Array.isArray(advanced)
@@ -382,15 +375,20 @@ function sanitizeBlockedForState(
 ): ModelManagerBlockedState | null {
 	if (!blocked) return null;
 	const sanitized: ModelManagerBlockedState = {
-		reason: BLOCKED_REASONS.includes(blocked.reason) ? blocked.reason : "unreadable",
+		reason: BLOCKED_REASONS.includes(blocked.reason)
+			? blocked.reason
+			: "unreadable",
 		message: REDACTED_MESSAGE,
 	};
-	if (blocked.rawBytes instanceof Uint8Array) sanitized.rawBytes = blocked.rawBytes;
+	if (blocked.rawBytes instanceof Uint8Array)
+		sanitized.rawBytes = blocked.rawBytes;
 	if (blocked.compatibilityImport) {
 		sanitized.compatibilityImport = {
 			available: blocked.compatibilityImport.available === true,
 			sourcePaths: Array.isArray(blocked.compatibilityImport.sourcePaths)
-				? blocked.compatibilityImport.sourcePaths.map((path) => safePath(path, secrets))
+				? blocked.compatibilityImport.sourcePaths.map((path) =>
+						safePath(path, secrets),
+					)
 				: [],
 		};
 	}
@@ -456,9 +454,7 @@ function sanitizeImpactForState(
 }
 
 function boundedCount(value: unknown): number {
-	return typeof value === "number" &&
-		Number.isSafeInteger(value) &&
-		value >= 0
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
 		? value
 		: 0;
 }
@@ -499,7 +495,8 @@ function renderMessage(
 	lines: string[],
 	secrets: readonly string[],
 ): void {
-	if (state.message) lines.push(`Message: ${safeMessage(state.message, secrets)}`);
+	if (state.message)
+		lines.push(`Message: ${safeMessage(state.message, secrets)}`);
 }
 
 function renderTransactionResult(

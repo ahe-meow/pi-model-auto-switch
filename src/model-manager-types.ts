@@ -110,12 +110,17 @@ function decimalPlaces(value: number): number {
 	return dot === -1 ? 0 : text.length - dot - 1;
 }
 
-export function validateMultiplier(value: unknown): ModelManagerResult<Multiplier> {
+export function validateMultiplier(
+	value: unknown,
+): ModelManagerResult<Multiplier> {
 	if (value === undefined) return { ok: true, value: 1 };
 	if (typeof value !== "number" || !Number.isFinite(value)) {
 		return {
 			ok: false,
-			error: { code: "invalid_multiplier", message: "multiplier must be a finite number" },
+			error: {
+				code: "invalid_multiplier",
+				message: "multiplier must be a finite number",
+			},
 		};
 	}
 	if (value < 0.001 || value > 1000) {
@@ -130,13 +135,18 @@ export function validateMultiplier(value: unknown): ModelManagerResult<Multiplie
 	if (decimalPlaces(value) > 3) {
 		return {
 			ok: false,
-			error: { code: "too_precise", message: "multiplier allows at most 3 decimals" },
+			error: {
+				code: "too_precise",
+				message: "multiplier allows at most 3 decimals",
+			},
 		};
 	}
 	return { ok: true, value };
 }
 
-export function groupCatalog(records: readonly ModelManagerRecord[]): CatalogGroup[] {
+export function groupCatalog(
+	records: readonly ModelManagerRecord[],
+): CatalogGroup[] {
 	const groups = new Map<string, ModelManagerRecord[]>();
 	for (const record of records) {
 		const key = record.remoteGroup ?? record.providerAlias;

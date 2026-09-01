@@ -1615,11 +1615,12 @@ function sameCatalogSnapshot(
 ): boolean {
 	return Boolean(
 		a &&
-		b &&
-		a.records.length === b.records.length &&
-		a.records.every(
-			(record, index) => JSON.stringify(record) === JSON.stringify(b.records[index]),
-		),
+			b &&
+			a.records.length === b.records.length &&
+			a.records.every(
+				(record, index) =>
+					JSON.stringify(record) === JSON.stringify(b.records[index]),
+			),
 	);
 }
 
@@ -1658,8 +1659,7 @@ async function readModelManagerState(
 	return {
 		...state,
 		snapshot: catalog.ok ? catalog.value : null,
-		blocked:
-			!catalog.ok && "reason" in catalog.error ? catalog.error : null,
+		blocked: !catalog.ok && "reason" in catalog.error ? catalog.error : null,
 		failoverSummary: failoverSummary(runtime),
 	};
 }
@@ -1693,7 +1693,9 @@ async function openModelManager(
 		const token = ++deleteGeneration;
 		pendingImpact = undefined;
 		const snapshot = state.snapshot;
-		const record = snapshot?.records.find((entry) => entry.id === selectedRecordId);
+		const record = snapshot?.records.find(
+			(entry) => entry.id === selectedRecordId,
+		);
 		if (!snapshot || !record) return;
 		const recordId = record.id;
 		dispatch({ type: "request-delete", recordId });
@@ -1748,7 +1750,10 @@ async function openModelManager(
 			"code" in result.error &&
 			result.error.code === "delete-notification-failed";
 		if (!result.ok && !notificationFailed) {
-			dispatch({ type: "transaction-result", result: managerTransactionResult(result) });
+			dispatch({
+				type: "transaction-result",
+				result: managerTransactionResult(result),
+			});
 			requestRender();
 			return;
 		}
@@ -1809,7 +1814,10 @@ async function openModelManager(
 					});
 				} else if (data === "\t") {
 					const index = TAB_ORDER.indexOf(state.tab);
-					dispatch({ type: "switch-tab", tab: TAB_ORDER[(index + 1) % TAB_ORDER.length]! });
+					dispatch({
+						type: "switch-tab",
+						tab: TAB_ORDER[(index + 1) % TAB_ORDER.length]!,
+					});
 				} else if (data === "r") {
 					inputMode = "raw";
 				} else if (data === "v") {

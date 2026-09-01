@@ -120,13 +120,16 @@ function providerForRecords(
 	const providers = previous.map((provider) => {
 		const safe = stripSecrets(provider) as PiProviderDraft;
 		safe.apiKey = "";
-		safe.models = provider.models.map((model) => stripSecrets(model) as PiProviderModel);
+		safe.models = provider.models.map(
+			(model) => stripSecrets(model) as PiProviderModel,
+		);
 		return safe;
 	});
 	const providerIndexes = new Map<string, number>();
 	for (let index = 0; index < providers.length; index += 1) {
 		const provider = providers[index]!;
-		if (!providerIndexes.has(provider.name)) providerIndexes.set(provider.name, index);
+		if (!providerIndexes.has(provider.name))
+			providerIndexes.set(provider.name, index);
 	}
 	const modelOccurrences = new Map<string, number>();
 
@@ -164,11 +167,17 @@ function providerForRecords(
 	return providers;
 }
 
-function parseProviderModels(provider: JsonObject): PiProviderModel[] | undefined {
+function parseProviderModels(
+	provider: JsonObject,
+): PiProviderModel[] | undefined {
 	if (!Array.isArray(provider.models)) return undefined;
 	const models: PiProviderModel[] = [];
 	for (const value of provider.models) {
-		if (!isObject(value) || typeof value.id !== "string" || value.id.trim() === "") {
+		if (
+			!isObject(value) ||
+			typeof value.id !== "string" ||
+			value.id.trim() === ""
+		) {
 			return undefined;
 		}
 		const safe = stripSecrets(value) as JsonObject;
@@ -178,7 +187,8 @@ function parseProviderModels(provider: JsonObject): PiProviderModel[] | undefine
 }
 
 function parseProviders(document: unknown): PiProviderDraft[] | undefined {
-	if (!isObject(document) || !Array.isArray(document.providers)) return undefined;
+	if (!isObject(document) || !Array.isArray(document.providers))
+		return undefined;
 	const providers: PiProviderDraft[] = [];
 	for (const providerValue of document.providers) {
 		if (
@@ -220,7 +230,9 @@ function buildRecords(
 		),
 	);
 	return sidecar.models
-		.filter((record) => identities.has(`${record.providerAlias}\u0000${record.modelId}`))
+		.filter((record) =>
+			identities.has(`${record.providerAlias}\u0000${record.modelId}`),
+		)
 		.map(sanitizeRecord);
 }
 
@@ -238,7 +250,9 @@ export async function readModelCatalog(
 
 	let parsed: unknown;
 	try {
-		parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(modelsRead));
+		parsed = JSON.parse(
+			new TextDecoder("utf-8", { fatal: true }).decode(modelsRead),
+		);
 	} catch {
 		return unreadableModels();
 	}
@@ -274,7 +288,8 @@ export function toSidecarRecord(
 ): ModelManagerRecord {
 	const copiedFields = structuredClone(fields);
 	const providerAlias =
-		typeof copiedFields.providerAlias === "string" && copiedFields.providerAlias.length > 0
+		typeof copiedFields.providerAlias === "string" &&
+		copiedFields.providerAlias.length > 0
 			? copiedFields.providerAlias
 			: providerName;
 	return sanitizeRecord({
@@ -309,7 +324,13 @@ export function applyCatalogDraft(
 		if (index === -1) continue;
 		const editableFields: JsonObject = {};
 		for (const [key, value] of Object.entries(edit.fields)) {
-			if (key === "id" || key === "providerAlias" || key === "providerName" || key === "modelId") continue;
+			if (
+				key === "id" ||
+				key === "providerAlias" ||
+				key === "providerName" ||
+				key === "modelId"
+			)
+				continue;
 			editableFields[key] = value;
 		}
 		records[index] = structuredClone({
@@ -318,7 +339,8 @@ export function applyCatalogDraft(
 		});
 	}
 	const removed = new Set(edits.remove ?? []);
-	if (removed.size > 0) records = records.filter((record) => !removed.has(record.id));
+	if (removed.size > 0)
+		records = records.filter((record) => !removed.has(record.id));
 
 	return {
 		records,

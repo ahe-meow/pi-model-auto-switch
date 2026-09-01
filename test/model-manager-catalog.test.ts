@@ -1,10 +1,5 @@
 import assert from "node:assert/strict";
-import {
-	mkdtemp,
-	readFile,
-	rm,
-	writeFile,
-} from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -36,7 +31,10 @@ interface Fixture {
 	records: ModelManagerRecord[];
 }
 
-function makeFixtureData(): Omit<Fixture, "dir" | "modelsPath" | "sidecarPath" | "failoverPaths"> {
+function makeFixtureData(): Omit<
+	Fixture,
+	"dir" | "modelsPath" | "sidecarPath" | "failoverPaths"
+> {
 	const firstId = "arbitrary-record-id";
 	const records: ModelManagerRecord[] = [
 		{
@@ -71,14 +69,24 @@ function makeFixtureData(): Omit<Fixture, "dir" | "modelsPath" | "sidecarPath" |
 				models: [
 					{ id: "gpt-4o", name: "GPT-4o", reasoning: true },
 					{ id: "gpt-4o", name: "GPT-4o duplicate", reasoning: false },
-					{ id: "orphan-model", name: "Orphan Model", metadata: { source: "native" } },
+					{
+						id: "orphan-model",
+						name: "Orphan Model",
+						metadata: { source: "native" },
+					},
 				],
 			},
 			{
 				name: "provider-b",
 				api: "anthropic-messages",
 				apiKey: opaqueApiKey,
-				models: [{ id: "orphan-provider-model", name: "Orphan Provider Model", metadata: { tier: "native" } }],
+				models: [
+					{
+						id: "orphan-provider-model",
+						name: "Orphan Provider Model",
+						metadata: { tier: "native" },
+					},
+				],
 			},
 		],
 	};
@@ -93,15 +101,25 @@ async function makeFixture(): Promise<Fixture> {
 	const dir = await mkdtemp(join(tmpdir(), "model-manager-catalog-"));
 	const modelsPath = join(dir, "models.json");
 	const sidecarPath = join(dir, "model-manager.json");
-	const failoverPaths = [join(dir, "model-failover.json"), join(dir, "failover-state.json")];
+	const failoverPaths = [
+		join(dir, "model-failover.json"),
+		join(dir, "failover-state.json"),
+	];
 	const data = makeFixtureData();
 	await writeFile(modelsPath, data.modelsBytes);
-	await writeFile(sidecarPath, `${JSON.stringify(data.sidecar, null, 2)}\n`, "utf8");
-	for (const path of failoverPaths) await writeFile(path, failoverMarker, "utf8");
+	await writeFile(
+		sidecarPath,
+		`${JSON.stringify(data.sidecar, null, 2)}\n`,
+		"utf8",
+	);
+	for (const path of failoverPaths)
+		await writeFile(path, failoverMarker, "utf8");
 	return { dir, modelsPath, sidecarPath, failoverPaths, ...data };
 }
 
-async function withFixture(run: (fixture: Fixture) => Promise<void>): Promise<void> {
+async function withFixture(
+	run: (fixture: Fixture) => Promise<void>,
+): Promise<void> {
 	const fixture = await makeFixture();
 	try {
 		await run(fixture);
@@ -133,14 +151,23 @@ test("readModelCatalog builds stable id index from records and models config", a
 		assert.equal(snapshot.providers.length, 2);
 		assert.equal(snapshot.providers[0]?.name, "provider-a");
 		assert.equal(snapshot.providers[0]?.baseUrl, "https://api.example.test/v1");
-		assert.deepEqual(snapshot.providers[0]?.models.map(({ id }) => id), ["gpt-4o", "gpt-4o", "orphan-model"]);
+		assert.deepEqual(
+			snapshot.providers[0]?.models.map(({ id }) => id),
+			["gpt-4o", "gpt-4o", "orphan-model"],
+		);
 		assert.equal(snapshot.providers[1]?.name, "provider-b");
-		assert.deepEqual(snapshot.providers[1]?.models.map(({ id }) => id), ["orphan-provider-model"]);
+		assert.deepEqual(
+			snapshot.providers[1]?.models.map(({ id }) => id),
+			["orphan-provider-model"],
+		);
 		assert.equal(snapshot.providers[0]?.apiKey, "");
 		assert.equal(snapshot.providers[1]?.apiKey, "");
 		assert.equal(snapshot.byId.get(snapshot.records[0]!.id), snapshot.records[0]);
 		assert.equal(snapshot.byId.get(snapshot.records[1]!.id), snapshot.records[1]);
-		assert.equal(snapshot.byId.get(createStableId("provider-a", "gpt-4o")), undefined);
+		assert.equal(
+			snapshot.byId.get(createStableId("provider-a", "gpt-4o")),
+			undefined,
+		);
 		assert.equal(snapshot.failoverUntouched, true);
 	});
 });
@@ -148,12 +175,18 @@ test("readModelCatalog builds stable id index from records and models config", a
 test("readModelCatalog rejects invalid provider credentials and model shapes", async () => {
 	await withFixture(async ({ modelsPath, sidecarPath }) => {
 		const cases = [
-			{ name: "missing apiKey", provider: { name: "provider-a", models: [{ id: "gpt-4o" }] } },
+			{
+				name: "missing apiKey",
+				provider: { name: "provider-a", models: [{ id: "gpt-4o" }] },
+			},
 			{
 				name: "non-string apiKey",
 				provider: { name: "provider-a", apiKey: 42, models: [{ id: "gpt-4o" }] },
 			},
-			{ name: "missing models", provider: { name: "provider-a", apiKey: opaqueApiKey } },
+			{
+				name: "missing models",
+				provider: { name: "provider-a", apiKey: opaqueApiKey },
+			},
 			{
 				name: "non-array models",
 				provider: { name: "provider-a", apiKey: opaqueApiKey, models: {} },
@@ -161,7 +194,11 @@ test("readModelCatalog rejects invalid provider credentials and model shapes", a
 		];
 
 		for (const { name, provider } of cases) {
-			await writeFile(modelsPath, JSON.stringify({ providers: [provider] }), "utf8");
+			await writeFile(
+				modelsPath,
+				JSON.stringify({ providers: [provider] }),
+				"utf8",
+			);
 			const result = await readModelCatalog(modelsPath, sidecarPath);
 			assertBlocked(result);
 			if (result.ok) continue;
@@ -175,13 +212,21 @@ test("readModelCatalog rejects invalid provider credentials and model shapes", a
 
 test("applyCatalogDraft preserves provider and model metadata", async () => {
 	await withFixture(async ({ modelsPath, sidecarPath }) => {
-		const snapshot = assertSnapshot(await readModelCatalog(modelsPath, sidecarPath));
+		const snapshot = assertSnapshot(
+			await readModelCatalog(modelsPath, sidecarPath),
+		);
 		const edited = applyCatalogDraft(snapshot, {
 			edit: [{ id: snapshot.records[0]!.id, fields: { label: "Edited" } }],
 		});
 
-		assert.equal((snapshot.providers[0] as Record<string, unknown>).api, "openai-completions");
-		assert.equal((edited.providers[0] as Record<string, unknown>).api, "openai-completions");
+		assert.equal(
+			(snapshot.providers[0] as Record<string, unknown>).api,
+			"openai-completions",
+		);
+		assert.equal(
+			(edited.providers[0] as Record<string, unknown>).api,
+			"openai-completions",
+		);
 		assert.equal(snapshot.providers[0]?.models[0]?.reasoning, true);
 		assert.equal(edited.providers[0]?.models[0]?.reasoning, true);
 	});
@@ -189,44 +234,59 @@ test("applyCatalogDraft preserves provider and model metadata", async () => {
 
 test("applyCatalogDraft preserves orphan providers and models", async () => {
 	await withFixture(async ({ modelsPath, sidecarPath }) => {
-		const snapshot = assertSnapshot(await readModelCatalog(modelsPath, sidecarPath));
+		const snapshot = assertSnapshot(
+			await readModelCatalog(modelsPath, sidecarPath),
+		);
 		const edited = applyCatalogDraft(snapshot, {
 			edit: [{ id: snapshot.records[0]!.id, fields: { label: "Edited" } }],
 		});
 
 		assert.equal(edited.providers.length, 2);
-		const providerA = edited.providers.find((provider) => provider.name === "provider-a")!;
-		const providerB = edited.providers.find((provider) => provider.name === "provider-b")!;
+		const providerA = edited.providers.find(
+			(provider) => provider.name === "provider-a",
+		)!;
+		const providerB = edited.providers.find(
+			(provider) => provider.name === "provider-b",
+		)!;
 		assert.equal(providerA.api, "openai-completions");
 		assert.equal(providerB.api, "anthropic-messages");
-		assert.deepEqual(providerA.models.find((model) => model.id === "orphan-model"), {
-			id: "orphan-model",
-			name: "Orphan Model",
-			metadata: { source: "native" },
-		});
-		assert.deepEqual(providerB.models, [{
-			id: "orphan-provider-model",
-			name: "Orphan Provider Model",
-			metadata: { tier: "native" },
-		}]);
+		assert.deepEqual(
+			providerA.models.find((model) => model.id === "orphan-model"),
+			{
+				id: "orphan-model",
+				name: "Orphan Model",
+				metadata: { source: "native" },
+			},
+		);
+		assert.deepEqual(providerB.models, [
+			{
+				id: "orphan-provider-model",
+				name: "Orphan Provider Model",
+				metadata: { tier: "native" },
+			},
+		]);
 		assert.equal(providerA.apiKey, "");
 		assert.equal(providerB.apiKey, "");
 	});
 });
 test("applyCatalogDraft keeps record identity fields immutable", async () => {
 	await withFixture(async ({ modelsPath, sidecarPath }) => {
-		const snapshot = assertSnapshot(await readModelCatalog(modelsPath, sidecarPath));
+		const snapshot = assertSnapshot(
+			await readModelCatalog(modelsPath, sidecarPath),
+		);
 		const original = snapshot.records[0]!;
 		const edited = applyCatalogDraft(snapshot, {
-			edit: [{
-				id: original.id,
-				fields: {
-					id: "replacement-id",
-					providerAlias: "replacement-provider",
-					modelId: "replacement-model",
-					label: "Edited",
+			edit: [
+				{
+					id: original.id,
+					fields: {
+						id: "replacement-id",
+						providerAlias: "replacement-provider",
+						modelId: "replacement-model",
+						label: "Edited",
+					},
 				},
-			}],
+			],
 		});
 		const record = edited.records[0]!;
 
@@ -250,16 +310,25 @@ test("readModelCatalog strips nested secrets from sidecar records and outputs", 
 				deeper: [{ api_key: secret, visible: "yes" }],
 			},
 		};
-		await writeFile(sidecarPath, JSON.stringify({ ...sidecar, models: [nestedRecord, records[1]] }), "utf8");
+		await writeFile(
+			sidecarPath,
+			JSON.stringify({ ...sidecar, models: [nestedRecord, records[1]] }),
+			"utf8",
+		);
 
-		const snapshot = assertSnapshot(await readModelCatalog(modelsPath, sidecarPath));
+		const snapshot = assertSnapshot(
+			await readModelCatalog(modelsPath, sidecarPath),
+		);
 		const output = JSON.stringify(snapshot);
 		assert.equal(output.includes(secret), false);
 		assert.deepEqual(snapshot.records[0]?.nestedMetadata, {
 			keep: true,
 			deeper: [{ visible: "yes" }],
 		});
-		assert.equal(JSON.stringify(toPiProviderAlias(snapshot.records[0]!)).includes(secret), false);
+		assert.equal(
+			JSON.stringify(toPiProviderAlias(snapshot.records[0]!)).includes(secret),
+			false,
+		);
 	});
 });
 
@@ -273,7 +342,10 @@ test("readModelCatalog surfaces sidecar blocked state unchanged", async () => {
 		if (!("reason" in result.error)) return;
 		assert.equal(result.error.reason, "malformed");
 		assert.equal(result.error.message, "sidecar is not valid JSON");
-		assert.deepEqual(Buffer.from(result.error.rawBytes ?? []), Buffer.from("{ malformed sidecar", "utf8"));
+		assert.deepEqual(
+			Buffer.from(result.error.rawBytes ?? []),
+			Buffer.from("{ malformed sidecar", "utf8"),
+		);
 		assert.equal("code" in result.error, false);
 	});
 });
@@ -305,8 +377,16 @@ test("existing apiKey bytes survive unchanged without entering snapshot", async 
 		assert.deepEqual(await readFile(modelsPath), before);
 		assert.equal(printableOutput.includes(opaqueApiKey), false);
 		assert.equal(JSON.stringify(snapshot.records).includes(opaqueApiKey), false);
-		assert.equal(JSON.stringify(snapshot.providers).includes(opaqueApiKey), false);
-		assert.equal(JSON.stringify(toPiProviderAlias(snapshot.records[0]!)).includes(opaqueApiKey), false);
+		assert.equal(
+			JSON.stringify(snapshot.providers).includes(opaqueApiKey),
+			false,
+		);
+		assert.equal(
+			JSON.stringify(toPiProviderAlias(snapshot.records[0]!)).includes(
+				opaqueApiKey,
+			),
+			false,
+		);
 		assert.equal(JSON.stringify(snapshot).includes("apiKey"), true);
 		assert.equal(snapshot.providers[0]?.apiKey, "");
 	});
@@ -355,14 +435,35 @@ test("applyCatalogDraft add edit remove returns new snapshot without mutating in
 		assert.deepEqual(snapshot.records, originalRecords);
 		assert.deepEqual([...snapshot.byId.entries()], originalIndex);
 		assert.equal(draft.records.length, 2);
-		assert.equal(draft.records.find((record: ModelManagerRecord) => record.id === editedId)?.label, "Edited");
-		assert.equal(draft.records.find((record: ModelManagerRecord) => record.id === editedId)?.multiplier, 3);
-		assert.deepEqual(draft.records.find((record: ModelManagerRecord) => record.id === editedId)?.unknownField, {
-			nested: [1, 2, 3],
-		});
-		assert.equal(draft.records.some((record: ModelManagerRecord) => record.id === removedId), false);
-		assert.equal(draft.byId.get(added.id), draft.records.find((record) => record.id === added.id));
-		assert.equal(draft.byId.get(createStableId("provider-a", "new-model")), draft.records.find((record) => record.id === added.id));
+		assert.equal(
+			draft.records.find((record: ModelManagerRecord) => record.id === editedId)
+				?.label,
+			"Edited",
+		);
+		assert.equal(
+			draft.records.find((record: ModelManagerRecord) => record.id === editedId)
+				?.multiplier,
+			3,
+		);
+		assert.deepEqual(
+			draft.records.find((record: ModelManagerRecord) => record.id === editedId)
+				?.unknownField,
+			{
+				nested: [1, 2, 3],
+			},
+		);
+		assert.equal(
+			draft.records.some((record: ModelManagerRecord) => record.id === removedId),
+			false,
+		);
+		assert.equal(
+			draft.byId.get(added.id),
+			draft.records.find((record) => record.id === added.id),
+		);
+		assert.equal(
+			draft.byId.get(createStableId("provider-a", "new-model")),
+			draft.records.find((record) => record.id === added.id),
+		);
 		assert.equal(draft.failoverUntouched, true);
 	});
 });

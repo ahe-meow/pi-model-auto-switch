@@ -24,7 +24,9 @@ const record: ModelManagerRecord = {
 	modelId: "target-model",
 };
 
-function makeSnapshot(records: readonly ModelManagerRecord[] = [record]): ModelManagerCatalogSnapshot {
+function makeSnapshot(
+	records: readonly ModelManagerRecord[] = [record],
+): ModelManagerCatalogSnapshot {
 	return {
 		records: [...records],
 		byId: new Map(records.map((entry) => [entry.id, entry])),
@@ -70,7 +72,7 @@ async function makeFixture(): Promise<{
 		version: 1,
 		targets: {
 			"provider-a/target-model": {
-			settings: { enabled: true },
+				settings: { enabled: true },
 				runtime: { consecutiveFailures: 0 },
 			},
 		},
@@ -86,8 +88,14 @@ async function makeFixture(): Promise<{
 			},
 		},
 	};
-	const chainsBytes = Buffer.from(`${JSON.stringify(chainsValue, null, 2)}\n`, "utf8");
-	const stateBytes = Buffer.from(`${JSON.stringify(stateValue, null, 2)}\n`, "utf8");
+	const chainsBytes = Buffer.from(
+		`${JSON.stringify(chainsValue, null, 2)}\n`,
+		"utf8",
+	);
+	const stateBytes = Buffer.from(
+		`${JSON.stringify(stateValue, null, 2)}\n`,
+		"utf8",
+	);
 	await writeFile(chainsPath, chainsBytes);
 	await writeFile(statePath, stateBytes);
 	return { dir, chainsPath, statePath, chainsBytes, stateBytes };
@@ -112,10 +120,7 @@ function assertImpact(
 	return result.value;
 }
 
-function assertError<T>(
-	result: ModelManagerResult<T>,
-	code: string,
-): void {
+function assertError<T>(result: ModelManagerResult<T>, code: string): void {
 	assert.equal(result.ok, false);
 	if (result.ok) return;
 	assert.equal("code" in result.error, true);
@@ -132,10 +137,13 @@ test("analyzeDeletionImpact lists chain model entries", async () => {
 			}),
 		);
 
-		assert.deepEqual(impact.chains.filter(({ kind }) => kind === "model-entry"), [
-			{ file: chainsPath, chainId: "mm-legacy", kind: "model-entry" },
-			{ file: chainsPath, chainId: "mm-primary", kind: "model-entry" },
-		]);
+		assert.deepEqual(
+			impact.chains.filter(({ kind }) => kind === "model-entry"),
+			[
+				{ file: chainsPath, chainId: "mm-legacy", kind: "model-entry" },
+				{ file: chainsPath, chainId: "mm-primary", kind: "model-entry" },
+			],
+		);
 	});
 });
 
@@ -148,10 +156,13 @@ test("analyzeDeletionImpact lists generated blocks with mm prefix", async () => 
 			}),
 		);
 
-		assert.deepEqual(impact.chains.filter(({ kind }) => kind === "generated-block"), [
-			{ file: chainsPath, chainId: "mm-legacy", kind: "generated-block" },
-			{ file: chainsPath, chainId: "mm-primary", kind: "generated-block" },
-		]);
+		assert.deepEqual(
+			impact.chains.filter(({ kind }) => kind === "generated-block"),
+			[
+				{ file: chainsPath, chainId: "mm-legacy", kind: "generated-block" },
+				{ file: chainsPath, chainId: "mm-primary", kind: "generated-block" },
+			],
+		);
 	});
 });
 
@@ -181,10 +192,14 @@ test("analyzeDeletionImpact unreferenced record reports referenced false", async
 			modelId: "missing-model",
 		};
 		const impact = assertImpact(
-			await analyzeDeletionImpact(makeSnapshot([missingFromFiles]), missingFromFiles.id, {
-				chainsPath,
-				statePath,
-			}),
+			await analyzeDeletionImpact(
+				makeSnapshot([missingFromFiles]),
+				missingFromFiles.id,
+				{
+					chainsPath,
+					statePath,
+				},
+			),
 		);
 
 		assert.deepEqual(impact, {
@@ -212,10 +227,13 @@ test("analyzeDeletionImpact supports array and wrapped v8 chain shapes", async (
 			}),
 		);
 
-		assert.deepEqual(impact.chains.filter(({ chainId }) => chainId === "mm-array"), [
-			{ file: chainsPath, chainId: "mm-array", kind: "generated-block" },
-			{ file: chainsPath, chainId: "mm-array", kind: "model-entry" },
-		]);
+		assert.deepEqual(
+			impact.chains.filter(({ chainId }) => chainId === "mm-array"),
+			[
+				{ file: chainsPath, chainId: "mm-array", kind: "generated-block" },
+				{ file: chainsPath, chainId: "mm-array", kind: "model-entry" },
+			],
+		);
 	});
 });
 
@@ -419,24 +437,32 @@ test("scanStateReferences reports only shared-state identity locations", () => {
 });
 
 test("analyzeDeletionImpact never writes files or source implementation", async () => {
-	await withFixture(async ({ chainsPath, statePath, chainsBytes, stateBytes }) => {
-		const sourcePath = new URL("../src/model-manager-impact.ts", import.meta.url);
-		const implementation = await readFile(sourcePath, "utf8");
-		const before = await Promise.all([readFile(chainsPath), readFile(statePath)]);
+	await withFixture(
+		async ({ chainsPath, statePath, chainsBytes, stateBytes }) => {
+			const sourcePath = new URL(
+				"../src/model-manager-impact.ts",
+				import.meta.url,
+			);
+			const implementation = await readFile(sourcePath, "utf8");
+			const before = await Promise.all([
+				readFile(chainsPath),
+				readFile(statePath),
+			]);
 
-		assertImpact(
-			await analyzeDeletionImpact(makeSnapshot(), record.id, {
-				chainsPath,
-				statePath,
-			}),
-		);
+			assertImpact(
+				await analyzeDeletionImpact(makeSnapshot(), record.id, {
+					chainsPath,
+					statePath,
+				}),
+			);
 
-		const after = await Promise.all([readFile(chainsPath), readFile(statePath)]);
-		assert.deepEqual(before[0], chainsBytes);
-		assert.deepEqual(before[1], stateBytes);
-		assert.deepEqual(after, before);
-		assert.equal(/\b(?:writeFile|appendFile)\b/.test(implementation), false);
-	});
+			const after = await Promise.all([readFile(chainsPath), readFile(statePath)]);
+			assert.deepEqual(before[0], chainsBytes);
+			assert.deepEqual(before[1], stateBytes);
+			assert.deepEqual(after, before);
+			assert.equal(/\b(?:writeFile|appendFile)\b/.test(implementation), false);
+		},
+	);
 });
 
 test("analyzeDeletionImpact returns a safe error for malformed reads", async () => {

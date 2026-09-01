@@ -16,7 +16,9 @@ import type {
 	ModelManagerSidecar,
 } from "../src/model-manager-types.ts";
 
-function baseSidecar(overrides: Record<string, unknown> = {}): ModelManagerSidecar {
+function baseSidecar(
+	overrides: Record<string, unknown> = {},
+): ModelManagerSidecar {
 	return {
 		version: 1,
 		models: [
@@ -110,7 +112,10 @@ test("readSidecar returns malformed with raw bytes preserved", async () => {
 
 test("readSidecar returns future for a version newer than one", async () => {
 	const { dir, path } = tempPath();
-	const rawBytes = Buffer.from(JSON.stringify({ version: 2, models: [] }), "utf8");
+	const rawBytes = Buffer.from(
+		JSON.stringify({ version: 2, models: [] }),
+		"utf8",
+	);
 	writeFileSync(path, rawBytes);
 	try {
 		const result = await readSidecar(path);
@@ -136,13 +141,19 @@ test("validateSidecar rejects invalid version and top-level shapes", () => {
 		const result = validateSidecar(value);
 		assertBlocked(result, "invalid");
 		if (result.ok) continue;
-		assert.match(result.error.message, new RegExp(path.replace(/[.[\]]/g, "\\$&")));
+		assert.match(
+			result.error.message,
+			new RegExp(path.replace(/[.[\]]/g, "\\$&")),
+		);
 	}
 });
 
 test("validateSidecar rejects invalid record fields and multiplier", () => {
 	const invalidValues: Array<[string, unknown]> = [
-		["models[0].id", baseSidecar({ models: [{ ...baseSidecar().models[0], id: "" }] })],
+		[
+			"models[0].id",
+			baseSidecar({ models: [{ ...baseSidecar().models[0], id: "" }] }),
+		],
 		[
 			"models[0].providerAlias",
 			baseSidecar({ models: [{ ...baseSidecar().models[0], providerAlias: 42 }] }),
@@ -165,7 +176,10 @@ test("validateSidecar rejects invalid record fields and multiplier", () => {
 		const result = validateSidecar(value);
 		assertBlocked(result, "invalid");
 		if (result.ok) continue;
-		assert.match(result.error.message, new RegExp(path.replace(/[.[\]]/g, "\\$&")));
+		assert.match(
+			result.error.message,
+			new RegExp(path.replace(/[.[\]]/g, "\\$&")),
+		);
 	}
 });
 
@@ -178,12 +192,17 @@ test("validateSidecar rejects secret keys without exposing their values", () => 
 		assertBlocked(topLevel, "invalid");
 		if (!topLevel.ok) {
 			assert.match(topLevel.error.message, new RegExp(key));
-			assert.doesNotMatch(JSON.stringify(topLevel.error), new RegExp(topLevelValue));
+			assert.doesNotMatch(
+				JSON.stringify(topLevel.error),
+				new RegExp(topLevelValue),
+			);
 		}
 
 		const recordValue = `record-${key}-secret-value`;
 		const record = validateSidecar(
-			baseSidecar({ models: [{ ...baseSidecar().models[0], [key]: recordValue }] }),
+			baseSidecar({
+				models: [{ ...baseSidecar().models[0], [key]: recordValue }],
+			}),
 		);
 		assertBlocked(record, "invalid");
 		if (!record.ok) {
@@ -216,7 +235,9 @@ test("validateSidecar preserves unknown top-level and record fields through roun
 	const serialized = serializeSidecar(validated.value);
 	assert.equal(serialized.ok, true);
 	if (!serialized.ok) return;
-	const roundTrip = validateSidecar(JSON.parse(new TextDecoder().decode(serialized.value)));
+	const roundTrip = validateSidecar(
+		JSON.parse(new TextDecoder().decode(serialized.value)),
+	);
 	assert.equal(roundTrip.ok, true);
 	if (!roundTrip.ok) return;
 	assert.deepEqual(roundTrip.value, sidecar);

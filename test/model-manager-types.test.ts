@@ -10,7 +10,9 @@ import {
 	type ModelManagerRecord,
 } from "../src/model-manager-types.ts";
 
-function baseRecord(overrides: Partial<ModelManagerRecord> = {}): ModelManagerRecord {
+function baseRecord(
+	overrides: Partial<ModelManagerRecord> = {},
+): ModelManagerRecord {
 	return {
 		id: "r1",
 		providerAlias: "provider-a",
@@ -63,16 +65,10 @@ test("validateMultiplier rejects more than 3 decimals", () => {
 test("createStableId is deterministic and collision safe", () => {
 	const formatted = createStableId("Anthropic", "Claude 3.5");
 	assert.match(formatted, /^anthropic--claude-3-5-[0-9a-f]{64}$/);
-	assert.equal(
-		formatted,
-		createStableId("anthropic", "Claude 3.5"),
-	);
+	assert.equal(formatted, createStableId("anthropic", "Claude 3.5"));
 	assert.equal(createStableId("anthropic", "claude35"), "anthropic--claude35");
 	const taken = new Set(["provider--model"]);
-	assert.equal(
-		createStableId("provider", "model", taken),
-		"provider--model-2",
-	);
+	assert.equal(createStableId("provider", "model", taken), "provider--model-2");
 	const takenTwo = new Set(["x--y", "x--y-2"]);
 	assert.equal(createStableId("x", "y", takenTwo), "x--y-3");
 	// Ambiguity: slug losses cause collision without disambiguation.

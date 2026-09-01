@@ -1,11 +1,5 @@
 import assert from "node:assert/strict";
-import {
-	mkdtemp,
-	mkdir,
-	readFile,
-	rm,
-	writeFile,
-} from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, afterEach, test } from "node:test";
@@ -55,14 +49,16 @@ import type {
 } from "../src/model-manager-types.ts";
 
 const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-const testAgentDir = await mkdtemp(join(tmpdir(), "model-manager-release-agent-"));
+const testAgentDir = await mkdtemp(
+	join(tmpdir(), "model-manager-release-agent-"),
+);
 let index: typeof import("../src/index.ts") | undefined;
 
 async function getIndex(): Promise<typeof import("../src/index.ts")> {
 	if (!index) {
 		process.env.PI_CODING_AGENT_DIR = testAgentDir;
 		index = await import(
-			new URL("../src/index.ts?model-manager-release", import.meta.url).href,
+			new URL("../src/index.ts?model-manager-release", import.meta.url).href
 		);
 	}
 	const loaded = index;
@@ -70,7 +66,10 @@ async function getIndex(): Promise<typeof import("../src/index.ts")> {
 	return loaded;
 }
 
-type CommandHandler = (args: string, ctx: unknown) => unknown | Promise<unknown>;
+type CommandHandler = (
+	args: string,
+	ctx: unknown,
+) => unknown | Promise<unknown>;
 type ManagerComponent = {
 	render(width: number): string | string[];
 	handleInput(data: string): void;
@@ -252,7 +251,10 @@ test("missing and unreadable blocked catalogs show only safe recovery guidance",
 		},
 	});
 	assert.match(missing, /Catalog blocked: missing/);
-	assert.match(missing, /Compatibility import available: auth\.json, models\.json/);
+	assert.match(
+		missing,
+		/Compatibility import available: auth\.json, models\.json/,
+	);
 	assert.doesNotMatch(missing, /raw bytes preserved/);
 	assert.doesNotMatch(missing, /private|secret|missing details/);
 
@@ -264,7 +266,10 @@ test("missing and unreadable blocked catalogs show only safe recovery guidance",
 		},
 	});
 	assert.match(unreadable, /Catalog blocked: unreadable/);
-	assert.match(unreadable, /Recovery: repair the sidecar, then reopen \/failover/);
+	assert.match(
+		unreadable,
+		/Recovery: repair the sidecar, then reopen \/failover/,
+	);
 	assert.doesNotMatch(unreadable, /raw bytes preserved/);
 	assert.doesNotMatch(unreadable, /private|secret|unreadable details/);
 });
@@ -274,7 +279,15 @@ test("cancelled delete analysis cannot resurrect a pending commit", async () => 
 	await mkdir(dirname(currentIndex.MODELS_JSON_PATH), { recursive: true });
 	await writeFile(
 		currentIndex.MODELS_JSON_PATH,
-		JSON.stringify({ providers: [{ name: sourceRecord.providerAlias, apiKey: "opaque", models: [{ id: sourceRecord.modelId, name: sourceRecord.label }] }] }),
+		JSON.stringify({
+			providers: [
+				{
+					name: sourceRecord.providerAlias,
+					apiKey: "opaque",
+					models: [{ id: sourceRecord.modelId, name: sourceRecord.label }],
+				},
+			],
+		}),
 	);
 	await writeFile(
 		currentIndex.MODEL_MANAGER_SIDECAR_PATH,
@@ -291,9 +304,11 @@ test("cancelled delete analysis cannot resurrect a pending commit", async () => 
 		analysisStarted = resolve;
 	});
 	let resolveAnalysis!: (result: ModelManagerResult<CatalogImpact>) => void;
-	const delayedAnalysis = new Promise<ModelManagerResult<CatalogImpact>>((resolve) => {
-		resolveAnalysis = resolve;
-	});
+	const delayedAnalysis = new Promise<ModelManagerResult<CatalogImpact>>(
+		(resolve) => {
+			resolveAnalysis = resolve;
+		},
+	);
 	let analysisFinished!: () => void;
 	const finished = new Promise<void>((resolve) => {
 		analysisFinished = resolve;
@@ -344,7 +359,15 @@ test("production delete handler refreshes after a committed notification failure
 	await mkdir(dirname(currentIndex.MODELS_JSON_PATH), { recursive: true });
 	await writeFile(
 		currentIndex.MODELS_JSON_PATH,
-		JSON.stringify({ providers: [{ name: sourceRecord.providerAlias, apiKey: "opaque", models: [{ id: sourceRecord.modelId, name: sourceRecord.label }] }] }),
+		JSON.stringify({
+			providers: [
+				{
+					name: sourceRecord.providerAlias,
+					apiKey: "opaque",
+					models: [{ id: sourceRecord.modelId, name: sourceRecord.label }],
+				},
+			],
+		}),
 	);
 	await writeFile(
 		currentIndex.MODEL_MANAGER_SIDECAR_PATH,
@@ -379,7 +402,9 @@ test("production delete handler refreshes after a committed notification failure
 		await command.handler(
 			"",
 			renderContext(rendered, notifications, () => {
-				if (rendered.value.includes("Delete committed; failover notification failed"))
+				if (
+					rendered.value.includes("Delete committed; failover notification failed")
+				)
 					renderedWarning();
 			}),
 		);
@@ -397,8 +422,13 @@ test("production delete handler refreshes after a committed notification failure
 		);
 		assert.equal(current.byId.has(sourceRecord.id), false);
 		assert.doesNotMatch(rendered.value, /Release model/);
-		assert.match(rendered.value, /Delete committed; failover notification failed/);
-		assert.ok(notifications.some((message) => /notification failed/.test(message)));
+		assert.match(
+			rendered.value,
+			/Delete committed; failover notification failed/,
+		);
+		assert.ok(
+			notifications.some((message) => /notification failed/.test(message)),
+		);
 		assert.doesNotMatch(notifications.join("\n"), /provider-secret/);
 	} finally {
 		await harness.shutdown();
@@ -432,7 +462,10 @@ test("raw duplicate batch rejects all lines without key material in errors", () 
 
 	assert.equal(result.accepted, false);
 	assert.deepEqual(result.entries, []);
-	assert.deepEqual(result.rejected.map(({ line }) => line), [3]);
+	assert.deepEqual(
+		result.rejected.map(({ line }) => line),
+		[3],
+	);
 	assert.equal(JSON.stringify(result).includes(secret), false);
 });
 
@@ -453,7 +486,8 @@ test("clone keeps advanced fields through buildPreview without secret material",
 	assert.deepEqual(cloned?.advancedConfig, sourceRecord.advancedConfig);
 	assert.equal(cloned?.baseUrl, sourceRecord.baseUrl);
 	assert.deepEqual(
-		provider?.models.find((model) => model.id === sourceRecord.modelId)?.advancedConfig,
+		provider?.models.find((model) => model.id === sourceRecord.modelId)
+			?.advancedConfig,
 		sourceRecord.advancedConfig,
 	);
 	assert.equal(provider?.apiKey, "");
@@ -542,12 +576,18 @@ test("delete confirmation then notifies bridge with exact impact and no failover
 		const chainsPath = join(dir, "model-failover.json");
 		const statePath = join(dir, "failover-state.json");
 		const chainBytes = Buffer.from(
-			JSON.stringify({ chains: { primary: [{ provider: sourceRecord.providerAlias, modelId: sourceRecord.modelId }] } }) +
-			"\n",
+			JSON.stringify({
+				chains: {
+					primary: [
+						{ provider: sourceRecord.providerAlias, modelId: sourceRecord.modelId },
+					],
+				},
+			}) + "\n",
 		);
 		const stateBytes = Buffer.from(
-			JSON.stringify({ targets: { [`${sourceRecord.providerAlias}/${sourceRecord.modelId}`]: {} } }) +
-			"\n",
+			JSON.stringify({
+				targets: { [`${sourceRecord.providerAlias}/${sourceRecord.modelId}`]: {} },
+			}) + "\n",
 		);
 		await writeFile(chainsPath, chainBytes);
 		await writeFile(statePath, stateBytes);
@@ -559,7 +599,10 @@ test("delete confirmation then notifies bridge with exact impact and no failover
 			}),
 		);
 		assert.equal(impact.referenced, true);
-		assert.equal(confirmCascade(impact, { recordId: sourceRecord.id, ack: true }).ok, true);
+		assert.equal(
+			confirmCascade(impact, { recordId: sourceRecord.id, ack: true }).ok,
+			true,
+		);
 
 		let received: { recordId: string; impact: CatalogImpact } | undefined;
 		const cleanup = registerModelManagerBridge({
@@ -639,12 +682,18 @@ test("delete coordinator has a real zero-write rejection and confirmed sidecar c
 			`${JSON.stringify({ version: 1, models: [sourceRecord] })}\n`,
 		);
 		const chainBytes = Buffer.from(
-			JSON.stringify({ chains: { primary: [{ provider: sourceRecord.providerAlias, modelId: sourceRecord.modelId }] } }) +
-			"\n",
+			JSON.stringify({
+				chains: {
+					primary: [
+						{ provider: sourceRecord.providerAlias, modelId: sourceRecord.modelId },
+					],
+				},
+			}) + "\n",
 		);
 		const stateBytes = Buffer.from(
-			JSON.stringify({ targets: { [`${sourceRecord.providerAlias}/${sourceRecord.modelId}`]: {} } }) +
-			"\n",
+			JSON.stringify({
+				targets: { [`${sourceRecord.providerAlias}/${sourceRecord.modelId}`]: {} },
+			}) + "\n",
 		);
 		await writeFile(modelsPath, modelsBytes);
 		await writeFile(sidecarPath, sidecarBytes);
@@ -705,7 +754,9 @@ test("delete coordinator has a real zero-write rejection and confirmed sidecar c
 				confirmation: { recordId: sourceRecord.id, ack: true },
 			});
 			assert.equal(committed.ok, true);
-			const afterCatalog = assertOk(await readModelCatalog(modelsPath, sidecarPath));
+			const afterCatalog = assertOk(
+				await readModelCatalog(modelsPath, sidecarPath),
+			);
 			assert.equal(afterCatalog.byId.has(sourceRecord.id), false);
 			assert.deepEqual(await readFile(modelsPath), before.models);
 			assert.deepEqual(await readFile(chainsPath), before.chains);

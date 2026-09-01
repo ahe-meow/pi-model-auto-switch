@@ -43,7 +43,10 @@ function invalid(path: string, rule: string): ModelManagerResult<never> {
 	return blocked("invalid", `${path}: ${rule}`);
 }
 
-function containsSecretKey(value: Record<string, unknown>, path: string): string | null {
+function containsSecretKey(
+	value: Record<string, unknown>,
+	path: string,
+): string | null {
 	for (const key of Object.keys(value)) {
 		if (secretKeys.has(key)) return `${path}.${key}`;
 	}
@@ -56,22 +59,26 @@ export function validateSidecar(
 	if (!isPlainObject(value)) return invalid("sidecar", "must be a plain object");
 
 	const topLevelSecret = containsSecretKey(value, "sidecar");
-	if (topLevelSecret) return invalid(topLevelSecret, "secret fields are not allowed");
+	if (topLevelSecret)
+		return invalid(topLevelSecret, "secret fields are not allowed");
 
 	if (typeof value.version !== "number" || !Number.isFinite(value.version)) {
 		return invalid("version", "must be a finite number");
 	}
-	if (value.version > 1) return blocked("future", "version is newer than supported");
+	if (value.version > 1)
+		return blocked("future", "version is newer than supported");
 	if (value.version !== 1) return invalid("version", "must equal 1");
 	if (!Array.isArray(value.models)) return invalid("models", "must be an array");
 
 	for (let index = 0; index < value.models.length; index += 1) {
 		const path = `models[${index}]`;
 		const recordValue = value.models[index];
-		if (!isPlainObject(recordValue)) return invalid(path, "must be a plain object");
+		if (!isPlainObject(recordValue))
+			return invalid(path, "must be a plain object");
 
 		const recordSecret = containsSecretKey(recordValue, path);
-		if (recordSecret) return invalid(recordSecret, "secret fields are not allowed");
+		if (recordSecret)
+			return invalid(recordSecret, "secret fields are not allowed");
 
 		for (const field of ["id", "providerAlias", "providerName", "modelId"]) {
 			const fieldValue = recordValue[field];
@@ -131,7 +138,9 @@ export async function readSidecar(
 	const validated = validateSidecar(parsed);
 	if (!validated.ok) {
 		if ("reason" in validated.error) {
-			return blocked(validated.error.reason, validated.error.message, { rawBytes });
+			return blocked(validated.error.reason, validated.error.message, {
+				rawBytes,
+			});
 		}
 		return { ok: false, error: validated.error };
 	}
@@ -155,7 +164,8 @@ export function serializeSidecar(
 
 	try {
 		const json = JSON.stringify(validated.value, null, 2);
-		if (typeof json !== "string") return invalid("sidecar", "must be JSON-serializable");
+		if (typeof json !== "string")
+			return invalid("sidecar", "must be JSON-serializable");
 		return { ok: true, value: new TextEncoder().encode(`${json}\n`) };
 	} catch {
 		return invalid("sidecar", "must be JSON-serializable");

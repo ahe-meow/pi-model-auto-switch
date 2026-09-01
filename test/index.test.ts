@@ -313,7 +313,7 @@ async function openEditor(
 ): Promise<TestEditor> {
 	let editor: TestEditor | undefined;
 	await harness.commands[0]!.handler(
-		"",
+		"chains",
 		createContext({
 			notifications,
 			custom: async (create) => {
@@ -398,7 +398,7 @@ async function driveEditor(
 			for (const key of keys) currentEditor.handleInput(key);
 		},
 	});
-	await harness.commands[0]!.handler("", ctx);
+	await harness.commands[0]!.handler("chains", ctx);
 	if (!editor) throw new Error("failover editor was not created");
 	await editor.whenIdle();
 	return { notifications, statuses };
@@ -694,7 +694,7 @@ test("malformed shared state preserves legacy bytes and blocks routing and editi
 	const notifications: string[] = [];
 	await startSession(harness, notifications);
 	await harness.commands[0]!.handler(
-		"",
+		"chains",
 		createContext({
 			notifications,
 			custom: async () => {
@@ -753,7 +753,7 @@ test("legacy migration CAS conflict preserves source bytes and blocks the provid
 	const notifications: string[] = [];
 	await startSession(harness, notifications);
 	await harness.commands[0]!.handler(
-		"",
+		"chains",
 		createContext({
 			notifications,
 			custom: async () => {
@@ -808,7 +808,7 @@ test("degraded v8 target registration blocks routing and does not open the edito
 	let customCalls = 0;
 	const notifications: string[] = [];
 	await harness.commands[0]!.handler(
-		"",
+		"chains",
 		createContext({
 			notifications,
 			custom: async () => {
@@ -832,7 +832,7 @@ test("unreadable chain config uses a generic notification without raw read detai
 		await startSession(harness, notifications);
 		let customCalls = 0;
 		await harness.commands[0]!.handler(
-			"",
+			"chains",
 			createContext({
 				notifications,
 				custom: async () => {
@@ -1111,7 +1111,7 @@ test("/failover uses Pi autocomplete rows for add-target candidates", async () =
 		  }
 		| undefined;
 	await harness.commands[0]!.handler(
-		"",
+		"chains",
 		createContext({
 			cwd: agentDir,
 			notifications,
@@ -1174,7 +1174,7 @@ test("TUI requests a render after an async target action settles", async () => {
 	let renderCount = 0;
 	let editor: TestEditor | undefined;
 	await harness.commands[0]!.handler(
-		"",
+		"chains",
 		createContext({
 			custom: async (create) => {
 				editor = create(
@@ -1228,7 +1228,7 @@ test("second session refreshes the chain after another session adds a target", a
 		  }
 		| undefined;
 	await second.commands[0]!.handler(
-		"",
+		"chains",
 		createContext({
 			notifications,
 			custom: async (create) => {
@@ -1360,7 +1360,7 @@ test("malformed config blocks routing and recovers on session_start", async () =
 
 	let customCalls = 0;
 	await harness.commands[0]!.handler(
-		"",
+		"chains",
 		createContext({
 			notifications,
 			custom: async () => {
@@ -1399,7 +1399,7 @@ test("malformed config blocks routing and recovers on session_start", async () =
 		  }
 		| undefined;
 	await harness.commands[0]!.handler(
-		"",
+		"chains",
 		createContext({
 			notifications,
 			custom: async (create) => {
