@@ -372,6 +372,45 @@ function sanitizeFailoverSummary(
 	};
 }
 
+function sanitizeImpactForState(
+	impact: CatalogImpact | null,
+	secrets: readonly string[],
+): CatalogImpact | null {
+	if (!isObjectRecord(impact)) return null;
+	const chains: CatalogImpact["chains"] = [];
+	if (Array.isArray(impact.chains)) {
+		for (const entry of impact.chains) {
+			if (!isObjectRecord(entry)) continue;
+			const kind =
+				entry.kind === "model-entry" || entry.kind === "generated-block"
+					? entry.kind
+					: null;
+			if (!kind) continue;
+			chains.push({
+				file: safePath(entry.file, secrets),
+				chainId: safeIdentity(entry.chainId, secrets),
+				kind,
+			});
+		}
+	}
+	const stateReferences: CatalogImpact["state"] = [];
+	if (Array.isArray(impact.state)) {
+		for (const entry of impact.state) {
+			if (!isObjectRecord(entry)) continue;
+			stateReferences.push({
+				file: safePath(entry.file, secrets),
+				key: safeIdentity(entry.key, secrets),
+			});
+		}
+	}
+	return {
+		recordId: safeIdentity(impact.recordId, secrets),
+		chains,
+		state: stateReferences,
+		referenced: impact.referenced === true,
+	};
+}
+
 function boundedCount(value: unknown): number {
 	return typeof value === "number" &&
 		Number.isSafeInteger(value) &&
@@ -563,7 +602,7 @@ export function applyTuiAction(state: TuiState, action: TuiAction): TuiState {
 		conflict: sanitizeTransactionResult(state.conflict, secrets),
 		message: state.message == null ? null : safeMessage(state.message, secrets),
 		pendingDraft: sanitizeDraftForState(state.pendingDraft),
-		pendingImpact: state.pendingImpact,
+		pendingImpact: sanitizeImpactForState(state.pendingImpact, secrets),
 		failoverSummary: sanitizeFailoverSummary(state.failoverSummary, secrets),
 		history: Array.isArray(state.history)
 			? state.history.map((entry) => safeHistoryEntry(entry, secrets))

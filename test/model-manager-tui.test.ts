@@ -265,7 +265,7 @@ test("applyTuiAction handles parser, delete, and confirmation semantics without 
 		{ type: "confirm-cascade", ack: true },
 	);
 	assert.deepEqual(confirmed.pendingDraft, draft);
-	assert.equal(confirmed.pendingImpact, impact);
+	assert.deepEqual(confirmed.pendingImpact, impact);
 	assert.match(confirmed.message ?? "", /ready/i);
 
 	for (const incomplete of [
@@ -286,7 +286,7 @@ test("applyTuiAction handles parser, delete, and confirmation semantics without 
 		{ type: "confirm-cascade", ack: false },
 	);
 	assert.deepEqual(declined.pendingDraft, draft);
-	assert.equal(declined.pendingImpact, impact);
+	assert.deepEqual(declined.pendingImpact, impact);
 	assert.doesNotMatch(declined.message ?? "", /ready|write/i);
 });
 
@@ -638,4 +638,75 @@ test("known draft secrets stay out of state, conflict projections, and all scree
 		assert.equal(rendered.includes(secret), false);
 		assert.doesNotMatch(rendered, /blocked hunter2|\/private\//);
 	}
+});
+
+
+test("reducer sanitizes unsafe pending impact before returning or rendering", () => {
+	const secret = "impact-secret-9f42c17b";
+	const unsafeDraft = { ...draft, secret } as ModelManagerDraft;
+	const unsafeImpact = {
+		recordId: secret,
+		chains: [
+			{
+				file: `/private/${secret}/chains.json`,
+				chainId: secret,
+				kind: "model-entry",
+			},
+			{
+				file: "/safe/chains.json",
+				chainId: "safe-chain",
+				kind: "generated-block",
+			},
+		],
+		state: [
+			{ file: `/private/${secret}/state.json`, key: secret },
+			{ file: "/safe/state.json", key: "targets.provider/model" },
+		],
+		referenced: true,
+	} as unknown as CatalogImpact;
+	const unsafe = state({ pendingDraft: unsafeDraft, pendingImpact: unsafeImpact });
+	const actions: TuiAction[] = [
+		{ type: "switch-tab", tab: "history" },
+		{ type: "select-record", recordId: "record-a" },
+		{ type: "raw-input-submit", text: "valid-a" },
+		{ type: "environment-submit", names: ["PATH"], env: {} },
+		{ type: "request-delete", recordId: "record-a" },
+		{ type: "confirm-cascade", ack: true },
+		{ type: "commit-draft" },
+		{ type: "cancel-draft" },
+		{
+			type: "transaction-result",
+			result: { ok: true, committed: [`/private/${secret}/models.json`] },
+		},
+	];
+	for (const action of actions) {
+		const updated = applyTuiAction(unsafe, action);
+		assert.equal(JSON.stringify(updated).includes(secret), false, action.type);
+		for (const rendered of [
+			renderManagerScreen(updated),
+			renderFailoverScreen(updated),
+			renderHistoryScreen(updated),
+		]) {
+			assert.equal(rendered.includes(secret), false, action.type);
+			assert.doesNotMatch(rendered, /\/private\//, action.type);
+		}
+	}
+
+	const sanitized = applyTuiAction(unsafe, {
+		type: "confirm-cascade",
+		ack: true,
+	});
+	assert.deepEqual(sanitized.pendingImpact, {
+		recordId: "[redacted]",
+		chains: [
+			{ file: "chains.json", chainId: "[redacted]", kind: "model-entry" },
+			{ file: "chains.json", chainId: "safe-chain", kind: "generated-block" },
+		],
+		state: [
+			{ file: "state.json", key: "[redacted]" },
+			{ file: "state.json", key: "targets.provider/model" },
+		],
+		referenced: true,
+	});
+	assert.match(sanitized.message ?? "", /ready/);
 });
